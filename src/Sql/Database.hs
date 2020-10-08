@@ -1,6 +1,8 @@
 module Sql.Database
     ( Handle(..)
+    , query
     , renderQueryTemplate
+    , withConditionValues
     ) where
 
 import Data.List
@@ -8,9 +10,16 @@ import Sql.Query
 import Tuple
 
 data Handle = Handle
-    { query :: forall result. Query result -> IO (Maybe result)
+    { queryMaybe :: forall result. Query result -> IO (Maybe result)
     , withTransaction :: forall r. IO r -> IO r
     }
+
+query :: Handle -> Query result -> IO result
+query db queryData = do
+    mr <- queryMaybe db queryData
+    case mr of
+        Just r -> return r
+        Nothing -> fail "query failed"
 
 renderQueryTemplate :: Query result -> String
 renderQueryTemplate (CreateTable table columns constraints) =
@@ -43,14 +52,24 @@ renderQueryTemplate (Update table fields _ mcond) =
         ++ case mcond of
             Nothing -> ""
             Just (Condition condt _) -> " WHERE " ++ condt
+renderQueryTemplate (Delete table mcond) =
+    "DELETE FROM " ++ table
+        ++ case mcond of
+            Nothing -> ""
+            Just (Condition condt _) -> " WHERE " ++ condt
+
+withConditionValues :: Maybe Condition -> (forall ts. TupleT Value ts -> r) -> r
+withConditionValues Nothing f = f E
+withConditionValues (Just (Condition _ values)) f = f values
 
 columnDecl :: ColumnDecl -> String
 columnDecl (ColumnDecl field "") = fieldName field ++ fieldType field
 columnDecl (ColumnDecl field descr) = fieldName field ++ fieldType field ++ " " ++ descr
 
 fieldType :: Field a -> String
+fieldType (FInt _) = " INTEGER"
 fieldType (FString _) = " TEXT"
-fieldType (FInteger _) = " INTEGER"
+fieldType (FText _) = " TEXT"
 
 strlist :: [String] -> String
 strlist = intercalate ","

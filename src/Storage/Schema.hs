@@ -57,12 +57,12 @@ upgradeSchema logger db = do
 withSchemaVersion :: Logger.Handle -> Db.Handle -> IO r -> IO r -> (SchemaVersion -> IO r) -> IO r
 withSchemaVersion logger db onInvalid onEmpty onSchema = do
     Logger.info logger $ "Storage: Current application schema: " <> Text.pack (show currentSchema)
-    selret <- Db.query db $ Select "sn_metadata" (FString "mvalue" :+ E) (Just (Condition "mkey = 'schema_version'" E)) Nothing Nothing
+    selret <- Db.queryMaybe db $ Select "sn_metadata" (FString "mvalue" :* E) (Just (Condition "mkey = 'schema_version'" E)) Nothing Nothing
     case selret of
         Nothing -> do
             Logger.warn logger $ "Storage: No database schema"
             onEmpty
-        Just [versionstr :* E] | (version, ""):_ <- reads versionstr -> do
+        Just [VString versionstr :* E] | (version, ""):_ <- reads versionstr -> do
             Logger.info logger $ "Storage: Database schema: " <> Text.pack (show version)
             onSchema version
         Just _ -> do
@@ -76,18 +76,18 @@ upgradeEmptyToCurrent :: Logger.Handle -> Db.Handle -> IO (Either InitFailure ()
 upgradeEmptyToCurrent logger db = do
     Logger.info logger $ "Storage: Create a new database from scratch"
     Db.withTransaction db $ do
-        queryJust db $ CreateTable "sn_metadata"
+        Db.query db $ CreateTable "sn_metadata"
             [ ColumnDecl (FString "mkey") "PRIMARY KEY"
             , ColumnDecl (FString "mvalue") ""
             ]
             []
-        queryJust db $ Insert "sn_metadata"
-            (FString "mkey" :+ FString "mvalue" :+ E)
-            [VString "schema_version" :+ VString (show currentSchema) :+ E]
-        queryJust db $ CreateTable "sn_users"
-            [ ColumnDecl (FInteger "user_id") "PRIMARY KEY"
-            , ColumnDecl (FString "user_name") ""
-            , ColumnDecl (FString "user_surname") ""
+        Db.query db $ Insert "sn_metadata"
+            (FString "mkey" :* FString "mvalue" :* E)
+            [VString "schema_version" :* VString (show currentSchema) :* E]
+        Db.query db $ CreateTable "sn_users"
+            [ ColumnDecl (FInt "user_id") "PRIMARY KEY"
+            , ColumnDecl (FText "user_name") ""
+            , ColumnDecl (FText "user_surname") ""
             ]
             []
         return $ Right ()
@@ -96,10 +96,3 @@ upgradeFromToCurrent :: Logger.Handle -> Db.Handle -> SchemaVersion -> IO (Eithe
 upgradeFromToCurrent logger db version = do
     Logger.err logger $ "Storage: Cannot upgrade from schema: " <> Text.pack (show version)
     return $ Left $ InitFailureIncompatibleSchema version
-
-queryJust :: Db.Handle -> Query result -> IO result
-queryJust db query = do
-    mret <- Db.query db query
-    case mret of
-        Just ret -> return ret
-        Nothing -> fail "SQL request failed"

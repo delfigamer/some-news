@@ -18,44 +18,44 @@ spec = do
             Logger.withTestLogger $ \logger -> do
                 withTestDatabase $ \actionCheckpoint db -> do
                     actionCheckpoint
-                        [ Query (Select "sn_metadata" (FString "mvalue" :+ E) (Just (Condition "mkey = 'schema_version'" E)) Nothing Nothing)
+                        [ QueryMaybe (Select "sn_metadata" (FString "mvalue" :* E) (Just (Condition "mkey = 'schema_version'" E)) Nothing Nothing)
                             |>> Nothing
                         ]
                     matchCurrentSchema logger db (return . Left) (return $ Right ())
                         `shouldReturn` Left InitFailureEmpty
                     actionCheckpoint
-                        [ Query (Select "sn_metadata" (FString "mvalue" :+ E) (Just (Condition "mkey = 'schema_version'" E)) Nothing Nothing)
+                        [ QueryMaybe (Select "sn_metadata" (FString "mvalue" :* E) (Just (Condition "mkey = 'schema_version'" E)) Nothing Nothing)
                             |>> Just []
                         ]
                     matchCurrentSchema logger db (return . Left) (return $ Right ())
                         `shouldReturn` Left InitFailureInvalidSchema
                     actionCheckpoint
-                        [ Query (Select "sn_metadata" (FString "mvalue" :+ E) (Just (Condition "mkey = 'schema_version'" E)) Nothing Nothing)
-                            |>> Just ["asdfasdf" :* E]
+                        [ QueryMaybe (Select "sn_metadata" (FString "mvalue" :* E) (Just (Condition "mkey = 'schema_version'" E)) Nothing Nothing)
+                            |>> Just [VString "asdfasdf" :* E]
                         ]
                     matchCurrentSchema logger db (return . Left) (return $ Right ())
                         `shouldReturn` Left InitFailureInvalidSchema
                     actionCheckpoint
-                        [ Query (Select "sn_metadata" (FString "mvalue" :+ E) (Just (Condition "mkey = 'schema_version'" E)) Nothing Nothing)
-                            |>> Just ["SomeNewsSchema 0 0" :* E]
+                        [ QueryMaybe (Select "sn_metadata" (FString "mvalue" :* E) (Just (Condition "mkey = 'schema_version'" E)) Nothing Nothing)
+                            |>> Just [VString "SomeNewsSchema 0 0" :* E]
                         ]
                     matchCurrentSchema logger db (return . Left) (return $ Right ())
                         `shouldReturn` Left (InitFailureObsoleteSchema $ SomeNewsSchema 0 0)
                     actionCheckpoint
-                        [ Query (Select "sn_metadata" (FString "mvalue" :+ E) (Just (Condition "mkey = 'schema_version'" E)) Nothing Nothing)
-                            |>> Just ["SomeNewsSchema 0 123456" :* E]
+                        [ QueryMaybe (Select "sn_metadata" (FString "mvalue" :* E) (Just (Condition "mkey = 'schema_version'" E)) Nothing Nothing)
+                            |>> Just [VString "SomeNewsSchema 0 123456" :* E]
                         ]
                     matchCurrentSchema logger db (return . Left) (return $ Right ())
                         `shouldReturn` Left (InitFailureAdvancedSchema $ SomeNewsSchema 0 123456)
                     actionCheckpoint
-                        [ Query (Select "sn_metadata" (FString "mvalue" :+ E) (Just (Condition "mkey = 'schema_version'" E)) Nothing Nothing)
-                            |>> Just ["SomeNewsSchema 123456 123456" :* E]
+                        [ QueryMaybe (Select "sn_metadata" (FString "mvalue" :* E) (Just (Condition "mkey = 'schema_version'" E)) Nothing Nothing)
+                            |>> Just [VString "SomeNewsSchema 123456 123456" :* E]
                         ]
                     matchCurrentSchema logger db (return . Left) (return $ Right ())
                         `shouldReturn` Left (InitFailureIncompatibleSchema $ SomeNewsSchema 123456 123456)
                     actionCheckpoint
-                        [ Query (Select "sn_metadata" (FString "mvalue" :+ E) (Just (Condition "mkey = 'schema_version'" E)) Nothing Nothing)
-                            |>> Just ["SomeNewsSchema 0 1" :* E]
+                        [ QueryMaybe (Select "sn_metadata" (FString "mvalue" :* E) (Just (Condition "mkey = 'schema_version'" E)) Nothing Nothing)
+                            |>> Just [VString "SomeNewsSchema 0 1" :* E]
                         ]
                     matchCurrentSchema logger db (return . Left) (return $ Right ())
                         `shouldReturn` Right ()
@@ -63,28 +63,59 @@ spec = do
             Logger.withTestLogger $ \logger -> do
                 withTestDatabase $ \actionCheckpoint db -> do
                     actionCheckpoint
-                        [ Query (Select "sn_metadata" (FString "mvalue" :+ E) (Just (Condition "mkey = 'schema_version'" E)) Nothing Nothing)
+                        [ QueryMaybe (Select "sn_metadata" (FString "mvalue" :* E) (Just (Condition "mkey = 'schema_version'" E)) Nothing Nothing)
+                            |>> Just []
+                        ]
+                    upgradeSchema logger db
+                        `shouldReturn` Left InitFailureInvalidSchema
+                    actionCheckpoint
+                        [ QueryMaybe (Select "sn_metadata" (FString "mvalue" :* E) (Just (Condition "mkey = 'schema_version'" E)) Nothing Nothing)
+                            |>> Just [VString "asdfasdf" :* E]
+                        ]
+                    upgradeSchema logger db
+                        `shouldReturn` Left InitFailureInvalidSchema
+                    actionCheckpoint
+                        [ QueryMaybe (Select "sn_metadata" (FString "mvalue" :* E) (Just (Condition "mkey = 'schema_version'" E)) Nothing Nothing)
+                            |>> Just [VString "SomeNewsSchema 0 0" :* E]
+                        ]
+                    upgradeSchema logger db
+                        `shouldReturn` Left (InitFailureIncompatibleSchema $ SomeNewsSchema 0 0)
+                    actionCheckpoint
+                        [ QueryMaybe (Select "sn_metadata" (FString "mvalue" :* E) (Just (Condition "mkey = 'schema_version'" E)) Nothing Nothing)
+                            |>> Just [VString "SomeNewsSchema 0 123456" :* E]
+                        ]
+                    upgradeSchema logger db
+                        `shouldReturn` Left (InitFailureAdvancedSchema $ SomeNewsSchema 0 123456)
+                    actionCheckpoint
+                        [ QueryMaybe (Select "sn_metadata" (FString "mvalue" :* E) (Just (Condition "mkey = 'schema_version'" E)) Nothing Nothing)
+                            |>> Just [VString "SomeNewsSchema 123456 123456" :* E]
+                        ]
+                    upgradeSchema logger db
+                        `shouldReturn` Left (InitFailureIncompatibleSchema $ SomeNewsSchema 123456 123456)
+                    {- no schema -}
+                    actionCheckpoint
+                        [ QueryMaybe (Select "sn_metadata" (FString "mvalue" :* E) (Just (Condition "mkey = 'schema_version'" E)) Nothing Nothing)
                             |>> Nothing
                         , BeginTransaction
                             |>> ()
-                        , Query
+                        , QueryMaybe
                             (CreateTable "sn_metadata"
                                 [ ColumnDecl (FString "mkey") "PRIMARY KEY"
                                 , ColumnDecl (FString "mvalue") ""
                                 ]
                                 [])
                             |>> Just ()
-                        , Query
+                        , QueryMaybe
                             (Insert
                                 "sn_metadata"
-                                (FString "mkey" :+ FString "mvalue" :+ E)
-                                [VString "schema_version" :+ VString "SomeNewsSchema 0 1" :+ E])
+                                (FString "mkey" :* FString "mvalue" :* E)
+                                [VString "schema_version" :* VString "SomeNewsSchema 0 1" :* E])
                             |>> Just ()
-                        , Query
+                        , QueryMaybe
                             (CreateTable "sn_users"
-                                [ ColumnDecl (FInteger "user_id") "PRIMARY KEY"
-                                , ColumnDecl (FString "user_name") ""
-                                , ColumnDecl (FString "user_surname") ""
+                                [ ColumnDecl (FInt "user_id") "PRIMARY KEY"
+                                , ColumnDecl (FText "user_name") ""
+                                , ColumnDecl (FText "user_surname") ""
                                 ]
                                 [])
                             |>> Just ()
@@ -93,39 +124,10 @@ spec = do
                         ]
                     upgradeSchema logger db
                         `shouldReturn` Right ()
+                    {- SomeNewsSchema 0 1 -}
                     actionCheckpoint
-                        [ Query (Select "sn_metadata" (FString "mvalue" :+ E) (Just (Condition "mkey = 'schema_version'" E)) Nothing Nothing)
-                            |>> Just []
-                        ]
-                    upgradeSchema logger db
-                        `shouldReturn` Left InitFailureInvalidSchema
-                    actionCheckpoint
-                        [ Query (Select "sn_metadata" (FString "mvalue" :+ E) (Just (Condition "mkey = 'schema_version'" E)) Nothing Nothing)
-                            |>> Just ["asdfasdf" :* E]
-                        ]
-                    upgradeSchema logger db
-                        `shouldReturn` Left InitFailureInvalidSchema
-                    actionCheckpoint
-                        [ Query (Select "sn_metadata" (FString "mvalue" :+ E) (Just (Condition "mkey = 'schema_version'" E)) Nothing Nothing)
-                            |>> Just ["SomeNewsSchema 0 0" :* E]
-                        ]
-                    upgradeSchema logger db
-                        `shouldReturn` Left (InitFailureIncompatibleSchema $ SomeNewsSchema 0 0)
-                    actionCheckpoint
-                        [ Query (Select "sn_metadata" (FString "mvalue" :+ E) (Just (Condition "mkey = 'schema_version'" E)) Nothing Nothing)
-                            |>> Just ["SomeNewsSchema 0 123456" :* E]
-                        ]
-                    upgradeSchema logger db
-                        `shouldReturn` Left (InitFailureAdvancedSchema $ SomeNewsSchema 0 123456)
-                    actionCheckpoint
-                        [ Query (Select "sn_metadata" (FString "mvalue" :+ E) (Just (Condition "mkey = 'schema_version'" E)) Nothing Nothing)
-                            |>> Just ["SomeNewsSchema 123456 123456" :* E]
-                        ]
-                    upgradeSchema logger db
-                        `shouldReturn` Left (InitFailureIncompatibleSchema $ SomeNewsSchema 123456 123456)
-                    actionCheckpoint
-                        [ Query (Select "sn_metadata" (FString "mvalue" :+ E) (Just (Condition "mkey = 'schema_version'" E)) Nothing Nothing)
-                            |>> Just ["SomeNewsSchema 0 1" :* E]
+                        [ QueryMaybe (Select "sn_metadata" (FString "mvalue" :* E) (Just (Condition "mkey = 'schema_version'" E)) Nothing Nothing)
+                            |>> Just [VString "SomeNewsSchema 0 1" :* E]
                         ]
                     upgradeSchema logger db
                         `shouldReturn` Right ()

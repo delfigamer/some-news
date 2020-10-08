@@ -1,0 +1,6 @@
+- database:
+    sqlite: ""
+  sample-size: 10000
+- database:
+    sqlite: "temp.sqlite~"
+  sample-size: 1000

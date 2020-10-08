@@ -16,13 +16,13 @@ import Tuple
 import Unsafe.Coerce
 
 data Action a where
-    Query :: Query result -> Action (Maybe result)
+    QueryMaybe :: Query result -> Action (Maybe result)
     BeginTransaction :: Action ()
     CommitTransaction :: Action ()
 deriving instance Show (Action a)
 
 instance HEq1 Action where
-    Query a ~= Query b = a ~= b
+    QueryMaybe a ~= QueryMaybe b = a ~= b
     BeginTransaction ~= BeginTransaction = True
     CommitTransaction ~= CommitTransaction = True
     _ ~= _ = False
@@ -58,15 +58,15 @@ withTestDatabase body = do
     pexpectations <- newIORef $ []
     result <- body (actionCheckpoint pexpectations) $
         Db.Handle
-            { Db.query = testDbQuery pexpectations
+            { Db.queryMaybe = testDbQueryMaybe pexpectations
             , Db.withTransaction = testDbWithTransaction pexpectations
             }
     actionCheckpoint pexpectations []
     return result
 
-testDbQuery :: IORef [ActionExpectation] -> Query result -> IO (Maybe result)
-testDbQuery pexpectations query = do
-    expectAction pexpectations $ Query query
+testDbQueryMaybe :: IORef [ActionExpectation] -> Query result -> IO (Maybe result)
+testDbQueryMaybe pexpectations query = do
+    expectAction pexpectations $ QueryMaybe query
 
 testDbWithTransaction :: IORef [ActionExpectation] -> IO r -> IO r
 testDbWithTransaction pexpectations body = do

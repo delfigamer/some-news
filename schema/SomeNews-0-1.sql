@@ -7,7 +7,7 @@ CREATE TABLE sn_metadata
     , mvalue TEXT
     );
 INSERT INTO sn_metadata VALUES
-    ('schema_version', 'SchemaVersion "SomeNews" 0 1');
+    ('schema_version', 'SomeNewsSchema 0 1');
 CREATE TABLE sn_users
     ( user_id INTEGER PRIMARY KEY
     , user_name TEXT
