@@ -6,11 +6,15 @@ module Sql.Database.Sqlite
 
 import Control.Concurrent.MVar
 import Control.Exception
+import Control.Monad
+import qualified Data.ByteString as BS
 import Data.IORef
+import Data.Int
 import Data.List
 import Data.String
 import qualified Data.Text as Text
 import Database.SQLite.Simple
+import Database.SQLite.Simple.FromField
 import Database.SQLite.Simple.FromRow
 import Database.SQLite.Simple.ToField
 import qualified Logger
@@ -39,7 +43,7 @@ initialize path = do
 sqliteQueryMaybe :: Logger.Handle -> MVar Connection -> Q.Query result -> IO (Maybe result)
 sqliteQueryMaybe logger mvconn queryData = do
     withMVar mvconn $ \conn -> do
-        let queryText = Db.renderQueryTemplate queryData
+        let queryText = Db.renderQueryTemplate renderConstranits queryData
         Logger.debug logger $ "Sqlite: " <> Text.pack (show queryData)
         Logger.info logger $ "Sqlite: " <> Text.pack queryText
         let sqlQuery = fromString queryText :: Query
@@ -47,7 +51,7 @@ sqliteQueryMaybe logger mvconn queryData = do
             Q.CreateTable {} -> execute_ conn sqlQuery
             Q.AddTableColumn {} -> execute_ conn sqlQuery
             Q.DropTable {} -> execute_ conn sqlQuery
-            Q.Select _ fields mcond _ _ -> Db.withConditionValues mcond $ queryWith (tupleParser fields) conn sqlQuery
+            Q.Select _ fields mcond _ _ -> Db.withConditionValues mcond $ queryWith (valueParser fields) conn sqlQuery
             Q.Insert _ _ rows -> executeMany conn sqlQuery rows
             Q.InsertReturning table fields values rets -> sqliteInsertReturning logger conn table fields values rets
             Q.Update _ _ values mcond -> Db.withConditionValues mcond $ \condvals -> execute conn sqlQuery $ joinTuple values condvals
@@ -60,13 +64,13 @@ sqliteQueryMaybe logger mvconn queryData = do
 
 sqliteInsertReturning :: Logger.Handle -> Connection -> Q.TableName -> TupleT Q.Field vs -> TupleT Q.Value vs -> TupleT Q.Field rs -> IO (TupleT Q.Value rs)
 sqliteInsertReturning logger conn table fields values rets = do
-    let query1 = Db.renderQueryTemplate $ Q.Insert table fields [values]
+    let query1 = Db.renderQueryTemplate renderConstranits $ Q.Insert table fields [values]
     Logger.debug logger $ "Sqlite: " <> Text.pack (show query1)
     execute conn (fromString query1) values
     lastRowId <- lastInsertRowId conn
-    let query2 = Db.renderQueryTemplate $ Q.Select table rets (Just (Q.Condition "_rowid_ = ?" E)) Nothing Nothing
+    let query2 = Db.renderQueryTemplate renderConstranits $ Q.Select table rets (Just (Q.Condition "_rowid_ = ?" E)) Nothing Nothing
     Logger.debug logger $ "Sqlite: " <> Text.pack (show query2) <> "; -- " <> Text.pack (show lastRowId)
-    [result] <- queryWith (tupleParser rets) conn (fromString query2) $ Only $ SQLInteger lastRowId
+    [result] <- queryWith (valueParser rets) conn (fromString query2) $ Only $ SQLInteger lastRowId
     return result
 
 sqliteWithTransaction :: Logger.Handle -> MVar Connection -> IO r -> IO r
@@ -81,16 +85,39 @@ sqliteWithTransaction logger mvconn act = do
         Logger.info logger $ "Sqlite: COMMIT TRANSACTION"
         return r
 
-tupleParser :: TupleT Q.Field ts -> RowParser (TupleT Q.Value ts)
-tupleParser E = return E
-tupleParser (Q.FInt _ :* xs) = (:*) . Q.VInt <$> field <*> tupleParser xs
-tupleParser (Q.FString _ :* xs) = (:*) . Q.VString <$> field <*> tupleParser xs
-tupleParser (Q.FText _ :* xs) = (:*) . Q.VText <$> field <*> tupleParser xs
+renderConstranits :: [Q.ColumnConstraint a] -> String
+renderConstranits [] = ""
+renderConstranits (Q.CPrimaryKey:cs) = " PRIMARY KEY" ++ renderConstranits cs
+renderConstranits (Q.CIntegerId:cs) = " PRIMARY KEY" ++ renderConstranits cs
+
+valueParser :: TupleT Q.Field ts -> RowParser (TupleT Q.Value ts)
+valueParser fields = Q.decode fields <$> primParser (Q.primFields fields)
+
+primParser :: TupleT Q.PrimField ts -> RowParser (TupleT Q.PrimValue ts)
+primParser E = return E
+primParser (Q.FInt _ :* fs) = (:*) <$> field <*> primParser fs
+primParser (Q.FFloat _ :* fs) = (:*) <$> field <*> primParser fs
+primParser (Q.FText _ :* fs) = (:*) <$> field <*> primParser fs
+primParser (Q.FBlob _ :* fs) = (:*) <$> field <*> primParser fs
+
+instance FromField (Q.PrimValue Int64) where
+    fromField f = (Q.VInt <$> fromField f) `mplus` return Q.VNull
+
+instance FromField (Q.PrimValue Double) where
+    fromField f = (Q.VFloat <$> fromField f) `mplus` return Q.VNull
+
+instance FromField (Q.PrimValue Text.Text) where
+    fromField f = (Q.VText <$> fromField f) `mplus` return Q.VNull
+
+instance FromField (Q.PrimValue BS.ByteString) where
+    fromField f = (Q.VBlob <$> fromField f) `mplus` return Q.VNull
 
 instance ToRow (TupleT Q.Value ts) where
-    toRow = mapTuple toField
+    toRow = mapTuple toField . Q.encode
 
-instance ToField (Q.Value a) where
-    toField (Q.VInt x) = toField x
-    toField (Q.VString x) = toField x
-    toField (Q.VText x) = toField x
+instance ToField (Q.PrimValue a) where
+    toField (Q.VInt x) = SQLInteger x
+    toField (Q.VFloat x) = SQLFloat x
+    toField (Q.VText x) = SQLText x
+    toField (Q.VBlob x) = SQLBlob x
+    toField Q.VNull = SQLNull

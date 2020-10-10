@@ -57,12 +57,12 @@ upgradeSchema logger db = do
 withSchemaVersion :: Logger.Handle -> Db.Handle -> IO r -> IO r -> (SchemaVersion -> IO r) -> IO r
 withSchemaVersion logger db onInvalid onEmpty onSchema = do
     Logger.info logger $ "Storage: Current application schema: " <> Text.pack (show currentSchema)
-    selret <- Db.queryMaybe db $ Select "sn_metadata" (FString "mvalue" :* E) (Just (Condition "mkey = 'schema_version'" E)) Nothing Nothing
+    selret <- Db.queryMaybe db $ Select "sn_metadata" (fString "mvalue" :* E) (Just (Condition "mkey = 'schema_version'" E)) Nothing Nothing
     case selret of
         Nothing -> do
             Logger.warn logger $ "Storage: No database schema"
             onEmpty
-        Just [VString versionstr :* E] | (version, ""):_ <- reads versionstr -> do
+        Just [Val versionstr :* E] | (version, ""):_ <- reads versionstr -> do
             Logger.info logger $ "Storage: Database schema: " <> Text.pack (show version)
             onSchema version
         Just _ -> do
@@ -77,17 +77,17 @@ upgradeEmptyToCurrent logger db = do
     Logger.info logger $ "Storage: Create a new database from scratch"
     Db.withTransaction db $ do
         Db.query db $ CreateTable "sn_metadata"
-            [ ColumnDecl (FString "mkey") "PRIMARY KEY"
-            , ColumnDecl (FString "mvalue") ""
+            [ ColumnDecl (FText "mkey") [CPrimaryKey]
+            , ColumnDecl (FText "mvalue") []
             ]
             []
         Db.query db $ Insert "sn_metadata"
-            (FString "mkey" :* FString "mvalue" :* E)
-            [VString "schema_version" :* VString (show currentSchema) :* E]
+            (fString "mkey" :* fString "mvalue" :* E)
+            [Val "schema_version" :* Val (show currentSchema) :* E]
         Db.query db $ CreateTable "sn_users"
-            [ ColumnDecl (FInt "user_id") "PRIMARY KEY"
-            , ColumnDecl (FText "user_name") ""
-            , ColumnDecl (FText "user_surname") ""
+            [ ColumnDecl (FInt "user_id") [CIntegerId]
+            , ColumnDecl (FText "user_name") []
+            , ColumnDecl (FText "user_surname") []
             ]
             []
         return $ Right ()

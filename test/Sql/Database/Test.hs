@@ -1,4 +1,5 @@
 {-# LANGUAGE StandaloneDeriving #-}
+{-# LANGUAGE TypeFamilies #-}
 
 module Sql.Database.Test
     ( Action(..)
@@ -15,8 +16,13 @@ import Test.Hspec
 import Tuple
 import Unsafe.Coerce
 
+type family PrimResult a where
+    PrimResult () = ()
+    PrimResult (TupleT Value ts) = TupleT PrimValue (MapPrims ts)
+    PrimResult [TupleT Value ts] = [TupleT PrimValue (MapPrims ts)]
+
 data Action a where
-    QueryMaybe :: Query result -> Action (Maybe result)
+    QueryMaybe :: Query result -> Action (Maybe (PrimResult result))
     BeginTransaction :: Action ()
     CommitTransaction :: Action ()
 deriving instance Show (Action a)
@@ -66,7 +72,16 @@ withTestDatabase body = do
 
 testDbQueryMaybe :: IORef [ActionExpectation] -> Query result -> IO (Maybe result)
 testDbQueryMaybe pexpectations query = do
-    expectAction pexpectations $ QueryMaybe query
+    primr <- expectAction pexpectations $ QueryMaybe query
+    case query of
+        CreateTable {} -> return primr
+        AddTableColumn {} -> return primr
+        DropTable {} -> return primr
+        Select _ fields _ _ _ -> return $ map (decode fields) <$> primr
+        Insert {} -> return primr
+        InsertReturning _ _ _ rets -> return $ decode rets <$> primr
+        Update {} -> return primr
+        Delete {} -> return primr
 
 testDbWithTransaction :: IORef [ActionExpectation] -> IO r -> IO r
 testDbWithTransaction pexpectations body = do

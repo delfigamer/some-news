@@ -21,15 +21,15 @@ query db queryData = do
         Just r -> return r
         Nothing -> fail "query failed"
 
-renderQueryTemplate :: Query result -> String
-renderQueryTemplate (CreateTable table columns constraints) =
-    "CREATE TABLE " ++ table ++ " (" ++ strlist (map columnDecl columns ++ constraints) ++ ")"
-renderQueryTemplate (AddTableColumn table column) =
-    "ALTER TABLE " ++ table ++ " ADD COLUMN " ++ columnDecl column
-renderQueryTemplate (DropTable table) =
+renderQueryTemplate :: (forall a. [ColumnConstraint a] -> String) -> Query result -> String
+renderQueryTemplate renderConstraints (CreateTable table columns constraints) =
+    "CREATE TABLE " ++ table ++ " (" ++ strlist (map (columnDecl renderConstraints) columns ++ constraints) ++ ")"
+renderQueryTemplate renderConstraints (AddTableColumn table column) =
+    "ALTER TABLE " ++ table ++ " ADD COLUMN " ++ columnDecl renderConstraints column
+renderQueryTemplate _ (DropTable table) =
     "DROP TABLE " ++ table
-renderQueryTemplate (Select table fields mcond morder mrange) =
-    "SELECT " ++ strlist (mapTuple fieldName fields) ++ " FROM " ++ table
+renderQueryTemplate _ (Select table fields mcond morder mrange) =
+    "SELECT " ++ fieldNames fields ++ " FROM " ++ table
         ++ case mcond of
             Nothing -> ""
             Just (Condition condt _) -> " WHERE " ++ condt
@@ -39,20 +39,20 @@ renderQueryTemplate (Select table fields mcond morder mrange) =
         ++ case mrange of
             Nothing -> ""
             Just (RowRange offset limit) -> " LIMIT " ++ show limit ++ " OFFSET " ++ show offset
-renderQueryTemplate (Insert table fields _) =
-    "INSERT INTO " ++ table ++ " (" ++ strlist (mapTuple fieldName fields) ++ ")"
-        ++ " VALUES (" ++ strlist (mapTuple (const "?") fields) ++ ")"
-renderQueryTemplate (InsertReturning table fields _ rets) =
-    "INSERT INTO " ++ table ++ " (" ++ strlist (mapTuple fieldName fields) ++ ")"
-        ++ " VALUES (" ++ strlist (mapTuple (const "?") fields) ++ ")"
-        ++ " RETURNING (" ++ strlist (mapTuple fieldName rets) ++ ")"
-renderQueryTemplate (Update table fields _ mcond) =
-    "UPDATE " ++ table ++ " SET (" ++ strlist (mapTuple fieldName fields) ++ ")"
-        ++ " = (" ++ strlist (mapTuple (const "?") fields) ++ ")"
+renderQueryTemplate _ (Insert table fields _) =
+    "INSERT INTO " ++ table ++ " (" ++ fieldNames fields ++ ")"
+        ++ " VALUES (" ++ fieldPlaceholders fields ++ ")"
+renderQueryTemplate _ (InsertReturning table fields _ rets) =
+    "INSERT INTO " ++ table ++ " (" ++ fieldNames fields ++ ")"
+        ++ " VALUES (" ++ fieldPlaceholders fields ++ ")"
+        ++ " RETURNING (" ++ fieldNames rets ++ ")"
+renderQueryTemplate _ (Update table fields _ mcond) =
+    "UPDATE " ++ table ++ " SET (" ++ fieldNames fields ++ ")"
+        ++ " = (" ++ fieldPlaceholders fields ++ ")"
         ++ case mcond of
             Nothing -> ""
             Just (Condition condt _) -> " WHERE " ++ condt
-renderQueryTemplate (Delete table mcond) =
+renderQueryTemplate _ (Delete table mcond) =
     "DELETE FROM " ++ table
         ++ case mcond of
             Nothing -> ""
@@ -62,14 +62,24 @@ withConditionValues :: Maybe Condition -> (forall ts. TupleT Value ts -> r) -> r
 withConditionValues Nothing f = f E
 withConditionValues (Just (Condition _ values)) f = f values
 
-columnDecl :: ColumnDecl -> String
-columnDecl (ColumnDecl field "") = fieldName field ++ fieldType field
-columnDecl (ColumnDecl field descr) = fieldName field ++ fieldType field ++ " " ++ descr
+columnDecl :: (forall a. [ColumnConstraint a] -> String) -> ColumnDecl -> String
+columnDecl renderConstraints (ColumnDecl field constrs) = fieldName field ++ fieldType field ++ renderConstraints constrs
 
-fieldType :: Field a -> String
+fieldType :: PrimField a -> String
 fieldType (FInt _) = " INTEGER"
-fieldType (FString _) = " TEXT"
+fieldType (FFloat _) = " REAL"
 fieldType (FText _) = " TEXT"
+fieldType (FBlob _) = " BLOB"
+
+fieldNames :: TupleT Field ts -> String
+fieldNames = intercalate "," . fieldNameList
+
+fieldPlaceholders :: TupleT Field ts -> String
+fieldPlaceholders = intercalate "," . map (const "?") . fieldNameList
+
+fieldNameList :: TupleT Field ts -> [String]
+fieldNameList E = []
+fieldNameList (Field fs :* rest) = mapTuple fieldName fs ++ fieldNameList rest
 
 strlist :: [String] -> String
 strlist = intercalate ","

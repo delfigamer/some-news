@@ -2,10 +2,8 @@
 {-# LANGUAGE TypeFamilies #-}
 
 module Storage
-    ( ObjectTag(..)
-    , Reference
+    ( Reference
     , User(..)
-    , RefBox(..)
     , InitFailure(..)
     , Handle(..)
     , withSqlStorage
@@ -14,7 +12,9 @@ module Storage
     ) where
 
 import Control.Exception
+import Control.Monad
 import Data.Int
+import Data.Maybe
 import qualified Data.Text as Text
 import qualified Logger
 import Sql.Query
@@ -22,12 +22,7 @@ import qualified Sql.Database as Db
 import Storage.Schema
 import Tuple
 
-data ObjectTag a where
-    UserTag :: ObjectTag User
-deriving instance Show (ObjectTag a)
-deriving instance Eq (ObjectTag a)
-
-data Reference a = Reference !(ObjectTag a) !Int64
+data Reference a = Reference !Int64
     deriving (Show, Eq)
 
 data User = User
@@ -36,105 +31,71 @@ data User = User
     }
     deriving (Show, Eq)
 
-data RefBox a = RefBox !a !(Reference a)
-    deriving (Show, Eq)
-
 data Handle = Handle
-    { spawnObject :: forall a. ObjectTag a -> a -> IO (Maybe (Reference a))
-    , getObject :: forall a. Reference a -> IO (Maybe a)
-    , setObject :: forall a. Reference a -> a -> IO (Maybe ())
-    , deleteObject :: forall a. Reference a -> IO (Maybe ())
-    , enumObjects :: forall a. ObjectTag a -> Int64 -> Int64 -> IO [RefBox a]
+    { spawnUser :: User -> IO (Maybe (Reference User))
+    , getUser :: Reference User -> IO (Maybe User)
+    , setUser :: Reference User -> User -> IO (Maybe ())
+    , deleteUser :: Reference User -> IO (Maybe ())
+    , listUsers :: Int64 -> Int64 -> IO [(Reference User, User)]
     }
 
 withSqlStorage :: Logger.Handle -> Db.Handle -> (InitFailure -> IO r) -> (Handle -> IO r) -> IO r
 withSqlStorage logger db onFail onSuccess = do
-    matchCurrentSchema logger db onFail $ do
-        onSuccess $ Handle
-            { spawnObject = sqlSpawnObject logger db
-            , getObject = sqlGetObject logger db
-            , setObject = sqlSetObject logger db
-            , deleteObject = sqlDeleteObject logger db
-            , enumObjects = sqlEnumObjects logger db
-            }
+    matchCurrentSchema logger db onFail $ onSuccess $ Handle
+        { spawnUser = \user -> do
+            mret <- Db.queryMaybe db $
+                InsertReturning "sn_users" (fUser :* E) (Val user :* E) (fReference "user_id" :* E)
+            case mret of
+                Just (Val ref :* E) -> return $ Just $ ref
+                _ -> return Nothing
+        , getUser = \ref -> do
+            mret <- Db.queryMaybe db $
+                Select "sn_users" (fUser :* E)
+                    (Just $ Condition ("user_id = ?") $ Val ref :* E)
+                    Nothing
+                    (Just $ RowRange 0 1)
+            case mret of
+                Just [Val user :* E] -> return $ Just $ user
+                _ -> return Nothing
+        , setUser = \ref user -> do
+            Db.queryMaybe db $
+                Update "sn_users" (fUser :* E) (Val user :* E)
+                    (Just $ Condition ("user_id = ?") $ Val ref :* E)
+        , deleteUser = \ref -> do
+            Db.queryMaybe db $
+                Delete "sn_users"
+                    (Just $ Condition ("user_id = ?") $ Val ref :* E)
+        , listUsers = \offset limit -> do
+            mret <- Db.queryMaybe db $
+                Select "sn_users" (fReference "user_id" :* fUser :* E)
+                    Nothing
+                    (Just "user_id")
+                    (guard (offset >= 0 && limit > 0) >> Just (RowRange offset limit))
+            case mret of
+                Just rets -> return $ mapMaybe
+                    (\row -> do
+                        Val oid :* Val user :* E <- Just row
+                        Just (oid, user))
+                    rets
+                Nothing -> return []
+        }
 
-type family FieldsOf a where
-    FieldsOf User = '[Text.Text, Text.Text]
+instance IsValue (Reference a) where
+    type Prims (Reference a) = '[Int64]
+    primDecode (VInt oid :* rest) cont = cont (Just (Reference oid)) rest
+    primDecode (_ :* rest) cont = cont Nothing rest
+    primEncode (Just (Reference oid)) rest = VInt oid :* rest
+    primEncode Nothing rest = VNull :* rest
 
-objectTable :: ObjectTag a -> TableName
-objectTable UserTag = "sn_users"
+fReference :: FieldName -> Field (Reference a)
+fReference name = Field (FInt name :* E)
 
-objectFields :: ObjectTag a -> TupleT Field (FieldsOf a)
-objectFields UserTag = FText "user_name" :* FText "user_surname" :* E
+instance IsValue User where
+    type Prims User = '[Text.Text, Text.Text]
+    primDecode (VText name :* VText surname :* rest) cont = cont (Just (User name surname)) rest
+    primDecode (_ :* _ :* rest) cont = cont Nothing rest
+    primEncode (Just (User name surname)) rest = VText name :* VText surname :* rest
+    primEncode Nothing rest = VNull :* VNull :* rest
 
-objectToValues :: ObjectTag a -> a -> TupleT Value (FieldsOf a)
-objectToValues UserTag (User name surname) = VText name :* VText surname :* E
-
-objectFromValues :: ObjectTag a -> TupleT Value (FieldsOf a) -> a
-objectFromValues UserTag (VText name :* VText surname :* E) = User name surname
-
-referenceField :: ObjectTag a -> String
-referenceField UserTag = "user_id"
-
-referenceFromValues :: ObjectTag a -> TupleT Value '[Int64] -> Reference a
-referenceFromValues objectTag (VInt objectId :* E) = Reference objectTag objectId
-
-referenceCondition :: ObjectTag a -> Int64 -> Maybe Condition
-referenceCondition objectTag objectId = (Just $ Condition (referenceField objectTag ++ " = ?") $ VInt objectId :* E)
-
-refBoxFromValues :: ObjectTag a -> TupleT Value (Int64 ': FieldsOf a) -> RefBox a
-refBoxFromValues objectTag (VInt objectId :* values) = RefBox (objectFromValues objectTag values) (Reference objectTag objectId)
-
-sqlSpawnObject :: Logger.Handle -> Db.Handle -> ObjectTag a -> a -> IO (Maybe (Reference a))
-sqlSpawnObject logger db objectTag object = do
-    mret <- Db.queryMaybe db $
-        InsertReturning
-            (objectTable objectTag)
-            (objectFields objectTag)
-            (objectToValues objectTag object)
-            (FInt (referenceField objectTag) :* E)
-    case mret of
-        Just vals -> return $ Just $ referenceFromValues objectTag vals
-        Nothing -> return Nothing
-
-sqlGetObject :: Logger.Handle -> Db.Handle -> Reference a -> IO (Maybe a)
-sqlGetObject logger db (Reference objectTag objectId) = do
-    mret <- Db.queryMaybe db $
-        Select
-            (objectTable objectTag)
-            (objectFields objectTag)
-            (referenceCondition objectTag objectId)
-            Nothing
-            Nothing
-    case mret of
-        Just (vals:_) -> return $ Just $ objectFromValues objectTag vals
-        _ -> return Nothing
-
-sqlSetObject :: Logger.Handle -> Db.Handle -> Reference a -> a -> IO (Maybe ())
-sqlSetObject logger db (Reference objectTag objectId) object = do
-    Db.queryMaybe db $
-        Update
-            (objectTable objectTag)
-            (objectFields objectTag)
-            (objectToValues objectTag object)
-            (referenceCondition objectTag objectId)
-
-sqlDeleteObject :: Logger.Handle -> Db.Handle -> Reference a -> IO (Maybe ())
-sqlDeleteObject logger db (Reference objectTag objectId) = do
-    Db.queryMaybe db $
-        Delete
-            (objectTable objectTag)
-            (referenceCondition objectTag objectId)
-
-sqlEnumObjects :: Logger.Handle -> Db.Handle -> ObjectTag a -> Int64 -> Int64 -> IO [RefBox a]
-sqlEnumObjects logger db objectTag offset limit = do
-    mret <- Db.queryMaybe db $
-        Select
-            (objectTable objectTag)
-            (FInt (referenceField objectTag) :* objectFields objectTag)
-            Nothing
-            (Just $ referenceField objectTag)
-            (Just $ RowRange offset limit)
-    case mret of
-        Just rets -> return $ map (refBoxFromValues objectTag) rets
-        Nothing -> return []
+fUser :: Field User
+fUser = Field (FText "user_name" :* FText "user_surname" :* E)

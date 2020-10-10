@@ -1,6 +1,13 @@
+# - database:
+    # sqlite: "temp.sqlite~"
+  # sample-size: 100
+
+# - database:
+    # sqlite: ""
+  # sample-size: 1000
+
 - database:
-    sqlite: ""
-  sample-size: 10000
-- database:
-    sqlite: "temp.sqlite~"
-  sample-size: 1000
+    postgres:
+      user: me
+      password: me
+  sample-size: 100000

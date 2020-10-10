@@ -66,7 +66,7 @@ spec = do
         describe "Storage" $ do
             it "handles user objects" $ \testconfList -> do
                 forM_ testconfList $ \testconf -> do
-                    Logger.withNullLogger $ \logger -> do
+                    Logger.withTestLogger $ \logger -> do
                         Db.withDatabase (databaseConfig testconf) logger $ \db -> do
                             clearDatabase db
                             Storage.upgradeSchema logger db `shouldReturn` Right ()
@@ -74,33 +74,35 @@ spec = do
                                 (expectationFailure . show)
                                 $ \storage -> do
                                     userListA1 <- generate $ vectorOf (sampleSize testconf) randomUser
-                                    userRefsA <- parallelFor userListA1 $ assertJust <=< Storage.spawnObject storage Storage.UserTag
-                                    userListA2 <- parallelFor userRefsA $ assertJust <=< Storage.getObject storage
-                                    userListA1 `shouldBe` userListA2
-                                    let userBoxesA1 = zipWith Storage.RefBox userListA1 userRefsA
-                                    userBoxesA2 <- Storage.enumObjects storage Storage.UserTag 0 (-1)
-                                    userBoxesA1 `shouldMatchList` userBoxesA2
+                                    userRefsA <- parallelFor userListA1 $ assertJust <=< Storage.spawnUser storage
+                                    userListA2 <- parallelFor userRefsA $ assertJust <=< Storage.getUser storage
+                                    userListA2 `shouldBe` userListA1
+                                    let userBoxesA1 = zip userRefsA userListA1
+                                    userBoxesA2 <- Storage.listUsers storage 0 (-1)
+                                    userBoxesA2 `shouldMatchList` userBoxesA1
                                     userListB1 <- generate $ vectorOf (sampleSize testconf) randomUser
-                                    userRefsB <- parallelFor userListB1 $ assertJust <=< Storage.spawnObject storage Storage.UserTag
-                                    userListB2 <- parallelFor userRefsB $ assertJust <=< Storage.getObject storage
-                                    userListB1 `shouldBe` userListB2
-                                    let userBoxesC1 = userBoxesA1 ++ zipWith Storage.RefBox userListB1 userRefsB
-                                    userBoxesC2 <- Storage.enumObjects storage Storage.UserTag 0 (-1)
-                                    userBoxesC1 `shouldMatchList` userBoxesC2
-                                    userReplacement <- forM userBoxesC1 $ \(Storage.RefBox userC ref) -> do
+                                    userRefsB <- parallelFor userListB1 $ assertJust <=< Storage.spawnUser storage
+                                    userListB2 <- parallelFor userRefsB $ assertJust <=< Storage.getUser storage
+                                    userListB2 `shouldBe` userListB1
+                                    let userBoxesC1 = userBoxesA1 ++ zip userRefsB userListB1
+                                    userBoxesC2 <- Storage.listUsers storage 0 (-1)
+                                    userBoxesC2 `shouldMatchList` userBoxesC1
+                                    userReplacement <- forM userBoxesC1 $ \(ref, userC) -> do
                                         i <- generate $ choose (1,10)
                                         if (i :: Int) <= 1
                                             then do
                                                 userD <- generate $ randomUser
-                                                return $ Just $ Storage.RefBox userD ref
+                                                return $ Just $ (ref, userD)
                                             else return Nothing
                                     userBoxesD1 <- parallelFor (zip userBoxesC1 userReplacement) $ \(boxC, mreplace) -> do
                                         case mreplace of
                                             Nothing -> return boxC
-                                            Just boxD@(Storage.RefBox userD ref) -> do
-                                                assertJust =<< Storage.setObject storage ref userD
+                                            Just boxD@(ref, userD) -> do
+                                                assertJust =<< Storage.setUser storage ref userD
                                                 return boxD
-                                    userErasure <- forM userBoxesD1 $ \(Storage.RefBox _ ref) -> do
+                                    userBoxesD2 <- Storage.listUsers storage 0 (-1)
+                                    userBoxesD2 `shouldMatchList` userBoxesD1
+                                    userErasure <- forM userBoxesD1 $ \(ref, _) -> do
                                         i <- generate $ choose (1,10)
                                         if (i :: Int) <= 1
                                             then do
@@ -110,8 +112,8 @@ spec = do
                                         case merase of
                                             Nothing -> return $ Just boxD
                                             Just ref -> do
-                                                assertJust =<< Storage.deleteObject storage ref
+                                                assertJust =<< Storage.deleteUser storage ref
                                                 return Nothing
                                     let userBoxesE1 = catMaybes userBoxesE1Maybes
-                                    userBoxesE2 <- Storage.enumObjects storage Storage.UserTag 0 (-1)
-                                    userBoxesE1 `shouldMatchList` userBoxesE2
+                                    userBoxesE2 <- Storage.listUsers storage 0 (-1)
+                                    userBoxesE2 `shouldMatchList` userBoxesE1
