@@ -20,6 +20,7 @@ import Database.SQLite.Simple.ToField
 import qualified Logger
 import qualified Sql.Database as Db
 import qualified Sql.Query as Q
+import qualified Sql.Query.Render as Q
 import Tuple
 
 withSqlite :: String -> Logger.Handle -> (Db.Handle -> IO r) -> IO r
@@ -43,19 +44,19 @@ initialize path = do
 sqliteQueryMaybe :: Logger.Handle -> MVar Connection -> Q.Query result -> IO (Maybe result)
 sqliteQueryMaybe logger mvconn queryData = do
     withMVar mvconn $ \conn -> do
-        let queryText = Db.renderQueryTemplate renderConstranits queryData
+        let queryText = Q.renderQueryTemplate sqliteDetailRenderer queryData
         Logger.debug logger $ "Sqlite: " <> Text.pack (show queryData)
-        Logger.info logger $ "Sqlite: " <> Text.pack queryText
+        Logger.debug logger $ "Sqlite: " <> Text.pack queryText
         let sqlQuery = fromString queryText :: Query
         eresult <- try $ case queryData of
             Q.CreateTable {} -> execute_ conn sqlQuery
             Q.AddTableColumn {} -> execute_ conn sqlQuery
             Q.DropTable {} -> execute_ conn sqlQuery
-            Q.Select _ fields mcond _ _ -> Db.withConditionValues mcond $ queryWith (valueParser fields) conn sqlQuery
+            Q.Select _ fields mcond _ _ -> Q.withConditionValues mcond $ queryWith (valueParser fields) conn sqlQuery
             Q.Insert _ _ rows -> executeMany conn sqlQuery rows
             Q.InsertReturning table fields values rets -> sqliteInsertReturning logger conn table fields values rets
-            Q.Update _ _ values mcond -> Db.withConditionValues mcond $ \condvals -> execute conn sqlQuery $ joinTuple values condvals
-            Q.Delete _ mcond -> Db.withConditionValues mcond $ execute conn sqlQuery
+            Q.Update _ _ values mcond -> Q.withConditionValues mcond $ \condvals -> execute conn sqlQuery $ joinTuple values condvals
+            Q.Delete _ mcond -> Q.withConditionValues mcond $ execute conn sqlQuery
         case eresult of
             Left err -> do
                 Logger.warn logger $ "Sqlite: " <> Text.pack (displayException (err :: SomeException))
@@ -64,11 +65,11 @@ sqliteQueryMaybe logger mvconn queryData = do
 
 sqliteInsertReturning :: Logger.Handle -> Connection -> Q.TableName -> TupleT Q.Field vs -> TupleT Q.Value vs -> TupleT Q.Field rs -> IO (TupleT Q.Value rs)
 sqliteInsertReturning logger conn table fields values rets = do
-    let query1 = Db.renderQueryTemplate renderConstranits $ Q.Insert table fields [values]
+    let query1 = Q.renderQueryTemplate sqliteDetailRenderer $ Q.Insert table fields [values]
     Logger.debug logger $ "Sqlite: " <> Text.pack (show query1)
     execute conn (fromString query1) values
     lastRowId <- lastInsertRowId conn
-    let query2 = Db.renderQueryTemplate renderConstranits $ Q.Select table rets (Just (Q.Condition "_rowid_ = ?" E)) Nothing Nothing
+    let query2 = Q.renderQueryTemplate sqliteDetailRenderer $ Q.Select table rets (Just (Q.Condition "_rowid_ = ?" E)) Nothing Nothing
     Logger.debug logger $ "Sqlite: " <> Text.pack (show query2) <> "; -- " <> Text.pack (show lastRowId)
     [result] <- queryWith (valueParser rets) conn (fromString query2) $ Only $ SQLInteger lastRowId
     return result
@@ -76,19 +77,27 @@ sqliteInsertReturning logger conn table fields values rets = do
 sqliteWithTransaction :: Logger.Handle -> MVar Connection -> IO r -> IO r
 sqliteWithTransaction logger mvconn act = do
     withMVar mvconn $ \conn -> do
-        Logger.info logger $ "Sqlite: BEGIN TRANSACTION"
+        Logger.debug logger $ "Sqlite: BEGIN TRANSACTION"
         r <- withTransaction conn $ do
             bracket_
                 (putMVar mvconn conn)
                 (takeMVar mvconn >> return ())
                 act
-        Logger.info logger $ "Sqlite: COMMIT TRANSACTION"
+        Logger.debug logger $ "Sqlite: COMMIT TRANSACTION"
         return r
 
-renderConstranits :: [Q.ColumnConstraint a] -> String
-renderConstranits [] = ""
-renderConstranits (Q.CPrimaryKey:cs) = " PRIMARY KEY" ++ renderConstranits cs
-renderConstranits (Q.CIntegerId:cs) = " PRIMARY KEY" ++ renderConstranits cs
+sqliteDetailRenderer :: Q.DetailRenderer
+sqliteDetailRenderer = Q.DetailRenderer
+    { Q.renderConstraints = concatMap $ \constr -> case constr of
+        Q.CPrimaryKey -> " PRIMARY KEY"
+        Q.CIntegerId -> " PRIMARY KEY"
+        Q.CIntegerSalt -> " DEFAULT (random())"
+    , Q.renderFieldType = \field -> case field of
+        Q.FInt _ -> " INTEGER"
+        Q.FFloat _ -> " REAL"
+        Q.FText _ -> " TEXT"
+        Q.FBlob _ -> " BLOB"
+    }
 
 valueParser :: TupleT Q.Field ts -> RowParser (TupleT Q.Value ts)
 valueParser fields = Q.decode fields <$> primParser (Q.primFields fields)

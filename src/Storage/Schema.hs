@@ -86,6 +86,7 @@ upgradeEmptyToCurrent logger db = do
             [Val "schema_version" :* Val (show currentSchema) :* E]
         Db.query db $ CreateTable "sn_users"
             [ ColumnDecl (FInt "user_id") [CIntegerId]
+            , ColumnDecl (FInt "user_salt") [CIntegerSalt]
             , ColumnDecl (FText "user_name") []
             , ColumnDecl (FText "user_surname") []
             ]

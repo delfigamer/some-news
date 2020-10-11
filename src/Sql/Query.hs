@@ -129,10 +129,12 @@ deriving instance Eq RowRange
 data ColumnConstraint a where
     CPrimaryKey :: ColumnConstraint a
     CIntegerId :: ColumnConstraint Int64
+    CIntegerSalt :: ColumnConstraint Int64
 deriving instance Show (ColumnConstraint a)
 instance HEq1 ColumnConstraint where
     CPrimaryKey ~= CPrimaryKey = True
     CIntegerId ~= CIntegerId = True
+    CIntegerSalt ~= CIntegerSalt = True
     _ ~= _ = False
 
 data ColumnDecl = forall a. ColumnDecl (PrimField a) [ColumnConstraint a]

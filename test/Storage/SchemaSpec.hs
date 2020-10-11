@@ -114,6 +114,7 @@ spec = do
                         , QueryMaybe
                             (CreateTable "sn_users"
                                 [ ColumnDecl (FInt "user_id") [CIntegerId]
+                                , ColumnDecl (FInt "user_salt") [CIntegerSalt]
                                 , ColumnDecl (FText "user_name") []
                                 , ColumnDecl (FText "user_surname") []
                                 ]

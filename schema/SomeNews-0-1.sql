@@ -10,6 +10,7 @@ INSERT INTO sn_metadata VALUES
     ('schema_version', 'SomeNewsSchema 0 1');
 CREATE TABLE sn_users
     ( user_id INTEGER PRIMARY KEY
+    , user_salt INTEGER DEFAULT (random())
     , user_name TEXT
     , user_surname TEXT
     );

@@ -75,14 +75,20 @@ spec = do
                                 $ \storage -> do
                                     userListA1 <- generate $ vectorOf (sampleSize testconf) randomUser
                                     userRefsA <- parallelFor userListA1 $ assertJust <=< Storage.spawnUser storage
-                                    userListA2 <- parallelFor userRefsA $ assertJust <=< Storage.getUser storage
+                                    userListA2 <- parallelFor userRefsA $ \ref1@(Storage.ReferenceSalted oid1 _) -> do
+                                        (ref2, user) <- assertJust =<< Storage.getUser storage (Storage.ReferenceAny oid1)
+                                        ref2 `shouldBe` ref1
+                                        return user
                                     userListA2 `shouldBe` userListA1
                                     let userBoxesA1 = zip userRefsA userListA1
                                     userBoxesA2 <- Storage.listUsers storage 0 (-1)
                                     userBoxesA2 `shouldMatchList` userBoxesA1
                                     userListB1 <- generate $ vectorOf (sampleSize testconf) randomUser
                                     userRefsB <- parallelFor userListB1 $ assertJust <=< Storage.spawnUser storage
-                                    userListB2 <- parallelFor userRefsB $ assertJust <=< Storage.getUser storage
+                                    userListB2 <- parallelFor userRefsB $ \ref1 -> do
+                                        (ref2, user) <- assertJust =<< Storage.getUser storage ref1
+                                        ref2 `shouldBe` ref1
+                                        return user
                                     userListB2 `shouldBe` userListB1
                                     let userBoxesC1 = userBoxesA1 ++ zip userRefsB userListB1
                                     userBoxesC2 <- Storage.listUsers storage 0 (-1)
