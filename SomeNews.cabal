@@ -4,7 +4,7 @@ cabal-version: 1.12
 --
 -- see: https://github.com/sol/hpack
 --
--- hash: d70d63cdbba56b4142ad3726749c618752cd68fc33c642335ace36d981cff8da
+-- hash: 4abe24d1e9513215937922876f17040758fa86b41911473449aa7ca25bf3fa91
 
 name:           SomeNews
 version:        0.1.0.0
@@ -34,6 +34,7 @@ library
       Sql.Database.Postgres
       Sql.Database.Sqlite
       Sql.Query
+      Sql.Query.Render
       Storage
       Storage.Schema
       Tuple
@@ -48,8 +49,10 @@ library
     , ansi-terminal
     , base
     , bytestring
+    , cryptonite
     , hspec
     , postgresql-simple
+    , random
     , sqlite-simple
     , text
     , time
@@ -73,8 +76,10 @@ executable SomeNews-exe
     , ansi-terminal
     , base
     , bytestring
+    , cryptonite
     , hspec
     , postgresql-simple
+    , random
     , sqlite-simple
     , text
     , time
@@ -87,8 +92,6 @@ test-suite SomeNews-test
   type: exitcode-stdio-1.0
   main-is: Spec.hs
   other-modules:
-      Sql.Database.Test
-      Storage.SchemaSpec
       StorageSpec
       Paths_SomeNews
   hs-source-dirs:
@@ -102,8 +105,10 @@ test-suite SomeNews-test
     , ansi-terminal
     , base
     , bytestring
+    , cryptonite
     , hspec
     , postgresql-simple
+    , random
     , sqlite-simple
     , text
     , time

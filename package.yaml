@@ -27,8 +27,10 @@ dependencies:
 - ansi-terminal
 - base
 - bytestring
+- cryptonite
 - hspec
 - postgresql-simple
+- random
 - sqlite-simple
 - text
 - time

@@ -1,3 +1,5 @@
+{-# LANGUAGE TypeFamilies #-}
+
 module Storage.Schema
     ( SchemaVersion(..)
     , InitFailure(..)
@@ -8,6 +10,7 @@ module Storage.Schema
 
 import Control.Exception
 import Data.Int
+import Data.Proxy
 import qualified Data.Text as Text
 import qualified Logger
 import Sql.Query
@@ -57,12 +60,12 @@ upgradeSchema logger db = do
 withSchemaVersion :: Logger.Handle -> Db.Handle -> IO r -> IO r -> (SchemaVersion -> IO r) -> IO r
 withSchemaVersion logger db onInvalid onEmpty onSchema = do
     Logger.info logger $ "Storage: Current application schema: " <> Text.pack (show currentSchema)
-    selret <- Db.queryMaybe db $ Select "sn_metadata" (fString "mvalue" :* E) (Just (Condition "mkey = 'schema_version'" E)) Nothing Nothing
+    selret <- Db.queryMaybe db $ Select ["sn_metadata"] (fSchemaVersion "mvalue" :* E) [Where "mkey = 'schema_version'" E] [] AllRows
     case selret of
         Nothing -> do
             Logger.warn logger $ "Storage: No database schema"
             onEmpty
-        Just [Val versionstr :* E] | (version, ""):_ <- reads versionstr -> do
+        Just [Val version :* E] -> do
             Logger.info logger $ "Storage: Database schema: " <> Text.pack (show version)
             onSchema version
         Just _ -> do
@@ -77,23 +80,79 @@ upgradeEmptyToCurrent logger db = do
     Logger.info logger $ "Storage: Create a new database from scratch"
     Db.withTransaction db $ do
         Db.query db $ CreateTable "sn_metadata"
-            [ ColumnDecl (FText "mkey") [CPrimaryKey]
+            [ ColumnDecl (FText "mkey") [CCPrimaryKey]
             , ColumnDecl (FText "mvalue") []
             ]
             []
         Db.query db $ Insert "sn_metadata"
-            (fString "mkey" :* fString "mvalue" :* E)
-            [Val "schema_version" :* Val (show currentSchema) :* E]
+            (fString "mkey" :* fSchemaVersion "mvalue" :* E)
+            (Val "schema_version" :* Val currentSchema :* E)
+            E
         Db.query db $ CreateTable "sn_users"
-            [ ColumnDecl (FInt "user_id") [CIntegerId]
-            , ColumnDecl (FInt "user_salt") [CIntegerSalt]
-            , ColumnDecl (FText "user_name") []
-            , ColumnDecl (FText "user_surname") []
+            [ ColumnDecl (FBlob "user_id") [CCPrimaryKey]
+            , ColumnDecl (FText "user_name") [CCNotNull]
+            , ColumnDecl (FText "user_surname") [CCNotNull]
+            , ColumnDecl (FDateTime "user_join_date") [CCNotNull]
+            , ColumnDecl (FInt "user_is_admin") []
             ]
             []
+        Db.query db $ CreateTable "sn_access_keys"
+            [ ColumnDecl (FBlob "access_key_front") [CCPrimaryKey]
+            , ColumnDecl (FBlob "access_key_back_hash") [CCNotNull]
+            , ColumnDecl (FBlob "access_key_user_id") [CCNotNull, CCReferences "sn_users" "user_id" FKRCascade FKRCascade]
+            ]
+            []
+        Db.query db $ CreateIndex "sn_access_keys_user_id_idx" "sn_access_keys" [Asc "access_key_user_id"]
+        Db.query db $ CreateTable "sn_authors"
+            [ ColumnDecl (FBlob "author_id") [CCPrimaryKey]
+            , ColumnDecl (FText "author_name") [CCNotNull]
+            , ColumnDecl (FText "author_description") [CCNotNull]
+            ]
+            []
+        Db.query db $ CreateTable "sn_author2user"
+            [ ColumnDecl (FBlob "a2u_author_id") [CCNotNull, CCReferences "sn_authors" "author_id" FKRCascade FKRCascade]
+            , ColumnDecl (FBlob "a2u_user_id") [CCNotNull, CCReferences "sn_users" "user_id" FKRCascade FKRCascade]
+            ]
+            [ TCPrimaryKey ["a2u_author_id", "a2u_user_id"]
+            ]
+        Db.query db $ CreateIndex "sn_author2user_rev_idx" "sn_author2user" [Asc "a2u_user_id", Asc "a2u_author_id"]
+        Db.query db $ CreateTable "sn_articles"
+            [ ColumnDecl (FBlob "article_id") [CCPrimaryKey]
+            , ColumnDecl (FBlob "article_author_id") [CCNotNull, CCReferences "sn_authors" "author_id" FKRCascade FKRSetNull]
+            , ColumnDecl (FText "article_name") [CCNotNull]
+            , ColumnDecl (FText "article_text") [CCNotNull]
+            , ColumnDecl (FDateTime "article_publication_date") []
+            ]
+            []
+        Db.query db $ CreateIndex "sn_articles_publication_date_idx" "sn_articles" [Asc "article_publication_date"]
+        Db.query db $ CreateTable "sn_files"
+            [ ColumnDecl (FBlob "file_id") [CCPrimaryKey]
+            , ColumnDecl (FDateTime "file_name") []
+            , ColumnDecl (FDateTime "file_mimetype") [CCNotNull]
+            ]
+            []
+        Db.query db $ CreateTable "sn_file_chunks"
+            [ ColumnDecl (FBlob "chunk_file_id") [CCNotNull, CCReferences "sn_files" "file_id" FKRCascade FKRCascade]
+            , ColumnDecl (FInt "chunk_index") [CCNotNull]
+            , ColumnDecl (FBlob "chunk_content") [CCNotNull]
+            ]
+            [ TCPrimaryKey ["chunk_file_id", "chunk_index"]
+            ]
         return $ Right ()
 
 upgradeFromToCurrent :: Logger.Handle -> Db.Handle -> SchemaVersion -> IO (Either InitFailure ())
 upgradeFromToCurrent logger db version = do
     Logger.err logger $ "Storage: Cannot upgrade from schema: " <> Text.pack (show version)
     return $ Left $ InitFailureIncompatibleSchema version
+
+instance IsValue SchemaVersion where
+    type Prims SchemaVersion = '[Text.Text]
+    primProxy _ = Proxy :* E
+    primDecode vals = do
+        VText str :* E <- return vals
+        (version, ""):_ <- return $ reads $ Text.unpack str
+        Just version
+    primEncode version = VText (Text.pack $ show version) :* E
+
+fSchemaVersion :: FieldName -> Field SchemaVersion
+fSchemaVersion a = Field (FText a :* E)

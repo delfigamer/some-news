@@ -10,12 +10,14 @@ import Control.Monad
 import Data.Aeson
 import Data.Maybe
 import qualified Data.Text as Text
+import Data.Time.Clock
 import Data.Yaml
 import qualified Logger
 import Sql.Query
 import qualified Sql.Database as Db
 import qualified Sql.Database.Config as Db
 import qualified Storage
+import System.IO.Unsafe
 import Test.Hspec
 import Test.QuickCheck
 import Test.QuickCheck.Gen
@@ -34,15 +36,32 @@ instance FromJSON TestConfig where
 
 clearDatabase :: Db.Handle -> IO ()
 clearDatabase db = do
-    _ <- Db.queryMaybe db $ DropTable "sn_metadata"
-    _ <- Db.queryMaybe db $ DropTable "sn_users"
+    mapM_ (Db.queryMaybe db . DropTable) $ reverse $
+        [ "sn_metadata"
+        , "sn_users"
+        , "sn_access_keys"
+        , "sn_authors"
+        , "sn_author2user"
+        , "sn_articles"
+        , "sn_files"
+        , "sn_file_chunks"
+        ]
     return ()
 
 randomText :: Gen Text.Text
 randomText = Text.pack . getPrintableString <$> arbitrary
 
+dateTimeGenBase :: UTCTime
+dateTimeGenBase = case unsafePerformIO getCurrentTime of
+    UTCTime day _ -> UTCTime day 0
+
+randomDateTime :: Gen UTCTime
+randomDateTime = do
+    seconds <- choose (-86400*1000, 0)
+    return $ addUTCTime (fromInteger seconds) dateTimeGenBase
+
 randomUser :: Gen Storage.User
-randomUser = Storage.User <$> randomText <*> randomText
+randomUser = Storage.User <$> randomText <*> randomText <*> randomDateTime <*> arbitrary
 
 parallelFor :: [a] -> (a -> IO b) -> IO [b]
 parallelFor source act = do
@@ -73,25 +92,20 @@ spec = do
                             Storage.withSqlStorage logger db
                                 (expectationFailure . show)
                                 $ \storage -> do
+                                    let totalLimit = fromIntegral $ sampleSize testconf * 10
                                     userListA1 <- generate $ vectorOf (sampleSize testconf) randomUser
                                     userRefsA <- parallelFor userListA1 $ assertJust <=< Storage.spawnUser storage
-                                    userListA2 <- parallelFor userRefsA $ \ref1@(Storage.ReferenceSalted oid1 _) -> do
-                                        (ref2, user) <- assertJust =<< Storage.getUser storage (Storage.ReferenceAny oid1)
-                                        ref2 `shouldBe` ref1
-                                        return user
+                                    userListA2 <- parallelFor userRefsA $ assertJust <=< Storage.getUser storage
                                     userListA2 `shouldBe` userListA1
                                     let userBoxesA1 = zip userRefsA userListA1
-                                    userBoxesA2 <- Storage.listUsers storage 0 (-1)
+                                    userBoxesA2 <- Storage.listUsers storage 0 totalLimit
                                     userBoxesA2 `shouldMatchList` userBoxesA1
                                     userListB1 <- generate $ vectorOf (sampleSize testconf) randomUser
                                     userRefsB <- parallelFor userListB1 $ assertJust <=< Storage.spawnUser storage
-                                    userListB2 <- parallelFor userRefsB $ \ref1 -> do
-                                        (ref2, user) <- assertJust =<< Storage.getUser storage ref1
-                                        ref2 `shouldBe` ref1
-                                        return user
+                                    userListB2 <- parallelFor userRefsB $ assertJust <=< Storage.getUser storage
                                     userListB2 `shouldBe` userListB1
                                     let userBoxesC1 = userBoxesA1 ++ zip userRefsB userListB1
-                                    userBoxesC2 <- Storage.listUsers storage 0 (-1)
+                                    userBoxesC2 <- Storage.listUsers storage 0 totalLimit
                                     userBoxesC2 `shouldMatchList` userBoxesC1
                                     userReplacement <- forM userBoxesC1 $ \(ref, userC) -> do
                                         i <- generate $ choose (1,10)
@@ -106,7 +120,7 @@ spec = do
                                             Just boxD@(ref, userD) -> do
                                                 assertJust =<< Storage.setUser storage ref userD
                                                 return boxD
-                                    userBoxesD2 <- Storage.listUsers storage 0 (-1)
+                                    userBoxesD2 <- Storage.listUsers storage 0 totalLimit
                                     userBoxesD2 `shouldMatchList` userBoxesD1
                                     userErasure <- forM userBoxesD1 $ \(ref, _) -> do
                                         i <- generate $ choose (1,10)
@@ -121,5 +135,6 @@ spec = do
                                                 assertJust =<< Storage.deleteUser storage ref
                                                 return Nothing
                                     let userBoxesE1 = catMaybes userBoxesE1Maybes
-                                    userBoxesE2 <- Storage.listUsers storage 0 (-1)
+                                    userBoxesE2 <- Storage.listUsers storage 0 totalLimit
                                     userBoxesE2 `shouldMatchList` userBoxesE1
+                                    return ()

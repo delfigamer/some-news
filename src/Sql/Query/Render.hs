@@ -1,7 +1,6 @@
 module Sql.Query.Render
     ( DetailRenderer(..)
-    , renderQueryTemplate
-    , withConditionValues
+    , withQueryRender
     ) where
 
 import Data.List
@@ -9,67 +8,110 @@ import Sql.Query
 import Tuple
 
 data DetailRenderer = DetailRenderer
-    { renderConstraints :: forall a. [ColumnConstraint a] -> String
-    , renderFieldType :: forall a. PrimField a -> String
+    { renderFieldType :: forall a. PrimField a -> String
     }
 
-renderQueryTemplate :: DetailRenderer -> Query result -> String
-renderQueryTemplate detail (CreateTable table columns constraints) =
-    "CREATE TABLE " ++ table ++ " (" ++ intercalate "," (map (columnDecl detail) columns ++ constraints) ++ ")"
-renderQueryTemplate detail (AddTableColumn table column) =
-    "ALTER TABLE " ++ table ++ " ADD COLUMN " ++ columnDecl detail column
-renderQueryTemplate _ (DropTable table) =
-    "DROP TABLE " ++ table
-renderQueryTemplate _ (Select table fields mcond morder mrange) =
-    "SELECT " ++ fieldNames fields ++ " FROM " ++ table
-        ++ case mcond of
-            Nothing -> ""
-            Just (Condition condt _) -> " WHERE " ++ condt
-        ++ case morder of
-            Nothing -> ""
-            Just order -> " ORDER BY " ++ order
-        ++ case normalizeRange mrange of
-            Nothing -> ""
-            Just (RowRange offset limit) -> " LIMIT " ++ show limit ++ " OFFSET " ++ show offset
-renderQueryTemplate _ (Insert table fields _) =
-    "INSERT INTO " ++ table ++ " (" ++ fieldNames fields ++ ")"
-        ++ " VALUES (" ++ fieldPlaceholders fields ++ ")"
-renderQueryTemplate _ (InsertReturning table fields _ rets) =
-    "INSERT INTO " ++ table ++ " (" ++ fieldNames fields ++ ")"
-        ++ " VALUES (" ++ fieldPlaceholders fields ++ ")"
-        ++ " RETURNING " ++ fieldNames rets
-renderQueryTemplate _ (Update table fields _ mcond) =
-    "UPDATE " ++ table ++ " SET (" ++ fieldNames fields ++ ")"
-        ++ " = (" ++ fieldPlaceholders fields ++ ")"
-        ++ case mcond of
-            Nothing -> ""
-            Just (Condition condt _) -> " WHERE " ++ condt
-renderQueryTemplate _ (Delete table mcond) =
-    "DELETE FROM " ++ table
-        ++ case mcond of
-            Nothing -> ""
-            Just (Condition condt _) -> " WHERE " ++ condt
+withQueryRender :: DetailRenderer -> Query result -> (forall ts. TupleT PrimValue ts -> String -> r) -> r
+withQueryRender detail (CreateTable (TableName table) columns constraints) onRender =
+    onRender E $
+        "CREATE TABLE " ++ table ++ " ("
+            ++ intercalate ", " (map (renderColumnDecl detail) columns ++ map renderTableConstraint constraints)
+            ++ ")"
+withQueryRender _ (CreateIndex (IndexName index) (TableName table) order) onRender =
+    onRender E $
+        "CREATE INDEX " ++ index ++ " ON " ++ table ++ " ("
+            ++ renderRowOrder order
+            ++ ")"
+withQueryRender _ (DropTable (TableName table)) onRender =
+    onRender E $
+        "DROP TABLE " ++ table
+withQueryRender _ (Select tableList fields cond order range) onRender =
+    withConditionValues cond $ \condVals -> onRender condVals $
+        "SELECT " ++ fieldNames fields ++ " FROM " ++ renderTableList tableList
+            ++ case cond of
+                [] -> ""
+                _ -> " WHERE " ++ renderConditionTemplate cond
+            ++ case order of
+                [] -> ""
+                _ -> " ORDER BY " ++ renderRowOrder order
+            ++ case range of
+                AllRows -> ""
+                RowRange offset limit -> " LIMIT " ++ show limit ++ " OFFSET " ++ show offset
+withQueryRender _ (Insert (TableName table) fields values E) onRender =
+    onRender (encode values) $
+        "INSERT INTO " ++ table ++ " (" ++ fieldNames fields ++ ")"
+            ++ " VALUES (" ++ fieldPlaceholders fields ++ ")"
+withQueryRender _ (Insert (TableName table) fields values rets) onRender =
+    onRender (encode values) $
+        "INSERT INTO " ++ table ++ " (" ++ fieldNames fields ++ ")"
+            ++ " VALUES (" ++ fieldPlaceholders fields ++ ")"
+            ++ " RETURNING " ++ fieldNames rets
+withQueryRender _ (Update (TableName table) fields values cond) onRender =
+    withConditionValues cond $ \condVals -> onRender (encode values >* condVals) $
+        "UPDATE " ++ table ++ " SET (" ++ fieldNames fields ++ ")"
+            ++ " = (" ++ fieldPlaceholders fields ++ ")"
+            ++ case cond of
+                [] -> ""
+                _ -> " WHERE " ++ renderConditionTemplate cond
+withQueryRender _ (Delete (TableName table) cond) onRender =
+    withConditionValues cond $ \condVals -> onRender condVals $
+        "DELETE FROM " ++ table
+            ++ case cond of
+                [] -> ""
+                _ -> " WHERE " ++ renderConditionTemplate cond
 
-withConditionValues :: Maybe Condition -> (forall ts. TupleT Value ts -> r) -> r
-withConditionValues Nothing f = f E
-withConditionValues (Just (Condition _ values)) f = f values
+withNoValues :: (forall ts. TupleT PrimValue ts -> r) -> r
+withNoValues f = f E
 
-columnDecl :: DetailRenderer -> ColumnDecl -> String
-columnDecl detail (ColumnDecl field constrs) = fieldName field ++ renderFieldType detail field ++ renderConstraints detail constrs
+withConditionValues :: [Where] -> (forall ts. TupleT PrimValue ts -> r) -> r
+withConditionValues [] f = f E
+withConditionValues (Where _ values:rest) f = withConditionValues rest $ \others -> f $ encode values >* others
+
+renderColumnDecl :: DetailRenderer -> ColumnDecl -> String
+renderColumnDecl detail (ColumnDecl field constrs) = primFieldName field ++ renderFieldType detail field ++ renderColumnConstraints constrs
+
+renderColumnConstraints :: [ColumnConstraint a] -> String
+renderColumnConstraints [] = ""
+renderColumnConstraints (CCPrimaryKey:others) = " PRIMARY KEY" ++ renderColumnConstraints others
+renderColumnConstraints (CCNotNull:others) = " NOT NULL" ++ renderColumnConstraints others
+renderColumnConstraints (CCReferences (TableName table) (FieldName foreignField) onUpdate onDelete:others) =
+    " REFERENCES " ++ table ++ " (" ++ foreignField ++ ")"
+        ++ " ON UPDATE" ++ renderFKR onUpdate
+        ++ " ON DELETE" ++ renderFKR onDelete
+        ++ renderColumnConstraints others
+
+renderTableConstraint :: TableConstraint -> String
+renderTableConstraint (TCPrimaryKey fields) =
+    "PRIMARY KEY (" ++ intercalate "," (map (\(FieldName f) -> f) fields) ++ ")"
+
+renderFKR :: ForeignKeyResolution -> String
+renderFKR FKRNoAction = " NO ACTION"
+renderFKR FKRRestrict = " RESTRICT"
+renderFKR FKRCascade = " CASCADE"
+renderFKR FKRSetNull = " SET NULL"
+renderFKR FKRSetDefault = " SET DEFAULT"
+
+primFieldNames :: TupleT PrimField ts -> String
+primFieldNames = intercalate ", " . mapTuple primFieldName
 
 fieldNames :: TupleT Field ts -> String
-fieldNames = intercalate "," . fieldNameList
+fieldNames = intercalate ", " . fieldList
 
 fieldPlaceholders :: TupleT Field ts -> String
-fieldPlaceholders = intercalate "," . map (const "?") . fieldNameList
+fieldPlaceholders = intercalate ", " . map (const "?") . fieldList
 
-fieldNameList :: TupleT Field ts -> [String]
-fieldNameList E = []
-fieldNameList (Field fs :* rest) = mapTuple fieldName fs ++ fieldNameList rest
+fieldList :: TupleT Field ts -> [String]
+fieldList E = []
+fieldList (Field fs :* rest) = mapTuple primFieldName fs ++ fieldList rest
 
-normalizeRange :: Maybe RowRange -> Maybe RowRange
-normalizeRange Nothing = Nothing
-normalizeRange (Just (RowRange offset limit))
-    | limit <= 0 = Nothing
-    | offset < 0 = Just (RowRange 0 limit)
-    | otherwise = Just (RowRange offset limit)
+renderTableList :: [TableName] -> String
+renderTableList = intercalate ", " . map (\(TableName table) -> table)
+
+renderConditionTemplate :: [Where] -> String
+renderConditionTemplate = intercalate " AND " . map (\(Where str _) -> "(" ++ str ++ ")")
+
+renderRowOrder :: [RowOrder] -> String
+renderRowOrder = intercalate ", " . map r1
+  where
+    r1 (Asc (FieldName field)) = field
+    r1 (Desc (FieldName field)) = field ++ " DESC"

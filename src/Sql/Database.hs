@@ -7,6 +7,7 @@ import Sql.Query
 
 data Handle = Handle
     { queryMaybe :: forall result. Query result -> IO (Maybe result)
+    , foldQuery :: forall a row. Query [row] -> a -> (a -> row -> IO a) -> IO a
     , withTransaction :: forall r. IO r -> IO r
     }
 

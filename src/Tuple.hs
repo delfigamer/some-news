@@ -8,7 +8,8 @@ module Tuple
     , foldrTuple
     , mapTuple
     , ListCat
-    , joinTuple
+    , (>*)
+    , splitTuple
     ) where
 
 import Data.Functor.Identity
@@ -46,6 +47,11 @@ type family ListCat (ts :: [*]) (us :: [*]) :: [*] where
     ListCat '[] us = us
     ListCat (t ': ts) us = t ': ListCat ts us
 
-joinTuple :: TupleT f ts -> TupleT f us -> TupleT f (ListCat ts us)
-joinTuple E tup = tup
-joinTuple (x :* xs) tup = x :* joinTuple xs tup
+infixr 6 >*
+(>*) :: TupleT f ts -> TupleT f us -> TupleT f (ListCat ts us)
+E >* tup = tup
+(x :* xs) >* tup = x :* (xs >* tup)
+
+splitTuple :: TupleT f ts -> TupleT g (ListCat ts us) -> (TupleT g ts -> TupleT g us -> r) -> r
+splitTuple E ys cont = cont E ys
+splitTuple (_ :* xs) (y :* ys) cont = splitTuple xs ys $ \mine others -> cont (y :* mine) others
