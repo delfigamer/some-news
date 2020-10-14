@@ -60,12 +60,12 @@ upgradeSchema logger db = do
 withSchemaVersion :: Logger.Handle -> Db.Handle -> IO r -> IO r -> (SchemaVersion -> IO r) -> IO r
 withSchemaVersion logger db onInvalid onEmpty onSchema = do
     Logger.info logger $ "Storage: Current application schema: " <> Text.pack (show currentSchema)
-    selret <- Db.queryMaybe db $ Select ["sn_metadata"] (fSchemaVersion "mvalue" :* E) [Where "mkey = 'schema_version'" E] [] AllRows
+    selret <- Db.queryMaybe db $ Select ["sn_metadata"] (fSchemaVersion "mvalue" :/ E) [Where "mkey = 'schema_version'" E] [] AllRows
     case selret of
         Nothing -> do
             Logger.warn logger $ "Storage: No database schema"
             onEmpty
-        Just [Val version :* E] -> do
+        Just [Just version :/ E] -> do
             Logger.info logger $ "Storage: Database schema: " <> Text.pack (show version)
             onSchema version
         Just _ -> do
@@ -84,15 +84,14 @@ upgradeEmptyToCurrent logger db = do
             , ColumnDecl (FText "mvalue") []
             ]
             []
-        Db.query db $ Insert "sn_metadata"
-            (fString "mkey" :* fSchemaVersion "mvalue" :* E)
-            (Val "schema_version" :* Val currentSchema :* E)
-            E
+        Db.query db $ Insert_ "sn_metadata"
+            (fString "mkey" :/ fSchemaVersion "mvalue" :/ E)
+            (Just "schema_version" :/ Just currentSchema :/ E)
         Db.query db $ CreateTable "sn_users"
             [ ColumnDecl (FBlob "user_id") [CCPrimaryKey]
             , ColumnDecl (FText "user_name") [CCNotNull]
             , ColumnDecl (FText "user_surname") [CCNotNull]
-            , ColumnDecl (FDateTime "user_join_date") [CCNotNull]
+            , ColumnDecl (FTime "user_join_date") [CCNotNull]
             , ColumnDecl (FInt "user_is_admin") []
             ]
             []
@@ -121,14 +120,14 @@ upgradeEmptyToCurrent logger db = do
             , ColumnDecl (FBlob "article_author_id") [CCNotNull, CCReferences "sn_authors" "author_id" FKRCascade FKRSetNull]
             , ColumnDecl (FText "article_name") [CCNotNull]
             , ColumnDecl (FText "article_text") [CCNotNull]
-            , ColumnDecl (FDateTime "article_publication_date") []
+            , ColumnDecl (FTime "article_publication_date") []
             ]
             []
         Db.query db $ CreateIndex "sn_articles_publication_date_idx" "sn_articles" [Asc "article_publication_date"]
         Db.query db $ CreateTable "sn_files"
             [ ColumnDecl (FBlob "file_id") [CCPrimaryKey]
-            , ColumnDecl (FDateTime "file_name") []
-            , ColumnDecl (FDateTime "file_mimetype") [CCNotNull]
+            , ColumnDecl (FTime "file_name") []
+            , ColumnDecl (FTime "file_mimetype") [CCNotNull]
             ]
             []
         Db.query db $ CreateTable "sn_file_chunks"
@@ -146,13 +145,12 @@ upgradeFromToCurrent logger db version = do
     return $ Left $ InitFailureIncompatibleSchema version
 
 instance IsValue SchemaVersion where
-    type Prims SchemaVersion = '[Text.Text]
-    primProxy _ = Proxy :* E
+    type Prims SchemaVersion = '[ 'TText ]
     primDecode vals = do
-        VText str :* E <- return vals
+        VText str :/ E <- return vals
         (version, ""):_ <- return $ reads $ Text.unpack str
         Just version
-    primEncode version = VText (Text.pack $ show version) :* E
+    primEncode version = VText (Text.pack $ show version) :/ E
 
 fSchemaVersion :: FieldName -> Field SchemaVersion
-fSchemaVersion a = Field (FText a :* E)
+fSchemaVersion a = Field (FText a :/ E)

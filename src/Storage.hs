@@ -28,7 +28,6 @@ import Data.Word
 import qualified Logger
 import Sql.Query
 import qualified Sql.Database as Db
-import qualified Sql.Database.Postgres as Db
 import Storage.Schema
 import System.Random
 import Tuple
@@ -86,67 +85,54 @@ withSqlStorage logger db onFail onSuccess = do
         { spawnUser = \user -> do
             ref <- generateRef
             mret <- Db.queryMaybe db $
-                Insert "sn_users" (fReference "user_id" :* fUser :* E) (Val ref :* Val user :* E) E
+                Insert_ "sn_users" (fReference "user_id" :/ fUser :/ E) (Just ref :/ Just user :/ E)
             case mret of
-                Just E -> return $ Just $ ref
+                Just () -> return $ Just $ ref
                 _ -> return Nothing
         , getUser = \ref -> do
             mret <- Db.queryMaybe db $
-                Select ["sn_users"] (fUser :* E)
-                    [Where "user_id = ?" $ Val ref :* E]
+                Select ["sn_users"] (fUser :/ E)
+                    [Where "user_id = ?" $ Just ref :/ E]
                     []
                     (RowRange 0 1)
             case mret of
-                Just [Val user :* E] -> return $ Just user
+                Just [Just user :/ E] -> return $ Just user
                 _ -> return Nothing
         , setUser = \ref user -> do
             Db.queryMaybe db $
-                Update "sn_users" (fUser :* E) (Val user :* E)
-                    [Where "user_id = ?" $ Val ref :* E]
+                Update "sn_users" (fUser :/ E) (Just user :/ E)
+                    [Where "user_id = ?" $ Just ref :/ E]
         , deleteUser = \ref -> do
             Db.queryMaybe db $
                 Delete "sn_users"
-                    [Where "user_id = ?" $ Val ref :* E]
+                    [Where "user_id = ?" $ Just ref :/ E]
         , listUsers = \offset limit -> do
             mret <- Db.queryMaybe db $
-                Select ["sn_users"] (fReference "user_id" :* fUser :* E)
+                Select ["sn_users"] (fReference "user_id" :/ fUser :/ E)
                     []
                     [Asc "user_id"]
                     (RowRange offset limit)
             case mret of
                 Just rets -> return $ mapMaybe
                     (\row -> case row of
-                        Val ref :* Val user :* E -> Just (ref, user)
+                        Just ref :/ Just user :/ E -> Just (ref, user)
                         _ -> Nothing)
                     rets
                 Nothing -> return []
         }
 
--- referenceCondition :: Field (Reference a) -> Reference a -> Maybe Condition
--- referenceCondition (Field (FInt oidName :* FInt saltName :* E)) reference =
-    -- case reference of
-        -- ReferenceSalted oid salt ->
-            -- Just $ Condition
-                -- (oidName ++ " = ? AND " ++ saltName ++ " = ?")
-                -- (Val oid :* Val salt :* E)
-        -- ReferenceAny oid ->
-            -- Just $ Condition
-                -- (oidName ++ " = ?")
-                -- (Val oid :* E)
-
 instance IsValue (Reference a) where
-    type Prims (Reference a) = '[BS.ByteString]
-    primProxy _ = Proxy :* E
-    primDecode (VBlob b :* E) = do
+    type Prims (Reference a) = '[ 'TBlob ]
+    primDecode (VBlob b :/ E) = do
         let bs1 = BS.unpack b
         (x, bs2) <- decodeWord bs1
         (y, []) <- decodeWord bs2
         Just $ Reference x y
     primDecode _ = Nothing
-    primEncode (Reference x y) = VBlob (BS.pack $ encodeWord x ++ encodeWord y) :* E
+    primEncode (Reference x y) = VBlob (BS.pack $ encodeWord x ++ encodeWord y) :/ E
 
 fReference :: FieldName -> Field (Reference a)
-fReference fieldName = Field (FBlob fieldName :* E)
+fReference fieldName = Field (FBlob fieldName :/ E)
 
 generateRef :: IO (Reference a)
 generateRef = do
@@ -155,64 +141,59 @@ generateRef = do
     return $ Reference x y
 
 instance IsValue User where
-    type Prims User = '[Text.Text, Text.Text, UTCTime, Int64]
-    primProxy _ = Proxy :* Proxy :* Proxy :* Proxy :* E
-    primDecode (VText name :* VText surname :* VDateTime joinDate :* vIsAdmin :* E) = do
-        isAdmin <- primDecode $ vIsAdmin :* E
+    type Prims User = '[ 'TText, 'TText, 'TTime, 'TInt ]
+    primDecode (VText name :/ VText surname :/ VTime joinDate :/ vIsAdmin :/ E) = do
+        isAdmin <- primDecode $ vIsAdmin :/ E
         Just $ User name surname joinDate isAdmin
     primDecode _ = Nothing
     primEncode (User name surname joinDate isAdmin) =
-        VText name :* VText surname :* VDateTime joinDate :* primEncode isAdmin
+        VText name :/ VText surname :/ VTime joinDate :/ primEncode isAdmin
 
 fUser :: Field User
-fUser = Field (FText "user_name" :* FText "user_surname" :* FDateTime "user_join_date" :* FInt "user_is_admin" :* E)
+fUser = Field (FText "user_name" :/ FText "user_surname" :/ FTime "user_join_date" :/ FInt "user_is_admin" :/ E)
 
 instance IsValue AccessKey where
-    type Prims AccessKey = '[BS.ByteString, BS.ByteString, BS.ByteString]
-    primProxy _ = Proxy :* Proxy :* Proxy :* E
-    primDecode (VBlob keyFront :* VBlob keyBackHash :* vUserId :* E) = do
-        userId <- primDecode $ vUserId :* E
+    type Prims AccessKey = '[ 'TBlob, 'TBlob, 'TBlob ]
+    primDecode (VBlob keyFront :/ VBlob keyBackHash :/ vUserId :/ E) = do
+        userId <- primDecode $ vUserId :/ E
         Just $ AccessKey keyFront keyBackHash userId
     primDecode _ = Nothing
     primEncode (AccessKey keyFront keyBackHash userId) =
-        VBlob keyFront :* VBlob keyBackHash :* primEncode userId
+        VBlob keyFront :/ VBlob keyBackHash :/ primEncode userId
 
 fAccessKey :: Field AccessKey
-fAccessKey = Field (FBlob "access_key_front" :* FBlob "access_key_back_hash" :* FBlob "access_key_user_id" :* E)
+fAccessKey = Field (FBlob "access_key_front" :/ FBlob "access_key_back_hash" :/ FBlob "access_key_user_id" :/ E)
 
 instance IsValue Author where
-    type Prims Author = '[Text.Text, Text.Text]
-    primProxy _ = Proxy :* Proxy :* E
-    primDecode (VText name :* VText description :* E) = do
+    type Prims Author = '[ 'TText, 'TText ]
+    primDecode (VText name :/ VText description :/ E) = do
         Just $ Author name description
     primDecode _ = Nothing
     primEncode (Author name description) =
-        VText name :* VText description :* E
+        VText name :/ VText description :/ E
 
 fAuthor :: Field Author
-fAuthor = Field (FText "author_name" :* FText "author_description" :* E)
+fAuthor = Field (FText "author_name" :/ FText "author_description" :/ E)
 
 instance IsValue PublicationStatus where
-    type Prims PublicationStatus = '[UTCTime]
-    primProxy _ = Proxy :* E
-    primDecode (VDateTime date :* E) = Just $ PublishAt date
-    primDecode (VNull :* E) = Just $ NonPublished
-    primEncode (PublishAt date) = VDateTime date :* E
-    primEncode NonPublished = VNull :* E
+    type Prims PublicationStatus = '[ 'TTime ]
+    primDecode (VTime date :/ E) = Just $ PublishAt date
+    primDecode (VNull :/ E) = Just $ NonPublished
+    primEncode (PublishAt date) = VTime date :/ E
+    primEncode NonPublished = VNull :/ E
 
 instance IsValue Article where
-    type Prims Article = '[BS.ByteString, Text.Text, Text.Text, UTCTime]
-    primProxy _ = Proxy :* Proxy :* Proxy :* Proxy :* E
-    primDecode (vAuthorId :* VText name :* VText text :* vPubDate :* E) = do
-        authorId <- primDecode $ vAuthorId :* E
-        pubStatus <- primDecode $ vPubDate :* E
+    type Prims Article = '[ 'TBlob, 'TText, 'TText, 'TTime ]
+    primDecode (vAuthorId :/ VText name :/ VText text :/ vPubDate :/ E) = do
+        authorId <- primDecode $ vAuthorId :/ E
+        pubStatus <- primDecode $ vPubDate :/ E
         Just $ Article authorId name text pubStatus
     primDecode _ = Nothing
     primEncode (Article authorId name text pubStatus) =
-        primEncode authorId >* VText name :* VText text :* primEncode pubStatus
+        primEncode authorId ++/ VText name :/ VText text :/ primEncode pubStatus
 
 fArticle :: Field Article
-fArticle = Field (FBlob "article_author_id" :* FText "article_name" :* FText "article_text" :* FDateTime "article_publication_date" :* E)
+fArticle = Field (FBlob "article_author_id" :/ FText "article_name" :/ FText "article_text" :/ FTime "article_publication_date" :/ E)
 
 encodeWord :: Word64 -> [Word8]
 encodeWord x =

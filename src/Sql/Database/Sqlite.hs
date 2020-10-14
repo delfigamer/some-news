@@ -1,4 +1,6 @@
+{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 module Sql.Database.Sqlite
     ( withSqlite
@@ -11,14 +13,15 @@ import qualified Data.ByteString as BS
 import Data.IORef
 import Data.Int
 import Data.List
+import Data.Proxy
 import Data.String
 import qualified Data.Text as Text
 import Data.Time.Clock
-import Data.Time.Format.ISO8601
 import Database.SQLite.Simple
 import Database.SQLite.Simple.FromField
 import Database.SQLite.Simple.FromRow
 import Database.SQLite.Simple.ToField
+import Database.SQLite.Simple.ToRow
 import qualified Logger
 import qualified Sql.Database as Db
 import qualified Sql.Query as Q
@@ -48,14 +51,14 @@ sqliteQueryMaybe :: Logger.Handle -> MVar Connection -> Q.Query result -> IO (Ma
 sqliteQueryMaybe logger mvconn queryData = do
     withMVar mvconn $ \conn -> do
         Q.withQueryRender sqliteDetailRenderer queryData $ \queryValues queryText -> do
-            Logger.debug logger $ "Sqlite: " <> Text.pack queryText <> "; -- " <> Text.pack (show queryValues)
+            Logger.debug logger $ "Sqlite: " <> Text.pack queryText <> "; -- " <> Text.pack (Q.showPrimValues 0 queryValues "")
             let sqlQuery = fromString queryText :: Query
             eresult <- try $ case queryData of
                 Q.CreateTable {} -> execute_ conn sqlQuery
                 Q.CreateIndex {} -> execute_ conn sqlQuery
                 Q.DropTable {} -> execute_ conn sqlQuery
-                Q.Select _ fields _ _ _ -> queryWith (valueParser fields) conn sqlQuery queryValues
-                Q.Insert _ _ _ E -> execute conn sqlQuery queryValues >> return E
+                Q.Select {} -> query conn sqlQuery queryValues
+                Q.Insert_ {} -> execute conn sqlQuery queryValues
                 Q.Insert table fields values rets -> sqliteInsertReturning logger conn table fields values rets
                 Q.Update {} -> execute conn sqlQuery queryValues
                 Q.Delete {} -> execute conn sqlQuery queryValues
@@ -65,17 +68,20 @@ sqliteQueryMaybe logger mvconn queryData = do
                     return Nothing
                 Right result -> return $ Just result
 
-sqliteInsertReturning :: Logger.Handle -> Connection -> Q.TableName -> TupleT Q.Field vs -> TupleT Q.Value vs -> TupleT Q.Field rs -> IO (TupleT Q.Value rs)
+sqliteInsertReturning
+    :: (All Q.IsValue vs, All Q.IsValue rs)
+    => Logger.Handle -> Connection
+    -> Q.TableName -> HList Q.Field vs -> HList Maybe vs -> HList Q.Field rs -> IO (HList Maybe rs)
 sqliteInsertReturning logger conn table fields values rets = do
-    let queryData1 = Q.Insert table fields values E
+    let queryData1 = Q.Insert_ table fields values
     Q.withQueryRender sqliteDetailRenderer queryData1 $ \queryValues1 queryText1 -> do
-        Logger.debug logger $ "Sqlite: " <> Text.pack queryText1 <> "; -- " <> Text.pack (show queryValues1)
+        Logger.debug logger $ "Sqlite: " <> Text.pack queryText1 <> "; -- " <> Text.pack (Q.showPrimValues 0 queryValues1 "")
         execute conn (fromString queryText1) queryValues1
         lastRowId <- lastInsertRowId conn
-        let queryData2 = Q.Select [table] rets [Q.Where "_rowid_ = ?" $ Q.Val lastRowId :* E] [] Q.AllRows
+        let queryData2 = Q.Select [table] rets [Q.Where "_rowid_ = ?" $ Just lastRowId :/ E] [] Q.AllRows
         Q.withQueryRender sqliteDetailRenderer queryData2 $ \queryValues2 queryText2 -> do
-            Logger.debug logger $ "Sqlite: " <> Text.pack queryText2 <> "; -- " <> Text.pack (show queryValues2)
-            [result] <- queryWith (valueParser rets) conn (fromString queryText2) queryValues2
+            Logger.debug logger $ "Sqlite: " <> Text.pack queryText2 <> "; -- " <> Text.pack (Q.showPrimValues 0 queryValues2 "")
+            [result] <- query conn (fromString queryText2) queryValues2
             return result
 
 sqliteFoldQuery :: Logger.Handle -> MVar Connection -> Q.Query [row] -> a -> (a -> row -> IO a) -> IO a
@@ -99,45 +105,50 @@ sqliteDetailRenderer :: Q.DetailRenderer
 sqliteDetailRenderer = Q.DetailRenderer
     { Q.renderFieldType = \field -> case field of
         Q.FInt _ -> " INTEGER"
-        Q.FFloat _ -> " REAL"
+        Q.FReal _ -> " REAL"
         Q.FText _ -> " TEXT"
         Q.FBlob _ -> " BLOB"
-        Q.FDateTime _ -> " TEXT"
+        Q.FTime _ -> " TEXT"
     }
 
-valueParser :: TupleT Q.Field ts -> RowParser (TupleT Q.Value ts)
-valueParser fields = Q.decode fields <$> primParser (Q.primFields fields)
+instance forall ts. (All Q.IsValue ts) => FromRow (HList Maybe ts) where
+    fromRow = traverseHListGiven
+        (Proxy :: Proxy Q.IsValue)
+        (proxyHList (Proxy :: Proxy ts))
+        parseValue
 
-primParser :: TupleT Q.PrimField ts -> RowParser (TupleT Q.PrimValue ts)
-primParser E = return E
-primParser (Q.FInt _ :* fs) = (:*) <$> field <*> primParser fs
-primParser (Q.FFloat _ :* fs) = (:*) <$> field <*> primParser fs
-primParser (Q.FText _ :* fs) = (:*) <$> field <*> primParser fs
-primParser (Q.FBlob _ :* fs) = (:*) <$> field <*> primParser fs
-primParser (Q.FDateTime _ :* fs) = (:*) <$> field <*> primParser fs
+parseValue :: forall a. Q.IsValue a => Proxy a -> RowParser (Maybe a)
+parseValue _ = fmap Q.primDecode $ traverseHListGiven
+    (Proxy :: Proxy Q.IsPrimType)
+    (proxyHList (Proxy :: Proxy (Q.Prims a)))
+    parsePrimValue
 
-instance FromField (Q.PrimValue Int64) where
+parsePrimValue :: Q.IsPrimType a => Proxy a -> RowParser (Q.PrimValue a)
+parsePrimValue proxy = Q.matchPrimType proxy
+    field field field field field
+
+instance FromField (Q.PrimValue 'Q.TInt) where
     fromField f = (Q.VInt <$> fromField f) `mplus` return Q.VNull
 
-instance FromField (Q.PrimValue Double) where
-    fromField f = (Q.VFloat <$> fromField f) `mplus` return Q.VNull
+instance FromField (Q.PrimValue 'Q.TReal) where
+    fromField f = (Q.VReal <$> fromField f) `mplus` return Q.VNull
 
-instance FromField (Q.PrimValue Text.Text) where
+instance FromField (Q.PrimValue 'Q.TText) where
     fromField f = (Q.VText <$> fromField f) `mplus` return Q.VNull
 
-instance FromField (Q.PrimValue BS.ByteString) where
+instance FromField (Q.PrimValue 'Q.TBlob) where
     fromField f = (Q.VBlob <$> fromField f) `mplus` return Q.VNull
 
-instance FromField (Q.PrimValue UTCTime) where
-    fromField f = (Q.VDateTime <$> fromField f) `mplus` return Q.VNull
+instance FromField (Q.PrimValue 'Q.TTime) where
+    fromField f = (Q.VTime <$> fromField f) `mplus` return Q.VNull
 
-instance ToRow (TupleT Q.PrimValue ts) where
-    toRow = mapTuple toField
+instance ToRow (HList Q.PrimValue ts) where
+    toRow = homogenize toField
 
 instance ToField (Q.PrimValue a) where
     toField (Q.VInt x) = toField x
-    toField (Q.VFloat x) = toField x
+    toField (Q.VReal x) = toField x
     toField (Q.VText x) = toField x
     toField (Q.VBlob x) = toField x
-    toField (Q.VDateTime x) = toField x
+    toField (Q.VTime x) = toField x
     toField Q.VNull = SQLNull

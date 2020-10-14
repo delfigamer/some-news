@@ -11,7 +11,7 @@ data DetailRenderer = DetailRenderer
     { renderFieldType :: forall a. PrimField a -> String
     }
 
-withQueryRender :: DetailRenderer -> Query result -> (forall ts. TupleT PrimValue ts -> String -> r) -> r
+withQueryRender :: DetailRenderer -> Query result -> (forall ts. HList PrimValue ts -> String -> r) -> r
 withQueryRender detail (CreateTable (TableName table) columns constraints) onRender =
     onRender E $
         "CREATE TABLE " ++ table ++ " ("
@@ -37,7 +37,7 @@ withQueryRender _ (Select tableList fields cond order range) onRender =
             ++ case range of
                 AllRows -> ""
                 RowRange offset limit -> " LIMIT " ++ show limit ++ " OFFSET " ++ show offset
-withQueryRender _ (Insert (TableName table) fields values E) onRender =
+withQueryRender _ (Insert_ (TableName table) fields values) onRender =
     onRender (encode values) $
         "INSERT INTO " ++ table ++ " (" ++ fieldNames fields ++ ")"
             ++ " VALUES (" ++ fieldPlaceholders fields ++ ")"
@@ -47,7 +47,7 @@ withQueryRender _ (Insert (TableName table) fields values rets) onRender =
             ++ " VALUES (" ++ fieldPlaceholders fields ++ ")"
             ++ " RETURNING " ++ fieldNames rets
 withQueryRender _ (Update (TableName table) fields values cond) onRender =
-    withConditionValues cond $ \condVals -> onRender (encode values >* condVals) $
+    withConditionValues cond $ \condVals -> onRender (encode values ++/ condVals) $
         "UPDATE " ++ table ++ " SET (" ++ fieldNames fields ++ ")"
             ++ " = (" ++ fieldPlaceholders fields ++ ")"
             ++ case cond of
@@ -60,12 +60,9 @@ withQueryRender _ (Delete (TableName table) cond) onRender =
                 [] -> ""
                 _ -> " WHERE " ++ renderConditionTemplate cond
 
-withNoValues :: (forall ts. TupleT PrimValue ts -> r) -> r
-withNoValues f = f E
-
-withConditionValues :: [Where] -> (forall ts. TupleT PrimValue ts -> r) -> r
+withConditionValues :: [Where] -> (forall ts. HList PrimValue ts -> r) -> r
 withConditionValues [] f = f E
-withConditionValues (Where _ values:rest) f = withConditionValues rest $ \others -> f $ encode values >* others
+withConditionValues (Where _ values:rest) f = withConditionValues rest $ \others -> f $ encode values ++/ others
 
 renderColumnDecl :: DetailRenderer -> ColumnDecl -> String
 renderColumnDecl detail (ColumnDecl field constrs) = primFieldName field ++ renderFieldType detail field ++ renderColumnConstraints constrs
@@ -91,27 +88,24 @@ renderFKR FKRCascade = " CASCADE"
 renderFKR FKRSetNull = " SET NULL"
 renderFKR FKRSetDefault = " SET DEFAULT"
 
-primFieldNames :: TupleT PrimField ts -> String
-primFieldNames = intercalate ", " . mapTuple primFieldName
-
-fieldNames :: TupleT Field ts -> String
-fieldNames = intercalate ", " . fieldList
-
-fieldPlaceholders :: TupleT Field ts -> String
-fieldPlaceholders = intercalate ", " . map (const "?") . fieldList
-
-fieldList :: TupleT Field ts -> [String]
-fieldList E = []
-fieldList (Field fs :* rest) = mapTuple primFieldName fs ++ fieldList rest
-
-renderTableList :: [TableName] -> String
-renderTableList = intercalate ", " . map (\(TableName table) -> table)
-
-renderConditionTemplate :: [Where] -> String
-renderConditionTemplate = intercalate " AND " . map (\(Where str _) -> "(" ++ str ++ ")")
-
 renderRowOrder :: [RowOrder] -> String
 renderRowOrder = intercalate ", " . map r1
   where
     r1 (Asc (FieldName field)) = field
     r1 (Desc (FieldName field)) = field ++ " DESC"
+
+renderConditionTemplate :: [Where] -> String
+renderConditionTemplate = intercalate " AND " . map (\(Where str _) -> "(" ++ str ++ ")")
+
+fieldNames :: HList Field ts -> String
+fieldNames = intercalate ", " . fieldList
+
+fieldPlaceholders :: HList Field ts -> String
+fieldPlaceholders = intercalate ", " . map (const "?") . fieldList
+
+fieldList :: HList Field ts -> [String]
+fieldList E = []
+fieldList (Field fs :/ rest) = homogenize primFieldName fs ++ fieldList rest
+
+renderTableList :: [TableName] -> String
+renderTableList = intercalate ", " . map (\(TableName table) -> table)
