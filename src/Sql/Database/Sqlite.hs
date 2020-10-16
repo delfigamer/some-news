@@ -87,7 +87,11 @@ sqliteInsertReturning logger conn table fields values rets = do
 sqliteFoldQuery :: Logger.Handle -> MVar Connection -> Q.Query [row] -> a -> (a -> row -> IO a) -> IO a
 sqliteFoldQuery logger mvconn queryData seed foldf = do
     withMVar mvconn $ \conn -> do
-        undefined
+        Q.withQueryRender sqliteDetailRenderer queryData $ \queryValues queryText -> do
+            Logger.debug logger $ "Sqlite: (streaming) " <> Text.pack queryText <> "; -- " <> Text.pack (Q.showPrimValues 0 queryValues "")
+            let sqlQuery = fromString queryText :: Query
+            case queryData of
+                Q.Select {} -> fold conn sqlQuery queryValues seed foldf
 
 sqliteWithTransaction :: Logger.Handle -> MVar Connection -> IO r -> IO r
 sqliteWithTransaction logger mvconn act = do

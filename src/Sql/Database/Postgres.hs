@@ -37,7 +37,7 @@ withPostgres conf logger body = do
         (\conn -> do
             body $ Db.Handle
                 { Db.queryMaybe = postgresQueryMaybe logger conn
-                , Db.foldQuery = undefined
+                , Db.foldQuery = postgresFoldQuery logger conn
                 , Db.withTransaction = postgresWithTransaction logger conn
                 })
 
@@ -74,6 +74,14 @@ postgresQueryMaybe logger conn queryData = do
                 Logger.warn logger $ "Postgres: " <> Text.pack (displayException (err :: SomeException))
                 return Nothing
             Right result -> return $ Just result
+
+postgresFoldQuery :: Logger.Handle -> Connection -> Q.Query [row] -> a -> (a -> row -> IO a) -> IO a
+postgresFoldQuery logger conn queryData seed foldf = do
+    Q.withQueryRender postgresDetailRenderer queryData $ \queryValues queryText -> do
+        Logger.debug logger $ "Postgres: (streaming) " <> Text.pack queryText <> "; -- " <> Text.pack (Q.showPrimValues 0 queryValues "")
+        let sqlQuery = fromString queryText :: Query
+        case queryData of
+            Q.Select {} -> fold conn sqlQuery queryValues seed foldf
 
 postgresWithTransaction :: Logger.Handle -> Connection -> IO r -> IO r
 postgresWithTransaction logger conn act = do

@@ -22,15 +22,17 @@ description:         Please see the README on GitHub at <https://github.com/gith
 default-extensions: DataKinds, GADTs, OverloadedStrings, RankNTypes, TypeOperators
 
 dependencies:
-- QuickCheck
 - aeson
 - ansi-terminal
 - base
 - bytestring
+- containers
 - cryptonite
 - hspec
+- memory
 - postgresql-simple
-- random
+- random == 1.2.*
+- splitmix == 0.1.*
 - sqlite-simple
 - text
 - time

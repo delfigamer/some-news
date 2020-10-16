@@ -4,7 +4,7 @@ cabal-version: 1.12
 --
 -- see: https://github.com/sol/hpack
 --
--- hash: 4abe24d1e9513215937922876f17040758fa86b41911473449aa7ca25bf3fa91
+-- hash: cdf4da32c81b096d88eedbcf8d8fa72706da6c8a24359006dd645f45cb3aae92
 
 name:           SomeNews
 version:        0.1.0.0
@@ -44,15 +44,17 @@ library
       src
   default-extensions: DataKinds, GADTs, OverloadedStrings, RankNTypes, TypeOperators
   build-depends:
-      QuickCheck
-    , aeson
+      aeson
     , ansi-terminal
     , base
     , bytestring
+    , containers
     , cryptonite
     , hspec
+    , memory
     , postgresql-simple
-    , random
+    , random ==1.2.*
+    , splitmix ==0.1.*
     , sqlite-simple
     , text
     , time
@@ -70,16 +72,18 @@ executable SomeNews-exe
   default-extensions: DataKinds, GADTs, OverloadedStrings, RankNTypes, TypeOperators
   ghc-options: -threaded -rtsopts -with-rtsopts=-N
   build-depends:
-      QuickCheck
-    , SomeNews
+      SomeNews
     , aeson
     , ansi-terminal
     , base
     , bytestring
+    , containers
     , cryptonite
     , hspec
+    , memory
     , postgresql-simple
-    , random
+    , random ==1.2.*
+    , splitmix ==0.1.*
     , sqlite-simple
     , text
     , time
@@ -92,6 +96,7 @@ test-suite SomeNews-test
   type: exitcode-stdio-1.0
   main-is: Spec.hs
   other-modules:
+      Gen
       StorageSpec
       Paths_SomeNews
   hs-source-dirs:
@@ -99,16 +104,18 @@ test-suite SomeNews-test
   default-extensions: DataKinds, GADTs, OverloadedStrings, RankNTypes, TypeOperators
   ghc-options: -threaded -rtsopts -with-rtsopts=-N
   build-depends:
-      QuickCheck
-    , SomeNews
+      SomeNews
     , aeson
     , ansi-terminal
     , base
     , bytestring
+    , containers
     , cryptonite
     , hspec
+    , memory
     , postgresql-simple
-    , random
+    , random ==1.2.*
+    , splitmix ==0.1.*
     , sqlite-simple
     , text
     , time

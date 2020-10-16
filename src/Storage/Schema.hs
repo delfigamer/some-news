@@ -96,8 +96,8 @@ upgradeEmptyToCurrent logger db = do
             ]
             []
         Db.query db $ CreateTable "sn_access_keys"
-            [ ColumnDecl (FBlob "access_key_front") [CCPrimaryKey]
-            , ColumnDecl (FBlob "access_key_back_hash") [CCNotNull]
+            [ ColumnDecl (FBlob "access_key_id") [CCPrimaryKey]
+            , ColumnDecl (FBlob "access_key_hash") [CCNotNull]
             , ColumnDecl (FBlob "access_key_user_id") [CCNotNull, CCReferences "sn_users" "user_id" FKRCascade FKRCascade]
             ]
             []

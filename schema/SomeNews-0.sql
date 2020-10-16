@@ -21,8 +21,8 @@ CREATE TABLE sn_users
     );
 
 CREATE TABLE sn_access_keys
-    ( access_key_front BLOB PRIMARY KEY
-    , access_key_back_hash BLOB NOT NULL
+    ( access_key_id BLOB PRIMARY KEY
+    , access_key_hash BLOB NOT NULL
     , access_key_user_id BLOB NOT NULL
         REFERENCES sn_users (user_id) ON UPDATE CASCADE ON DELETE CASCADE
     );
