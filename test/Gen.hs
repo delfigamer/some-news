@@ -6,6 +6,8 @@ module Gen
     , suchThat
     , randomPrintableChar
     , randomPrintableString
+    , chooseFrom
+    , chooseAllFrom
     , generate
     ) where
 
@@ -59,9 +61,46 @@ randomPrintableChar = do
 randomPrintableString :: Int -> Gen String
 randomPrintableString n = replicateM n randomPrintableChar
 
+chooseFrom :: [a] -> Int -> Gen [a]
+chooseFrom list n = takeSource n $ permutationSource list
+
+chooseAllFrom :: [a] -> Gen [a]
+chooseAllFrom list = takeAllSource $ permutationSource list
+
 generate :: Gen a -> IO a
 generate m = atomicModifyIORef' globalGen $ \g1 -> runGen m g1 $ \g2 x -> (g2, x)
 
 globalGen :: IORef R.StdGen
 globalGen = unsafePerformIO $ newIORef =<< R.newStdGen
 {-# NOINLINE globalGen #-}
+
+newtype GenSource a = GenSource (Gen (Maybe (a, GenSource a)))
+
+takeSource :: Int -> GenSource a -> Gen [a]
+takeSource 0 _ = return []
+takeSource i (GenSource f) = do
+    iter <- f
+    case iter of
+        Just (x, next) -> (x:) <$> takeSource (i-1) next
+        Nothing -> return []
+
+takeAllSource :: GenSource a -> Gen [a]
+takeAllSource (GenSource f) = do
+    iter <- f
+    case iter of
+        Just (x, next) -> (x:) <$> takeAllSource next
+        Nothing -> return []
+
+permutationSource :: [a] -> GenSource a
+permutationSource list0 = do
+    let len0 = length list0
+    GenSource $ sourceFunc len0 list0
+  where
+    sourceFunc 0 _ = return Nothing
+    sourceFunc len list = do
+        i <- randomWithin 0 (len-1)
+        let (x, xs) = listMinus i list
+        return $ Just (x, GenSource $ sourceFunc (len-1) xs)
+    listMinus _ [] = error "empty list"
+    listMinus 0 (x:xs) = (x, xs)
+    listMinus i (x:xs) = (x:) <$> listMinus (i-1) xs

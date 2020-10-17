@@ -51,6 +51,7 @@ CREATE TABLE sn_articles
         REFERENCES sn_authors (author_id) ON UPDATE CASCADE ON DELETE SET NULL
     , article_name TEXT NOT NULL
     , article_text TEXT NOT NULL
+    , article_version BLOB NOT NULL
     , article_publication_date DATETIME NULL
     );
 CREATE INDEX sn_articles_publication_date_idx

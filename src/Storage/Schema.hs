@@ -120,6 +120,7 @@ upgradeEmptyToCurrent logger db = do
             , ColumnDecl (FBlob "article_author_id") [CCNotNull, CCReferences "sn_authors" "author_id" FKRCascade FKRSetNull]
             , ColumnDecl (FText "article_name") [CCNotNull]
             , ColumnDecl (FText "article_text") [CCNotNull]
+            , ColumnDecl (FBlob "article_version") [CCNotNull]
             , ColumnDecl (FTime "article_publication_date") []
             ]
             []
