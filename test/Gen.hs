@@ -1,5 +1,6 @@
 module Gen
     ( Gen
+    , random
     , randomBool
     , randomChar
     , randomWithin
@@ -8,6 +9,8 @@ module Gen
     , randomPrintableString
     , chooseFrom
     , chooseAllFrom
+    , chooseFromSuch
+    , chooseAllFromSuch
     , generate
     ) where
 
@@ -32,6 +35,9 @@ instance Monad Gen where
 
 gen :: (R.StdGen -> (a, R.StdGen)) -> Gen a
 gen f = Gen $ \g1 cont -> let (x, g2) = f g1 in cont g2 x
+
+random :: R.Uniform a => Gen a
+random = gen $ R.uniform
 
 randomBool :: Gen Bool
 randomBool = gen R.uniform
@@ -61,11 +67,17 @@ randomPrintableChar = do
 randomPrintableString :: Int -> Gen String
 randomPrintableString n = replicateM n randomPrintableChar
 
-chooseFrom :: [a] -> Int -> Gen [a]
-chooseFrom list n = takeSource n $ permutationSource list
+chooseFrom :: Int -> [a] -> Gen [a]
+chooseFrom = chooseFromSuch (const True)
 
 chooseAllFrom :: [a] -> Gen [a]
-chooseAllFrom list = takeAllSource $ permutationSource list
+chooseAllFrom = chooseAllFromSuch (const True)
+
+chooseFromSuch :: (a -> Bool) -> Int -> [a] -> Gen [a]
+chooseFromSuch filter n = takeSource filter n . permutationSource
+
+chooseAllFromSuch :: (a -> Bool) -> [a] -> Gen [a]
+chooseAllFromSuch filter = takeAllSource filter . permutationSource
 
 generate :: Gen a -> IO a
 generate m = atomicModifyIORef' globalGen $ \g1 -> runGen m g1 $ \g2 x -> (g2, x)
@@ -76,19 +88,23 @@ globalGen = unsafePerformIO $ newIORef =<< R.newStdGen
 
 newtype GenSource a = GenSource (Gen (Maybe (a, GenSource a)))
 
-takeSource :: Int -> GenSource a -> Gen [a]
-takeSource 0 _ = return []
-takeSource i (GenSource f) = do
+takeSource :: (a -> Bool) -> Int -> GenSource a -> Gen [a]
+takeSource _ 0 _ = return []
+takeSource filter i (GenSource f) = do
     iter <- f
     case iter of
-        Just (x, next) -> (x:) <$> takeSource (i-1) next
+        Just (x, next) -> if filter x
+            then (x:) <$> takeSource filter (i-1) next
+            else takeSource filter i next
         Nothing -> return []
 
-takeAllSource :: GenSource a -> Gen [a]
-takeAllSource (GenSource f) = do
+takeAllSource :: (a -> Bool) -> GenSource a -> Gen [a]
+takeAllSource filter (GenSource f) = do
     iter <- f
     case iter of
-        Just (x, next) -> (x:) <$> takeAllSource next
+        Just (x, next) -> if filter x
+            then (x:) <$> takeAllSource filter next
+            else takeAllSource filter next
         Nothing -> return []
 
 permutationSource :: [a] -> GenSource a

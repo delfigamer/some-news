@@ -27,7 +27,7 @@ CREATE TABLE sn_access_keys
         REFERENCES sn_users (user_id) ON UPDATE CASCADE ON DELETE CASCADE
     );
 CREATE INDEX sn_access_keys_user_id_idx
-    ON sn_access_keys (access_key_user_id);
+    ON sn_access_keys (access_key_user_id, access_key_id);
 
 CREATE TABLE sn_authors
     ( author_id BLOB PRIMARY KEY
@@ -49,13 +49,15 @@ CREATE TABLE sn_articles
     ( article_id BLOB PRIMARY KEY
     , article_author_id BLOB NULL
         REFERENCES sn_authors (author_id) ON UPDATE CASCADE ON DELETE SET NULL
+    , article_version BLOB NOT NULL
     , article_name TEXT NOT NULL
     , article_text TEXT NOT NULL
-    , article_version BLOB NOT NULL
-    , article_publication_date DATETIME NULL
+    , article_publication_date DATETIME NOT NULL
     );
-CREATE INDEX sn_articles_publication_date_idx
-    ON sn_articles (article_publication_date);
+CREATE INDEX sn_articles_main_idx
+    ON sn_articles (article_publication_date DESC, article_id);
+CREATE INDEX sn_articles_author_idx
+    ON sn_articles (article_author_id, article_publication_date DESC, article_id);
 
 CREATE TABLE sn_files
     ( file_id BLOB PRIMARY KEY

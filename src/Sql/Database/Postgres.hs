@@ -57,18 +57,20 @@ postgresQueryMaybe logger conn queryData = do
                 _ <- execute_ conn sqlQuery
                 return ()
             Q.Select {} -> query conn sqlQuery queryValues
-            Q.Insert_ {} -> do
-                _ <- execute conn sqlQuery queryValues
-                return ()
+            Q.Insert _ _ _ E -> do
+                n <- execute conn sqlQuery queryValues
+                case n of
+                    1 -> return $ Just E
+                    _ -> return Nothing
             Q.Insert {} -> do
-                [r] <- query conn sqlQuery queryValues
-                return r
+                rets <- query conn sqlQuery queryValues
+                case rets of
+                    [result] -> return $ Just result
+                    _ -> return Nothing
             Q.Update {} -> do
-                _ <- execute conn sqlQuery queryValues
-                return ()
+                fromIntegral <$> execute conn sqlQuery queryValues
             Q.Delete {} -> do
-                _ <- execute conn sqlQuery queryValues
-                return ()
+                fromIntegral <$> execute conn sqlQuery queryValues
         case eresult of
             Left err -> do
                 Logger.warn logger $ "Postgres: " <> Text.pack (displayException (err :: SomeException))
@@ -98,6 +100,7 @@ postgresDetailRenderer = Q.DetailRenderer
         Q.FText _ -> " TEXT"
         Q.FBlob _ -> " BYTEA"
         Q.FTime _ -> " TIMESTAMPTZ"
+    , Q.renderInsertPart = \inner -> "INSERT INTO " ++ inner ++ " ON CONFLICT DO NOTHING"
     }
 
 instance forall ts. (All Q.IsValue ts) => FromRow (HList Maybe ts) where
@@ -140,4 +143,6 @@ instance ToField (Q.PrimValue a) where
     toField (Q.VText x) = toField x
     toField (Q.VBlob x) = toField (Binary x)
     toField (Q.VTime x) = toField x
+    toField Q.VTPosInf = toField ("infinity" :: String)
+    toField Q.VTNegInf = toField ("-infinity" :: String)
     toField Q.VNull = toField Null

@@ -9,6 +9,7 @@ import Tuple
 
 data DetailRenderer = DetailRenderer
     { renderFieldType :: forall a. PrimField a -> String
+    , renderInsertPart :: String -> String
     }
 
 withQueryRender :: DetailRenderer -> Query result -> (forall ts. HList PrimValue ts -> String -> r) -> r
@@ -37,14 +38,14 @@ withQueryRender _ (Select tableList fields cond order range) onRender =
             ++ case range of
                 AllRows -> ""
                 RowRange offset limit -> " LIMIT " ++ show limit ++ " OFFSET " ++ show offset
-withQueryRender _ (Insert_ (TableName table) fields values) onRender =
+withQueryRender detail (Insert (TableName table) fields values E) onRender =
     onRender (encode values) $
-        "INSERT INTO " ++ table ++ " (" ++ fieldNames fields ++ ")"
-            ++ " VALUES (" ++ fieldPlaceholders fields ++ ")"
-withQueryRender _ (Insert (TableName table) fields values rets) onRender =
+        renderInsertPart detail
+                (table ++ " (" ++ fieldNames fields ++ ")" ++ " VALUES (" ++ fieldPlaceholders fields ++ ")")
+withQueryRender detail (Insert (TableName table) fields values rets) onRender =
     onRender (encode values) $
-        "INSERT INTO " ++ table ++ " (" ++ fieldNames fields ++ ")"
-            ++ " VALUES (" ++ fieldPlaceholders fields ++ ")"
+        renderInsertPart detail
+                (table ++ " (" ++ fieldNames fields ++ ")" ++ " VALUES (" ++ fieldPlaceholders fields ++ ")")
             ++ " RETURNING " ++ fieldNames rets
 withQueryRender _ (Update (TableName table) fields values cond) onRender =
     withConditionValues cond $ \condVals -> onRender (encode values ++/ condVals) $

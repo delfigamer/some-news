@@ -58,10 +58,19 @@ sqliteQueryMaybe logger mvconn queryData = do
                 Q.CreateIndex {} -> execute_ conn sqlQuery
                 Q.DropTable {} -> execute_ conn sqlQuery
                 Q.Select {} -> query conn sqlQuery queryValues
-                Q.Insert_ {} -> execute conn sqlQuery queryValues
+                Q.Insert _ _ _ E -> do
+                    execute conn sqlQuery queryValues
+                    n <- changes conn
+                    case n of
+                        0 -> return Nothing
+                        _ -> return (Just E)
                 Q.Insert table fields values rets -> sqliteInsertReturning logger conn table fields values rets
-                Q.Update {} -> execute conn sqlQuery queryValues
-                Q.Delete {} -> execute conn sqlQuery queryValues
+                Q.Update {} -> do
+                    execute conn sqlQuery queryValues
+                    changes conn
+                Q.Delete {} -> do
+                    execute conn sqlQuery queryValues
+                    changes conn
             case eresult of
                 Left err -> do
                     Logger.warn logger $ "Sqlite: " <> Text.pack (displayException (err :: SomeException))
@@ -71,18 +80,24 @@ sqliteQueryMaybe logger mvconn queryData = do
 sqliteInsertReturning
     :: (All Q.IsValue vs, All Q.IsValue rs)
     => Logger.Handle -> Connection
-    -> Q.TableName -> HList Q.Field vs -> HList Maybe vs -> HList Q.Field rs -> IO (HList Maybe rs)
+    -> Q.TableName -> HList Q.Field vs -> HList Maybe vs -> HList Q.Field rs -> IO (Maybe (HList Maybe rs))
 sqliteInsertReturning logger conn table fields values rets = do
-    let queryData1 = Q.Insert_ table fields values
+    let queryData1 = Q.Insert table fields values E
     Q.withQueryRender sqliteDetailRenderer queryData1 $ \queryValues1 queryText1 -> do
         Logger.debug logger $ "Sqlite: " <> Text.pack queryText1 <> "; -- " <> Text.pack (Q.showPrimValues 0 queryValues1 "")
         execute conn (fromString queryText1) queryValues1
-        lastRowId <- lastInsertRowId conn
-        let queryData2 = Q.Select [table] rets [Q.Where "_rowid_ = ?" $ Just lastRowId :/ E] [] Q.AllRows
-        Q.withQueryRender sqliteDetailRenderer queryData2 $ \queryValues2 queryText2 -> do
-            Logger.debug logger $ "Sqlite: " <> Text.pack queryText2 <> "; -- " <> Text.pack (Q.showPrimValues 0 queryValues2 "")
-            [result] <- query conn (fromString queryText2) queryValues2
-            return result
+        n <- changes conn
+        case n of
+            0 -> return Nothing
+            _ -> do
+                lastRowId <- lastInsertRowId conn
+                let queryData2 = Q.Select [table] rets [Q.Where "_rowid_ = ?" $ Just lastRowId :/ E] [] Q.AllRows
+                Q.withQueryRender sqliteDetailRenderer queryData2 $ \queryValues2 queryText2 -> do
+                    Logger.debug logger $ "Sqlite: " <> Text.pack queryText2 <> "; -- " <> Text.pack (Q.showPrimValues 0 queryValues2 "")
+                    rets <- query conn (fromString queryText2) queryValues2
+                    case rets of
+                        [result] -> return $ Just result
+                        _ -> return Nothing
 
 sqliteFoldQuery :: Logger.Handle -> MVar Connection -> Q.Query [row] -> a -> (a -> row -> IO a) -> IO a
 sqliteFoldQuery logger mvconn queryData seed foldf = do
@@ -113,6 +128,7 @@ sqliteDetailRenderer = Q.DetailRenderer
         Q.FText _ -> " TEXT"
         Q.FBlob _ -> " BLOB"
         Q.FTime _ -> " TEXT"
+    , Q.renderInsertPart = \inner -> "INSERT OR IGNORE INTO " ++ inner
     }
 
 instance forall ts. (All Q.IsValue ts) => FromRow (HList Maybe ts) where
@@ -155,4 +171,6 @@ instance ToField (Q.PrimValue a) where
     toField (Q.VText x) = toField x
     toField (Q.VBlob x) = toField x
     toField (Q.VTime x) = toField x
+    toField Q.VTPosInf = toField ("infinity" :: String)
+    toField Q.VTNegInf = toField ("-infinity" :: String)
     toField Q.VNull = SQLNull

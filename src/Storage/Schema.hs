@@ -84,9 +84,10 @@ upgradeEmptyToCurrent logger db = do
             , ColumnDecl (FText "mvalue") []
             ]
             []
-        Db.query db $ Insert_ "sn_metadata"
+        Db.query db $ Insert "sn_metadata"
             (fString "mkey" :/ fSchemaVersion "mvalue" :/ E)
             (Just "schema_version" :/ Just currentSchema :/ E)
+            E
         Db.query db $ CreateTable "sn_users"
             [ ColumnDecl (FBlob "user_id") [CCPrimaryKey]
             , ColumnDecl (FText "user_name") [CCNotNull]
@@ -101,7 +102,8 @@ upgradeEmptyToCurrent logger db = do
             , ColumnDecl (FBlob "access_key_user_id") [CCNotNull, CCReferences "sn_users" "user_id" FKRCascade FKRCascade]
             ]
             []
-        Db.query db $ CreateIndex "sn_access_keys_user_id_idx" "sn_access_keys" [Asc "access_key_user_id"]
+        Db.query db $ CreateIndex "sn_access_keys_user_id_idx" "sn_access_keys"
+            [Asc "access_key_user_id", Asc "access_key_id"]
         Db.query db $ CreateTable "sn_authors"
             [ ColumnDecl (FBlob "author_id") [CCPrimaryKey]
             , ColumnDecl (FText "author_name") [CCNotNull]
@@ -114,17 +116,21 @@ upgradeEmptyToCurrent logger db = do
             ]
             [ TCPrimaryKey ["a2u_author_id", "a2u_user_id"]
             ]
-        Db.query db $ CreateIndex "sn_author2user_rev_idx" "sn_author2user" [Asc "a2u_user_id", Asc "a2u_author_id"]
+        Db.query db $ CreateIndex "sn_author2user_rev_idx" "sn_author2user"
+            [Asc "a2u_user_id", Asc "a2u_author_id"]
         Db.query db $ CreateTable "sn_articles"
             [ ColumnDecl (FBlob "article_id") [CCPrimaryKey]
-            , ColumnDecl (FBlob "article_author_id") [CCNotNull, CCReferences "sn_authors" "author_id" FKRCascade FKRSetNull]
+            , ColumnDecl (FBlob "article_author_id") [CCReferences "sn_authors" "author_id" FKRCascade FKRSetNull]
+            , ColumnDecl (FBlob "article_version") [CCNotNull]
             , ColumnDecl (FText "article_name") [CCNotNull]
             , ColumnDecl (FText "article_text") [CCNotNull]
-            , ColumnDecl (FBlob "article_version") [CCNotNull]
-            , ColumnDecl (FTime "article_publication_date") []
+            , ColumnDecl (FTime "article_publication_date") [CCNotNull]
             ]
             []
-        Db.query db $ CreateIndex "sn_articles_publication_date_idx" "sn_articles" [Asc "article_publication_date"]
+        Db.query db $ CreateIndex "sn_articles_main_idx" "sn_articles"
+            [Desc "article_publication_date", Asc "article_id"]
+        Db.query db $ CreateIndex "sn_articles_author_idx" "sn_articles"
+            [Asc "article_author_id", Desc "article_publication_date", Asc "article_id"]
         Db.query db $ CreateTable "sn_files"
             [ ColumnDecl (FBlob "file_id") [CCPrimaryKey]
             , ColumnDecl (FTime "file_name") []

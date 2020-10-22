@@ -112,6 +112,8 @@ data PrimValue a where
     VText :: !Text.Text -> PrimValue 'TText
     VBlob :: !BS.ByteString -> PrimValue 'TBlob
     VTime :: !UTCTime -> PrimValue 'TTime
+    VTPosInf :: PrimValue 'TTime
+    VTNegInf :: PrimValue 'TTime
     VNull :: PrimValue a
 deriving instance Show (PrimValue a)
 
@@ -228,10 +230,9 @@ data Query result where
     CreateIndex :: IndexName -> TableName -> [RowOrder] -> Query ()
     DropTable :: TableName -> Query ()
     Select :: All IsValue rs => [TableName] -> HList Field rs -> [Where] -> [RowOrder] -> RowRange -> Query [HList Maybe rs]
-    Insert_ :: All IsValue vs => TableName -> HList Field vs -> HList Maybe vs -> Query ()
-    Insert :: (All IsValue vs, All IsValue rs) => TableName -> HList Field vs -> HList Maybe vs -> HList Field rs -> Query (HList Maybe rs)
-    Update :: All IsValue vs => TableName -> HList Field vs -> HList Maybe vs -> [Where] -> Query ()
-    Delete :: TableName -> [Where] -> Query ()
+    Insert :: (All IsValue vs, All IsValue rs) => TableName -> HList Field vs -> HList Maybe vs -> HList Field rs -> Query (Maybe (HList Maybe rs))
+    Update :: All IsValue vs => TableName -> HList Field vs -> HList Maybe vs -> [Where] -> Query Int
+    Delete :: TableName -> [Where] -> Query Int
 
 instance Show (Query ts) where
     showsPrec d (CreateTable table columns constr) = showParen (d > 10)
@@ -250,10 +251,6 @@ instance Show (Query ts) where
         . showString " " . showsPrec 11 cond
         . showString " " . showsPrec 11 order
         . showString " " . showsPrec 11 range
-    showsPrec d (Insert_ table fields values) = showParen (d > 10)
-        $ showString "Insert_ " . showsPrec 11 table
-        . showString " " . showPrimFields 11 (primFields fields)
-        . showString " " . showPrimValues 11 (encode values)
     showsPrec d (Insert table fields values rets) = showParen (d > 10)
         $ showString "Insert " . showsPrec 11 table
         . showString " " . showPrimFields 11 (primFields fields)

@@ -2,12 +2,12 @@
     # sqlite: "temp.sqlite~"
   # sample-size: 100
 
-- database:
-    sqlite: ""
-  sample-size: 20
-
 # - database:
-    # postgres:
-      # user: me
-      # password: me
-  # sample-size: 100
+    # sqlite: ""
+  # sample-size: 20
+
+- database:
+    postgres:
+      user: me
+      password: me
+  sample-size: 2000

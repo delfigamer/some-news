@@ -7,28 +7,31 @@ import Control.Concurrent.MVar
 import Control.Concurrent.QSemN
 import Control.Exception
 import Control.Monad
-import Data.Aeson
+import Data.Aeson hiding (Result)
 import Data.Int
+import Data.List
 import Data.Maybe
 import Data.Time.Clock
 import Data.Yaml
 import System.IO.Unsafe
-import System.Random.Stateful
 import Test.Hspec
+import qualified Data.ByteString as BS
 import qualified Data.Char as Char
 import qualified Data.Map as Map
 import qualified Data.Text as Text
+import qualified System.IO as IO
 import Gen
 import Sql.Query
 import Tuple
 import qualified Logger
 import qualified Sql.Database as Db
 import qualified Sql.Database.Config as Db
-import qualified Storage
+import Storage
+import Storage.Model
 
 data TestConfig = TestConfig
     { databaseConfig :: Db.Config
-    , sampleSize :: Int
+    , confSampleSize :: Int
     }
 
 instance FromJSON TestConfig where
@@ -49,25 +52,46 @@ clearDatabase db = do
         , "sn_files"
         , "sn_file_chunks"
         ]
-    return ()
 
 randomText :: Gen Text.Text
 randomText = fmap Text.pack $ randomPrintableString =<< randomWithin 4 32
 
+randomByteString :: Int -> Gen BS.ByteString
+randomByteString n = BS.pack <$> replicateM n random
+
 dateTimeGenBase :: UTCTime
 dateTimeGenBase = case unsafePerformIO getCurrentTime of
     UTCTime day _ -> UTCTime day 0
+{-# NOINLINE dateTimeGenBase #-}
 
 randomDateTime :: Gen UTCTime
 randomDateTime = do
-    seconds <- randomWithin (-86400*1000) 0
-    return $ addUTCTime (fromInteger seconds) dateTimeGenBase
+    seconds <- randomWithin (-86400*1000) (-86400)
+    epoch <- randomWithin 0 1
+    let delta = fromInteger seconds + nominalDay * (fromInteger (epoch * 365 * 10))
+    return $ addUTCTime delta dateTimeGenBase
 
-randomUser :: Gen Storage.User
-randomUser = Storage.User <$> randomText <*> randomText <*> randomDateTime <*> randomBool
+randomReference :: Gen (Reference a)
+randomReference = Reference <$> randomByteString 16
 
-randomAuthor :: Gen Storage.Author
-randomAuthor = Storage.Author <$> randomText <*> randomText
+randomVersion :: Gen (Version a)
+randomVersion = Version <$> randomByteString 16
+
+randomUser :: Gen User
+randomUser = User <$> randomText <*> randomText <*> randomDateTime <*> randomBool
+
+randomAuthor :: Gen Author
+randomAuthor = Author <$> randomText <*> randomText
+
+randomPublicationStatus :: Gen PublicationStatus
+randomPublicationStatus = do
+    i <- randomWithin 1 3 :: Gen Int
+    if i <= 1
+        then return NonPublished
+        else PublishAt <$> randomDateTime
+
+randomArticleOf :: Reference Author -> Gen Article
+randomArticleOf authorRef = Article authorRef <$> randomText <*> randomText <*> randomPublicationStatus
 
 parallelFor :: [a] -> (a -> IO b) -> IO [b]
 parallelFor source act = do
@@ -84,9 +108,22 @@ parallelFor source act = do
 parallelFor_ :: [a] -> (a -> IO ()) -> IO ()
 parallelFor_ source act = parallelFor source act >> return ()
 
-assertJust :: HasCallStack => Maybe a -> IO a
-assertJust (Just x) = return x
-assertJust Nothing = expectationFailure "Just expected, got Nothing" >> undefined
+byChance :: Int -> Int -> IO a -> IO a -> IO a
+byChance num den ma mb = do
+    i <- generate $ randomWithin 1 den
+    if i <= num
+        then ma
+        else mb
+
+repeatSome_ :: Int -> Int -> IO a -> IO ()
+repeatSome_ lo hi act = do
+    n <- generate $ randomWithin lo hi
+    replicateM_ n act
+
+convertTimeChar :: Char -> Char
+convertTimeChar ':' = '-'
+convertTimeChar '.' = '-'
+convertTimeChar c = c
 
 spec :: Spec
 spec = do
@@ -94,154 +131,234 @@ spec = do
         describe "Storage" $ do
             it "handles objects" $ \testconfList -> do
                 forM_ testconfList $ \testconf -> do
-                    Logger.withTestLogger $ \logger -> do
+                    time <- getCurrentTime
+                    let tstr = map convertTimeChar $ show time
+                    Logger.withFileLogger (".testlogs/" ++ tstr ++ ".log") $ \logger -> do
                         Db.withDatabase (databaseConfig testconf) logger $ \db -> do
                             clearDatabase db
-                            Storage.upgradeSchema logger db `shouldReturn` Right ()
-                            Storage.withSqlStorage logger db
+                            upgradeSchema logger db `shouldReturn` Right ()
+                            withSqlStorage logger db
                                 (expectationFailure . show)
                                 $ \storage -> do
-                                    let totalLimit = fromIntegral $ sampleSize testconf * 10
-                                    {- test user objects -}
-                                    userBoxes <- testCrud storage testconf randomUser
-                                        Storage.spawnUser
-                                        Storage.getUser
-                                        Storage.setUser
-                                        Storage.deleteUser
-                                        Storage.listUsers
-                                    {- test access keys -}
-                                    {- generate some access keys for users -}
-                                    let userRefs = map fst userBoxes
-                                    userAccessKeysA <- parallelFor userRefs $ \ref -> do
-                                        n <- generate $ randomWithin 1 3 :: IO Int
-                                        replicateM n $ assertJust =<< Storage.spawnAccessKey storage ref
-                                    parallelFor_ (zip userRefs userAccessKeysA) $ \(userRef, akeysA) -> do
-                                        forM_ akeysA $ \akey -> do
-                                            ref2 <- assertJust =<< Storage.lookupAccessKey storage akey
-                                            ref2 `shouldBe` userRef
-                                        akeyRefsA <- assertJust =<< Storage.listAccessKeysOf storage userRef 0 totalLimit
-                                        akeyRefsA `shouldMatchList` map Storage.accessKeyId akeysA
-                                        return ()
-                                    {- delete some keys -}
-                                    userAccessKeysB <- parallelFor userAccessKeysA $ \akeysA -> do
-                                        akeysB <- fmap catMaybes $ parallelFor akeysA $ \akey@(Storage.AccessKey front _) -> do
-                                            i <- generate $ randomWithin 1 10 :: IO Int
-                                            if i <= 1
-                                                then do
-                                                    assertJust =<< Storage.deleteAccessKey storage (Storage.Reference front)
-                                                    return Nothing
-                                                else return $ Just akey
-                                        return akeysB
-                                    parallelFor_ (zip userRefs userAccessKeysB) $ \(userRef, akeysB) -> do
-                                        akeyRefsB <- assertJust =<< Storage.listAccessKeysOf storage userRef 0 totalLimit
-                                        akeyRefsB `shouldMatchList` map Storage.accessKeyId akeysB
-                                    {- spawn some additional keys -}
-                                    userAccessKeysC <- parallelFor (zip userRefs userAccessKeysB) $ \(userRef, akeysB) -> do
-                                        i <- generate $ randomWithin 1 10 :: IO Int
-                                        if i <= 1
-                                            then do
-                                                newkey <- assertJust =<< Storage.spawnAccessKey storage userRef
-                                                return $ newkey:akeysB
-                                            else return akeysB
-                                    parallelFor_ (zip userRefs userAccessKeysC) $ \(userRef, akeysC) -> do
-                                        akeyRefsC <- assertJust =<< Storage.listAccessKeysOf storage userRef 0 totalLimit
-                                        akeyRefsC `shouldMatchList` map Storage.accessKeyId akeysC
-                                    {- test author objects -}
-                                    authorBoxes <- testCrud storage testconf randomAuthor
-                                        Storage.spawnAuthor
-                                        Storage.getAuthor
-                                        Storage.setAuthor
-                                        Storage.deleteAuthor
-                                        Storage.listAuthors
-                                    let authorRefs = map fst authorBoxes
-                                    {- connect some users with some authors -}
-                                    userToAuthorListA <- parallelFor userRefs $ \userRef -> do
-                                        userAuthors <- generate $ chooseFrom authorRefs =<< randomWithin 0 3
-                                        parallelFor userAuthors $ \authorRef -> do
-                                            assertJust =<< Storage.connectUserAuthor storage userRef authorRef
-                                            return authorRef
-                                    parallelFor_ (zip userRefs userToAuthorListA) $ \(userRef, userAuthors1) -> do
-                                        userAuthors2 <- fmap (map fst) $ assertJust =<< Storage.listAuthorsOfUser storage userRef 0 totalLimit
-                                        userAuthors2 `shouldMatchList` userAuthors1
-                                    parallelFor_ authorRefs $ \authorRef -> do
-                                        let authorUsers1 = mapMaybe
-                                                (\(userRef, userAuthors) -> do
-                                                    guard $ authorRef `elem` userAuthors
-                                                    Just userRef)
-                                                (zip userRefs userToAuthorListA)
-                                        authorUsers2 <- fmap (map fst) $ assertJust =<< Storage.listUsersOfAuthor storage authorRef 0 totalLimit
-                                        authorUsers2 `shouldMatchList` authorUsers1
-                                    {- disconnect some users and authors -}
-                                    userToAuthorListB <- parallelFor (zip userRefs userToAuthorListA) $ \(userRef, userAuthorsA) -> do
-                                        fmap catMaybes $ parallelFor userAuthorsA $ \authorRef -> do
-                                            i <- generate $ randomWithin 1 3 :: IO Int
-                                            if i <= 1
-                                                then do
-                                                    assertJust =<< Storage.disconnectUserAuthor storage userRef authorRef
-                                                    return Nothing
-                                                else return $ Just authorRef
-                                    parallelFor_ (zip userRefs userToAuthorListB) $ \(userRef, userAuthors1) -> do
-                                        userAuthors2 <- fmap (map fst) $ assertJust =<< Storage.listAuthorsOfUser storage userRef 0 totalLimit
-                                        userAuthors2 `shouldMatchList` userAuthors1
-                                    parallelFor_ authorRefs $ \authorRef -> do
-                                        let authorUsers1 = mapMaybe
-                                                (\(userRef, userAuthors) -> do
-                                                    guard $ authorRef `elem` userAuthors
-                                                    Just userRef)
-                                                (zip userRefs userToAuthorListB)
-                                        authorUsers2 <- fmap (map fst) $ assertJust =<< Storage.listUsersOfAuthor storage authorRef 0 totalLimit
-                                        authorUsers2 `shouldMatchList` authorUsers1
+                                    let sampleSize = confSampleSize testconf
+                                    model <- newStorageModel
+                                    testCrud storage model sampleSize randomUser
+                                        spawnUser getUser setUser deleteUser
+                                        modelSetUser modelDeleteUser modelListUsers
+                                        verifyUsers
+                                    testAccessKeys storage model sampleSize
+                                    testCrud storage model sampleSize randomAuthor
+                                        spawnAuthor getAuthor setAuthor deleteAuthor
+                                        modelSetAuthor modelDeleteAuthor modelListAuthors
+                                        verifyAuthors
+                                    testAuthorUserConns storage model sampleSize
+                                    testArticles storage model sampleSize
                                     return ()
 
 testCrud
     :: (Show obj, Eq obj)
-    => Storage.Handle
-    -> TestConfig
+    => Handle
+    -> Model
+    -> Int
     -> Gen obj
-    -> (Storage.Handle -> obj -> IO (Maybe (Storage.Reference obj)))
-    -> (Storage.Handle -> Storage.Reference obj -> IO (Maybe obj))
-    -> (Storage.Handle -> Storage.Reference obj -> obj -> IO (Maybe ()))
-    -> (Storage.Handle -> Storage.Reference obj -> IO (Maybe ()))
-    -> (Storage.Handle -> Int64 -> Int64 -> IO [(Storage.Reference obj, obj)])
-    -> IO [(Storage.Reference obj, obj)]
-testCrud storage testconf randomObject
-        spawnObject getObject setObject deleteObject listObjects = do
-    let totalLimit = fromIntegral $ sampleSize testconf * 10
-    {- create a batch of objects -}
-    listA1 <- generate $ replicateM (sampleSize testconf) randomObject
-    refsA <- parallelFor listA1 $ \objA -> assertJust =<< spawnObject storage objA
-    listA2 <- parallelFor refsA $ \ref -> assertJust =<< getObject storage ref
-    listA2 `shouldBe` listA1
-    let boxesA1 = zip refsA listA1
-    boxesA2 <- listObjects storage 0 totalLimit
-    boxesA2 `shouldMatchList` boxesA1
-    {- create a second batch of objects -}
-    listB1 <- generate $ replicateM (sampleSize testconf) randomObject
-    refsB <- parallelFor listB1 $ \objB -> assertJust =<< spawnObject storage objB
-    listB2 <- parallelFor refsB $ \ref -> assertJust =<< getObject storage ref
-    listB2 `shouldBe` listB1
-    let boxesC1 = boxesA1 ++ zip refsB listB1
-    boxesC2 <- listObjects storage 0 totalLimit
-    boxesC2 `shouldMatchList` boxesC1
-    {- replace some objects -}
-    boxesD1 <- parallelFor boxesC1 $ \boxC@(ref, _) -> do
-        i <- generate $ randomWithin 1 10 :: IO Int
-        if i <= 1
-            then do
-                objD <- generate $ randomObject
-                assertJust =<< setObject storage ref objD
-                return (ref, objD)
-            else return boxC
-    boxesD2 <- listObjects storage 0 totalLimit
-    boxesD2 `shouldMatchList` boxesD1
-    {- delete some objects -}
-    boxesE1 <- fmap catMaybes $ parallelFor boxesD1 $ \boxD@(ref, _) -> do
-        i <- generate $ randomWithin 1 10 :: IO Int
-        if i <= 1
-            then do
-                assertJust =<< deleteObject storage ref
-                return Nothing
-            else return $ Just boxD
-    boxesE2 <- listObjects storage 0 totalLimit
-    boxesE2 `shouldMatchList` boxesE1
-    return boxesE2
+    -> (Handle -> obj -> IO (Result (Reference obj)))
+    -> (Handle -> Reference obj -> IO (Result obj))
+    -> (Handle -> Reference obj -> obj -> IO (Result ()))
+    -> (Handle -> Reference obj -> IO (Result ()))
+    -> (Model -> Reference obj -> obj -> IO ())
+    -> (Model -> Reference obj -> IO ())
+    -> (Model -> IO [(Reference obj, obj)])
+    -> (Model -> Handle -> IO ())
+    -> IO ()
+testCrud storage model sampleSize randomObject
+        spawnObject getObject setObject deleteObject
+        modelSet modelDelete modelList
+        verifyObjects = do
+    do
+        parallelFor_ [1 .. sampleSize] $ \_ -> do
+            obj <- generate $ randomObject
+            ref <- assertOk =<< spawnObject storage obj
+            modelSet model ref obj
+        verifyObjects model storage
+    do
+        parallelFor_ [1 .. sampleSize] $ \_ -> do
+            obj <- generate $ randomObject
+            ref <- assertOk =<< spawnObject storage obj
+            modelSet model ref obj
+        verifyObjects model storage
+    do
+        objList <- modelList model
+        toAlter <- generate $ chooseFrom (sampleSize `div` 5) objList
+        parallelFor_ toAlter $ \(ref, _) -> do
+            obj <- generate $ randomObject
+            assertOk =<< setObject storage ref obj
+            modelSet model ref obj
+        verifyObjects model storage
+    do
+        objList <- modelList model
+        toDelete <- generate $ chooseFrom (sampleSize `div` 5) objList
+        parallelFor_ toDelete $ \(ref, _) -> do
+            assertOk =<< deleteObject storage ref
+            modelDelete model ref
+        verifyObjects model storage
+    do
+        objList <- modelList model
+        parallelFor_ objList $ \(ref, objA) -> do
+            objB <- assertOk =<< getObject storage ref
+            objB `shouldBe` objA
+        let refList = map fst objList
+        badRefs <- generate $
+            replicateM 20 $
+                randomReference `suchThat` (`notElem` refList)
+        parallelFor_ badRefs $ \ref -> do
+            obj <- generate $ randomObject
+            getObject storage ref `shouldReturn` NotFoundError
+            setObject storage ref obj `shouldReturn` NotFoundError
+            deleteObject storage ref `shouldReturn` NotFoundError
+
+testAccessKeys :: Handle -> Model -> Int -> IO ()
+testAccessKeys storage model sampleSize = do
+    users <- modelListUsers model
+    let userRefs = map fst users
+    do
+        parallelFor_ userRefs $ \ref -> do
+            repeatSome_ 1 3 $ do
+                akey <- assertOk =<< spawnAccessKey storage ref
+                modelSetAccessKey model ref akey
+        verifyAccessKeys model storage
+    do
+        userKeys <- modelListAccessKeys model
+        let allKeys = do
+                (userRef, akeys) <- userKeys
+                key <- akeys
+                [(userRef, key)]
+        toDelete <- generate $ chooseFrom (sampleSize `div` 5) allKeys
+        parallelFor_ toDelete $ \(userRef, akey) -> do
+            assertOk =<< deleteAccessKey storage userRef (accessKeyId akey)
+            modelDeleteAccessKey model userRef akey
+        verifyAccessKeys model storage
+    do
+        parallelFor_ userRefs $ \ref -> do
+            repeatSome_ 1 3 $ do
+                akey <- assertOk =<< spawnAccessKey storage ref
+                modelSetAccessKey model ref akey
+        verifyAccessKeys model storage
+    do
+        userKeys <- modelListAccessKeys model
+        let oneKeys = do
+                (userRef, oneKey:_) <- userKeys
+                [(userRef, oneKey)]
+        let (users, keys) = unzip oneKeys
+        let badKeys = zip users (drop 1 keys)
+        toDeleteBad <- generate $ chooseFrom (sampleSize `div` 5) badKeys
+        parallelFor_ toDeleteBad $ \(userRef, akey) -> do
+            deleteAccessKey storage userRef (accessKeyId akey) `shouldReturn` NotFoundError
+        verifyAccessKeys model storage
+    return ()
+
+testAuthorUserConns :: Handle -> Model -> Int -> IO ()
+testAuthorUserConns storage model sampleSize = do
+    userBoxes <- modelListUsers model
+    authorBoxes <- modelListAuthors model
+    let userRefs = map fst userBoxes
+    let authorRefs = map fst authorBoxes
+    do
+        parallelFor_ authorRefs $ \authorRef -> do
+            myUsers <- generate $ randomWithin 1 3 >>= \n -> chooseFrom n userRefs
+            parallelFor_ myUsers $ \userRef -> do
+                assertOk =<< connectUserAuthor storage userRef authorRef
+                byChance 1 5
+                    (assertOk =<< connectUserAuthor storage userRef authorRef)
+                    (return ())
+                modelConnectUserAuthor model userRef authorRef
+        verifyUserAuthorConns model storage
+    do
+        parallelFor_ authorRefs $ \authorRef -> do
+            myUserBoxes <- modelListUsersOfAuthor model authorRef
+            let myUsers = map fst myUserBoxes
+            parallelFor_ myUsers $ \userRef -> do
+                byChance 1 5
+                    (do
+                        assertOk =<< disconnectUserAuthor storage userRef authorRef
+                        byChance 1 5
+                            (assertOk =<< disconnectUserAuthor storage userRef authorRef)
+                            (return ())
+                        modelDisconnectUserAuthor model userRef authorRef)
+                    (return ())
+        verifyUserAuthorConns model storage
+    do
+        usersToDelete <- generate $ chooseFrom (sampleSize `div` 5) userRefs
+        parallelFor_ usersToDelete $ \userRef -> do
+            assertOk =<< deleteUser storage userRef
+            modelDeleteUser model userRef
+        verifyUserAuthorConns model storage
+    do
+        authorsToDelete <- generate $ chooseFrom (sampleSize `div` 5) authorRefs
+        parallelFor_ authorsToDelete $ \authorRef -> do
+            assertOk =<< deleteAuthor storage authorRef
+            modelDeleteAuthor model authorRef
+        verifyUserAuthorConns model storage
+    return ()
+
+testArticles :: Handle -> Model -> Int -> IO ()
+testArticles storage model sampleSize = do
+    authorBoxes <- modelListAuthors model
+    let authorRefs = map fst authorBoxes
+    do
+        parallelFor_ [1 .. sampleSize] $ \_ -> do
+            [authorRef] <- generate $ chooseFrom 1 authorRefs
+            article <- generate $ randomArticleOf authorRef
+            (articleRef, articleVersion) <- assertOk =<< spawnArticle storage article
+            modelSetArticle model articleRef article articleVersion
+        verifyArticles model storage (PublishAt dateTimeGenBase)
+    do
+        parallelFor_ [1 .. sampleSize] $ \_ -> do
+            [authorRef] <- generate $ chooseFrom 1 authorRefs
+            article <- generate $ randomArticleOf authorRef
+            (articleRef, articleVersion) <- assertOk =<< spawnArticle storage article
+            modelSetArticle model articleRef article articleVersion
+        verifyArticles model storage (PublishAt dateTimeGenBase)
+    do
+        articleList <- modelListArticleVersions model
+        toAlter <- generate $ chooseFrom (sampleSize `div` 5) articleList
+        parallelFor_ toAlter $ \(articleRef, oldArticle, oldVersion) -> do
+            [authorRef] <- byChance 1 5
+                (generate $ chooseFrom 1 authorRefs)
+                (return [articleAuthor oldArticle])
+            newArticle <- generate $ randomArticleOf authorRef
+            newVersion <- assertOk =<< setArticle storage articleRef newArticle oldVersion
+            modelSetArticle model articleRef newArticle newVersion
+        verifyArticles model storage (PublishAt dateTimeGenBase)
+    do
+        articleList <- modelListArticleVersions model
+        toDelete <- generate $ chooseFrom (sampleSize `div` 5) articleList
+        parallelFor_ toDelete $ \(articleRef, _, _) -> do
+            assertOk =<< deleteArticle storage articleRef
+            modelDeleteArticle model articleRef
+        verifyArticles model storage (PublishAt dateTimeGenBase)
+    do
+        articleList <- modelListArticleVersions model
+        parallelFor_ articleList $ \(articleRef, articleA, articleVersionA) -> do
+            (articleB, articleVersionB) <- assertOk =<< getArticle storage articleRef
+            articleB `shouldBe` articleA
+            articleVersionB `shouldBe` articleVersionA
+            badVersion <- generate $ randomVersion `suchThat` (/= articleVersionA)
+            setArticle storage articleRef articleA badVersion `shouldReturn` NotFoundError
+        let refList = map (\(ref, _, _) -> ref) articleList
+        badRefs <- generate $
+            replicateM 20 $
+                randomReference `suchThat` (`notElem` refList)
+        parallelFor_ badRefs $ \ref -> do
+            [authorRef] <- generate $ chooseFrom 1 authorRefs
+            article <- generate $ randomArticleOf authorRef
+            version <- generate $ randomVersion
+            getArticle storage ref `shouldReturn` NotFoundError
+            setArticle storage ref article version `shouldReturn` NotFoundError
+            deleteArticle storage ref `shouldReturn` NotFoundError
+    do
+        authorsToDelete <- generate $ chooseFrom (sampleSize `div` 5) authorRefs
+        parallelFor_ authorsToDelete $ \authorRef -> do
+            assertOk =<< deleteAuthor storage authorRef
+            modelDeleteAuthor model authorRef
+        verifyArticles model storage (PublishAt dateTimeGenBase)
+    return ()
