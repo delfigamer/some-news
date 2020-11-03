@@ -30,6 +30,7 @@ dependencies:
 - cryptonite
 - hspec
 - memory
+- mtl
 - postgresql-simple
 - random == 1.2.*
 - splitmix == 0.1.*

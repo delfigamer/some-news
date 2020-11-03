@@ -37,7 +37,7 @@ prependParam key value str =
     Text.unpack key ++ "='" ++ escapeParamValue (Text.unpack value) ++ "' " ++ str
 
 escapeParamValue :: String -> String
-escapeParamValue ('\'':rest) = '\\':'\'':escapeParamValue rest
-escapeParamValue ('\\':rest) = '\\':'\\':escapeParamValue rest
-escapeParamValue (c:rest) = c:escapeParamValue rest
+escapeParamValue ('\'' : rest) = '\\' : '\'' : escapeParamValue rest
+escapeParamValue ('\\' : rest) = '\\' : '\\' : escapeParamValue rest
+escapeParamValue (c : rest) = c : escapeParamValue rest
 escapeParamValue [] = []

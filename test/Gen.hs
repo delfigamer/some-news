@@ -94,7 +94,7 @@ takeSource filter i (GenSource f) = do
     iter <- f
     case iter of
         Just (x, next) -> if filter x
-            then (x:) <$> takeSource filter (i-1) next
+            then (x :) <$> takeSource filter (i-1) next
             else takeSource filter i next
         Nothing -> return []
 

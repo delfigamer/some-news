@@ -4,7 +4,7 @@ cabal-version: 1.12
 --
 -- see: https://github.com/sol/hpack
 --
--- hash: f326aa1d23d235eee99072cdc074f91175c20df8e922eca454e6ccd474be5900
+-- hash: 2a02b7f58a2451aa96935f81fe1bad8501f7fd2564e9d5b226845cab3b02e5ed
 
 name:           SomeNews
 version:        0.1.0.0
@@ -29,6 +29,7 @@ library
   exposed-modules:
       Lib
       Logger
+      ResourcePool
       Sql.Database
       Sql.Database.Config
       Sql.Database.Postgres
@@ -52,6 +53,7 @@ library
     , cryptonite
     , hspec
     , memory
+    , mtl
     , postgresql-simple
     , random ==1.2.*
     , splitmix ==0.1.*
@@ -82,6 +84,7 @@ executable SomeNews-exe
     , cryptonite
     , hspec
     , memory
+    , mtl
     , postgresql-simple
     , random ==1.2.*
     , splitmix ==0.1.*
@@ -116,6 +119,7 @@ test-suite SomeNews-test
     , cryptonite
     , hspec
     , memory
+    , mtl
     , postgresql-simple
     , random ==1.2.*
     , splitmix ==0.1.*

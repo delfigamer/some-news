@@ -13,16 +13,11 @@ module Tuple
     , All(..)
     , AllWith(..)
     , constrainHListWrapped
-    -- , HEq1(..)
     , homogenize
     , ListCat
     , (++/)
     , takeHList
     , traverseHListGiven
-    -- , ListJoin
-    -- , joinHList
-    -- , reshapeHList
-    -- , zipHList
     ) where
 
 import Data.Kind
@@ -84,20 +79,11 @@ constrainHListWrapped = constrainHListWith (Proxy :: Proxy g)
 instance forall f ts. AllWith f Show ts => Show (HList f ts) where
     showsPrec d tup = constrainHListWrapped (Proxy :: Proxy Show) tup
         (showString "E")
-        (\x xs -> showParen (d > 6) $ showsPrec 7 x . showString " :* " . showsPrec 7 xs)
-
--- infix 4 ~=
--- class HEq1 (f :: k -> *) where
-    -- (~=) :: f a -> f b -> Bool
-
--- instance HEq1 f => HEq1 (TupleT f) where
-    -- E ~= E = True
-    -- (x :* xs) ~= (y :* ys) = x ~= y && xs ~= ys
-    -- _ ~= _ = False
+        (\x xs -> showParen (d > 6) $ showsPrec 7 x . showString " :/ " . showsPrec 7 xs)
 
 homogenize :: (forall a. f a -> b) -> HList f ts -> [b]
 homogenize _ E = []
-homogenize f (x :/ xs) = f x:homogenize f xs
+homogenize f (x :/ xs) = f x : homogenize f xs
 
 type family ListCat ts us where
     ListCat '[] us = us
@@ -116,19 +102,3 @@ traverseHListGiven :: (All c ts, Applicative m) => proxy c -> HList f ts -> (for
 traverseHListGiven cproxy tup f = constrainHList cproxy tup
     (pure E)
     (\x xs -> (:/) <$> f x <*> traverseHListGiven cproxy xs f)
-
--- type family ListJoin tss where
-    -- ListJoin '[] = '[]
-    -- ListJoin (ts ': uss) = ListCat ts (ListJoin uss)
-
--- joinHList :: HList (HList f) tss -> HList f (ListJoin tss)
--- joinHList E = E
--- joinHList (xs :/ xss) = xs ++/ joinHList xss
-
--- reshapeHList :: HList (HList f) tss -> HList g (ListJoin tss) -> HList (HList g) tss
--- reshapeHList E E = E
--- reshapeHList (xs :/ xss) y = takeHList xs y $ \ys yss -> ys :/ reshapeHList xss yss
-
--- zipHList :: (forall a. f a -> g a -> h a) -> HList f ts -> HList g ts -> HList h ts
--- zipHList _ E E = E
--- zipHList f (x :/ xs) (y :/ ys) = f x y :/ zipHList f xs ys

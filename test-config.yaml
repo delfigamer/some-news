@@ -1,8 +1,4 @@
 # - database:
-    # sqlite: "temp.sqlite~"
-  # sample-size: 100
-
-# - database:
     # sqlite: ""
   # sample-size: 20
 
@@ -10,4 +6,4 @@
     postgres:
       user: me
       password: me
-  sample-size: 2000
+  sample-size: 20

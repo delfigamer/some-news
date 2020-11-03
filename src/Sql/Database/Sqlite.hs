@@ -9,35 +9,49 @@ module Sql.Database.Sqlite
 import Control.Concurrent.MVar
 import Control.Exception
 import Control.Monad
-import qualified Data.ByteString as BS
 import Data.IORef
 import Data.Int
 import Data.List
 import Data.Proxy
 import Data.String
-import qualified Data.Text as Text
 import Data.Time.Clock
 import Database.SQLite.Simple
 import Database.SQLite.Simple.FromField
 import Database.SQLite.Simple.FromRow
 import Database.SQLite.Simple.ToField
 import Database.SQLite.Simple.ToRow
+import qualified Data.ByteString as BS
+import qualified Data.Text as Text
+import ResourcePool
+import Tuple
 import qualified Logger
 import qualified Sql.Database as Db
 import qualified Sql.Query as Q
 import qualified Sql.Query.Render as Q
-import Tuple
 
 withSqlite :: String -> Logger.Handle -> (Db.Handle -> IO r) -> IO r
 withSqlite path logger body = do
-    bracket
-        (initialize path >>= newMVar)
-        (\mvconn -> takeMVar mvconn >>= close)
-        (\mvconn -> do
+    nameCounter <- newIORef (1 :: Int)
+    withResourcePool 1
+        (if path == "" || path == ":memory:"then 1 else 16)
+        (do
+            newName <- fmap (Text.pack . show) $ atomicModifyIORef' nameCounter $ \x -> (x+1, x)
+            Logger.info logger $ "Sqlite: " <> newName <> ": open connection"
+            newConn <- initialize path
+            return (newName, newConn))
+        (\(name, conn) -> do
+            Logger.info logger $ "Sqlite: " <> name <> ": close connection"
+            close conn)
+        (\(name, _) err -> do
+            Logger.err logger $ "Sqlite: " <> name <> ": " <> Text.pack (displayException err))
+        (\pool -> do
             body $ Db.Handle
-                { Db.queryMaybe = sqliteQueryMaybe logger mvconn
-                , Db.foldQuery = sqliteFoldQuery logger mvconn
-                , Db.withTransaction = sqliteWithTransaction logger mvconn
+                { Db.makeQuery  = \query ->
+                    withResource pool $ \(connName, conn) ->
+                        sqliteMakeQuery logger connName conn query
+                , Db.withTransaction = \level body ->
+                    withResource pool $ \(connName, conn) ->
+                        sqliteWithTransaction logger connName conn level body
                 })
 
 initialize :: String -> IO Connection
@@ -47,89 +61,114 @@ initialize path = do
     execute_ conn "PRAGMA journal_mode = WAL"
     return conn
 
-sqliteQueryMaybe :: Logger.Handle -> MVar Connection -> Q.Query result -> IO (Maybe result)
-sqliteQueryMaybe logger mvconn queryData = do
-    withMVar mvconn $ \conn -> do
-        Q.withQueryRender sqliteDetailRenderer queryData $ \queryValues queryText -> do
-            Logger.debug logger $ "Sqlite: " <> Text.pack queryText <> "; -- " <> Text.pack (Q.showPrimValues 0 queryValues "")
-            let sqlQuery = fromString queryText :: Query
-            eresult <- try $ case queryData of
-                Q.CreateTable {} -> execute_ conn sqlQuery
-                Q.CreateIndex {} -> execute_ conn sqlQuery
-                Q.DropTable {} -> execute_ conn sqlQuery
-                Q.Select {} -> query conn sqlQuery queryValues
-                Q.Insert _ _ _ E -> do
-                    execute conn sqlQuery queryValues
-                    n <- changes conn
-                    case n of
-                        0 -> return Nothing
-                        _ -> return (Just E)
-                Q.Insert table fields values rets -> sqliteInsertReturning logger conn table fields values rets
-                Q.Update {} -> do
-                    execute conn sqlQuery queryValues
-                    changes conn
-                Q.Delete {} -> do
-                    execute conn sqlQuery queryValues
-                    changes conn
-            case eresult of
-                Left err -> do
-                    Logger.warn logger $ "Sqlite: " <> Text.pack (displayException (err :: SomeException))
-                    return Nothing
-                Right result -> return $ Just result
+sqliteMakeQuery
+    :: Logger.Handle -> Text.Text -> Connection
+    -> Q.Query result -> IO (Either Db.QueryError result)
+sqliteMakeQuery logger connName conn queryData = do
+    Q.withQueryRender sqliteRenderDetail queryData $ \queryValues queryText -> do
+        Logger.debug logger $ "Sqlite: " <> connName <> ": " <> Text.pack queryText <> "; -- " <> Text.pack (Q.showPrimValues 0 queryValues "")
+        let sqlQuery = fromString queryText :: Query
+        case queryData of
+            Q.CreateTable {} -> sqlitePcall logger connName $ execute_ conn sqlQuery
+            Q.CreateIndex {} -> sqlitePcall logger connName $ execute_ conn sqlQuery
+            Q.DropTable {} -> sqlitePcall logger connName $ execute_ conn sqlQuery
+            Q.Select {} -> sqlitePcall logger connName $ query conn sqlQuery queryValues
+            Q.Insert _ _ _ E -> sqlitePcall logger connName $ do
+                execute conn sqlQuery queryValues
+                n <- changes conn
+                case n of
+                    0 -> return Nothing
+                    _ -> return (Just E)
+            Q.Insert table fields values rets -> sqlitePcall logger connName $ do
+                sqliteInsertReturning logger connName conn table fields values rets
+            Q.Update {} -> sqlitePcall logger connName $ do
+                execute conn sqlQuery queryValues
+                fromIntegral <$> changes conn
+            Q.Delete {} -> sqlitePcall logger connName $ do
+                execute conn sqlQuery queryValues
+                fromIntegral <$> changes conn
 
 sqliteInsertReturning
-    :: (All Q.IsValue vs, All Q.IsValue rs)
-    => Logger.Handle -> Connection
-    -> Q.TableName -> HList Q.Field vs -> HList Maybe vs -> HList Q.Field rs -> IO (Maybe (HList Maybe rs))
-sqliteInsertReturning logger conn table fields values rets = do
+    :: (All Q.IsValue rs, AllWith Q.Value Show vs)
+    => Logger.Handle -> Text.Text -> Connection
+    -> Q.TableName -> HList Q.Field vs -> HList Q.Value vs -> HList Q.Field rs -> IO (Maybe (HList Maybe rs))
+sqliteInsertReturning logger connName conn table fields values rets = do
     let queryData1 = Q.Insert table fields values E
-    Q.withQueryRender sqliteDetailRenderer queryData1 $ \queryValues1 queryText1 -> do
-        Logger.debug logger $ "Sqlite: " <> Text.pack queryText1 <> "; -- " <> Text.pack (Q.showPrimValues 0 queryValues1 "")
+    Q.withQueryRender sqliteRenderDetail queryData1 $ \queryValues1 queryText1 -> do
+        Logger.debug logger $ "Sqlite: " <> connName <> ": " <> Text.pack queryText1 <> "; -- " <> Text.pack (Q.showPrimValues 0 queryValues1 "")
         execute conn (fromString queryText1) queryValues1
-        n <- changes conn
+        n <-changes conn
         case n of
             0 -> return Nothing
             _ -> do
                 lastRowId <- lastInsertRowId conn
-                let queryData2 = Q.Select [table] rets [Q.Where "_rowid_ = ?" $ Just lastRowId :/ E] [] Q.AllRows
-                Q.withQueryRender sqliteDetailRenderer queryData2 $ \queryValues2 queryText2 -> do
-                    Logger.debug logger $ "Sqlite: " <> Text.pack queryText2 <> "; -- " <> Text.pack (Q.showPrimValues 0 queryValues2 "")
+                let queryData2 = Q.Select [Q.TableSource table] rets [Q.WhereWith lastRowId "_rowid_ = ?"] [] Q.AllRows
+                Q.withQueryRender sqliteRenderDetail queryData2 $ \queryValues2 queryText2 -> do
+                    Logger.debug logger $ "Sqlite: " <> connName <> ": " <> Text.pack queryText2 <> "; -- " <> Text.pack (Q.showPrimValues 0 queryValues2 "")
                     rets <- query conn (fromString queryText2) queryValues2
                     case rets of
                         [result] -> return $ Just result
                         _ -> return Nothing
 
-sqliteFoldQuery :: Logger.Handle -> MVar Connection -> Q.Query [row] -> a -> (a -> row -> IO a) -> IO a
-sqliteFoldQuery logger mvconn queryData seed foldf = do
-    withMVar mvconn $ \conn -> do
-        Q.withQueryRender sqliteDetailRenderer queryData $ \queryValues queryText -> do
-            Logger.debug logger $ "Sqlite: (streaming) " <> Text.pack queryText <> "; -- " <> Text.pack (Q.showPrimValues 0 queryValues "")
-            let sqlQuery = fromString queryText :: Query
-            case queryData of
-                Q.Select {} -> fold conn sqlQuery queryValues seed foldf
+sqliteWithTransaction
+    :: Logger.Handle -> Text.Text -> Connection
+    -> Db.TransactionLevel -> (Db.Handle -> IO (Either Db.QueryError r)) -> IO (Either Db.QueryError r)
+sqliteWithTransaction logger connName conn _ body = do
+    tresult <- sqlitePcall logger connName $ do
+        withCancelableTransaction $ do
+            body $ Db.Handle
+                { Db.makeQuery = sqliteMakeQuery logger connName conn
+                , Db.withTransaction = error "Sql.Database.Sqlite: nested transaction"
+                }
+    case tresult of
+        Left transFailure -> return $ Left transFailure
+        Right (Left userException) -> throwIO (userException :: SomeException)
+        Right (Right eresult) -> return eresult
+  where
+    withCancelableTransaction act = do
+        mask $ \restore -> do
+            doQuery "BEGIN TRANSACTION"
+            aresult <- try $ restore act
+            case aresult of
+                Right (Right _) -> doQuery "COMMIT TRANSACTION"
+                _ -> doQuery "ROLLBACK TRANSACTION"
+            return aresult
+    doQuery str = do
+        Logger.debug logger $ "Sqlite: " <> connName <> ": " <> Text.pack str
+        execute_ conn (fromString str)
 
-sqliteWithTransaction :: Logger.Handle -> MVar Connection -> IO r -> IO r
-sqliteWithTransaction logger mvconn act = do
-    withMVar mvconn $ \conn -> do
-        Logger.debug logger $ "Sqlite: BEGIN TRANSACTION"
-        r <- withTransaction conn $ do
-            bracket_
-                (putMVar mvconn conn)
-                (takeMVar mvconn >> return ())
-                act
-        Logger.debug logger $ "Sqlite: COMMIT TRANSACTION"
-        return r
-
-sqliteDetailRenderer :: Q.DetailRenderer
-sqliteDetailRenderer = Q.DetailRenderer
-    { Q.renderFieldType = \field -> case field of
+sqliteRenderDetail :: Q.RenderDetail
+sqliteRenderDetail = Q.RenderDetail
+    { Q.detailFieldType = \field -> case field of
         Q.FInt _ -> " INTEGER"
         Q.FReal _ -> " REAL"
+        Q.FBool _ -> " INTEGER"
         Q.FText _ -> " TEXT"
         Q.FBlob _ -> " BLOB"
         Q.FTime _ -> " TEXT"
-    , Q.renderInsertPart = \inner -> "INSERT OR IGNORE INTO " ++ inner
+    , Q.detailInsertLeft = " OR IGNORE"
+    , Q.detailInsertRight = ""
+    , Q.detailNullEquality = " IS "
     }
+
+sqlitePcall :: Logger.Handle -> Text.Text -> IO a -> IO (Either Db.QueryError a)
+sqlitePcall logger connName act = do
+    eret <- try act
+    case eret of
+        Right r -> return $ Right r
+        Left ex -> do
+            let ecode = case fromException ex of
+                    Nothing -> Db.QueryError
+                    Just SQLError {sqlError = se} -> case se of
+                        ErrorBusy -> Db.SerializationError
+                        ErrorLocked -> Db.SerializationError
+                        _ -> Db.QueryError
+            case ecode of
+                Db.SerializationError -> Logger.debug logger $
+                    "Sqlite: " <> connName <> ": Serialization failure: " <> Text.pack (displayException ex)
+                Db.QueryError -> Logger.warn logger $
+                    "Sqlite: " <> connName <> ": Error: " <> Text.pack (displayException ex)
+            return $ Left ecode
 
 instance forall ts. (All Q.IsValue ts) => FromRow (HList Maybe ts) where
     fromRow = traverseHListGiven
@@ -145,13 +184,18 @@ parseValue _ = fmap Q.primDecode $ traverseHListGiven
 
 parsePrimValue :: Q.IsPrimType a => Proxy a -> RowParser (Q.PrimValue a)
 parsePrimValue proxy = Q.matchPrimType proxy
-    field field field field field
+    field field field field field field
+    {- each `field` is called with a different equality constraint, like (a ~ 'TInt) and (a ~ 'TReal) -}
+    {- this makes the compiler to choose the corresponding FromField instance based on the proxy type -}
 
 instance FromField (Q.PrimValue 'Q.TInt) where
     fromField f = (Q.VInt <$> fromField f) `mplus` return Q.VNull
 
 instance FromField (Q.PrimValue 'Q.TReal) where
     fromField f = (Q.VReal <$> fromField f) `mplus` return Q.VNull
+
+instance FromField (Q.PrimValue 'Q.TBool) where
+    fromField f = (Q.VBool <$> fromField f) `mplus` return Q.VNull
 
 instance FromField (Q.PrimValue 'Q.TText) where
     fromField f = (Q.VText <$> fromField f) `mplus` return Q.VNull
@@ -168,6 +212,7 @@ instance ToRow (HList Q.PrimValue ts) where
 instance ToField (Q.PrimValue a) where
     toField (Q.VInt x) = toField x
     toField (Q.VReal x) = toField x
+    toField (Q.VBool x) = toField x
     toField (Q.VText x) = toField x
     toField (Q.VBlob x) = toField x
     toField (Q.VTime x) = toField x

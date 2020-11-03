@@ -18,22 +18,24 @@ module Sql.Query
     , PrimValue(..)
     , PrimField(..)
     , Field(..)
+    , Value(..)
     , MapPrims
     , primFields
-    , decode
-    , encode
-    , Where(..)
+    , Condition(..)
     , RowRange(..)
     , RowOrder(..)
     , ForeignKeyResolution(..)
     , ColumnConstraint(..)
     , ColumnDecl(..)
     , TableConstraint(..)
+    , RowSource(..)
     , Query(..)
     , showPrimFields
     , showPrimValues
     , primFieldName
+    , showBlob
     , fInt
+    , fBool
     , fReal
     , fText
     , fString
@@ -41,14 +43,15 @@ module Sql.Query
     , fTime
     ) where
 
-import qualified Data.ByteString as BS
 import Data.Functor.Identity
 import Data.Int
 import Data.List
 import Data.Proxy
 import Data.String
-import qualified Data.Text as Text
 import Data.Time.Clock
+import qualified Data.ByteString as BS
+import qualified Data.ByteString.Char8 as BSChar
+import qualified Data.Text as Text
 import Tuple
 
 newtype TableName = TableName String
@@ -69,6 +72,7 @@ deriving instance IsString FieldName
 data PrimType
     = TInt
     | TReal
+    | TBool
     | TText
     | TBlob
     | TTime
@@ -78,25 +82,29 @@ class IsPrimType a where
         :: proxy a
         -> (a ~ 'TInt => r)
         -> (a ~ 'TReal => r)
+        -> (a ~ 'TBool => r)
         -> (a ~ 'TText => r)
         -> (a ~ 'TBlob => r)
         -> (a ~ 'TTime => r)
         -> r
 
 instance IsPrimType 'TInt where
-    matchPrimType _ onInt _onReal _onText _onBlob _onTime = onInt
+    matchPrimType _ onInt _onReal _onBool _onText _onBlob _onTime = onInt
 
 instance IsPrimType 'TReal where
-    matchPrimType _ _onInt onReal _onText _onBlob _onTime = onReal
+    matchPrimType _ _onInt onReal _onBool _onText _onBlob _onTime = onReal
+
+instance IsPrimType 'TBool where
+    matchPrimType _ _onInt _onReal onBool _onText _onBlob _onTime = onBool
 
 instance IsPrimType 'TText where
-    matchPrimType _ _onInt _onReal onText _onBlob _onTime = onText
+    matchPrimType _ _onInt _onReal _onBool onText _onBlob _onTime = onText
 
 instance IsPrimType 'TBlob where
-    matchPrimType _ _onInt _onReal _onText onBlob _onTime = onBlob
+    matchPrimType _ _onInt _onReal _onBool _onText onBlob _onTime = onBlob
 
 instance IsPrimType 'TTime where
-    matchPrimType _ _onInt _onReal _onText _onBlob onTime = onTime
+    matchPrimType _ _onInt _onReal _onBool _onText _onBlob onTime = onTime
 
 class All IsPrimType (Prims a) => IsValue a where
     type Prims a :: [PrimType]
@@ -109,41 +117,42 @@ primProxies _ = proxyHList Proxy
 data PrimValue a where
     VInt :: !Int64 -> PrimValue 'TInt
     VReal :: !Double -> PrimValue 'TReal
+    VBool :: !Bool -> PrimValue 'TBool
     VText :: !Text.Text -> PrimValue 'TText
     VBlob :: !BS.ByteString -> PrimValue 'TBlob
     VTime :: !UTCTime -> PrimValue 'TTime
     VTPosInf :: PrimValue 'TTime
     VTNegInf :: PrimValue 'TTime
     VNull :: PrimValue a
-deriving instance Show (PrimValue a)
-
--- instance HEq1 PrimValue where
-    -- VInt xA ~= VInt xB = xA == xB
-    -- VFloat xA ~= VFloat xB = xA == xB
-    -- VText xA ~= VText xB = xA == xB
-    -- VBlob xA ~= VBlob xB = xA == xB
-    -- VDateTime xA ~= VDateTime xB = xA == xB
-    -- VNull ~= VNull = True
-    -- _ ~= _ = False
+instance Show (PrimValue a) where
+    showsPrec d (VInt x) = showParen (d > 10) $ showString "VInt " . showsPrec 10 x
+    showsPrec d (VReal x) = showParen (d > 10) $ showString "VReal " . showsPrec 10 x
+    showsPrec d (VBool x) = showParen (d > 10) $ showString "VBool " . showsPrec 10 x
+    showsPrec d (VText x) = showParen (d > 10) $ showString "VText " . showsPrec 10 x
+    showsPrec d (VBlob x) = showParen (d > 10) $ showString "VBlob " . showBlob "x" x
+    showsPrec d (VTime x) = showParen (d > 10) $ showString "VInt " . showsPrec 10 x
+    showsPrec _ VTPosInf = showString "VTPosInf"
+    showsPrec _ VTNegInf = showString "VTNegInf"
+    showsPrec _ VNull = showString "VNull"
 
 data PrimField a where
     FInt :: FieldName -> PrimField 'TInt
     FReal :: FieldName -> PrimField 'TReal
+    FBool :: FieldName -> PrimField 'TBool
     FText :: FieldName -> PrimField 'TText
     FBlob :: FieldName -> PrimField 'TBlob
     FTime :: FieldName -> PrimField 'TTime
 deriving instance Show (PrimField a)
 
--- instance HEq1 PrimField where
-    -- FInt xA ~= FInt xB = xA == xB
-    -- FFloat xA ~= FFloat xB = xA == xB
-    -- FText xA ~= FText xB = xA == xB
-    -- FBlob xA ~= FBlob xB = xA == xB
-    -- FDateTime xA ~= FDateTime xB = xA == xB
-    -- _ ~= _ = False
-
 data Field a where
-    Field :: HList PrimField (Prims a) -> Field a
+    Field :: IsValue a => HList PrimField (Prims a) -> Field a
+deriving instance AllWith PrimField Show (Prims a) => Show (Field a)
+
+data Value a where
+    Value :: IsValue a => a -> Value a
+    Null :: IsValue a => Value a
+    Subquery :: IsValue a => Query [HList Maybe '[a]] -> Value a
+deriving instance Show a => Show (Value a)
 
 type family MapPrims ts where
     MapPrims '[] = '[]
@@ -153,44 +162,22 @@ primFields :: HList Field ts -> HList PrimField (MapPrims ts)
 primFields E = E
 primFields (Field fs :/ rest) = fs ++/ primFields rest
 
-decode :: forall ts. All IsValue ts => HList PrimValue (MapPrims ts) -> HList Maybe ts
-decode primValues = constrainHList (Proxy :: Proxy IsValue) (proxyHList (Proxy :: Proxy ts))
-    E
-    (\myProxy _ -> do
-        let myPrimsProxyList = primProxies myProxy
-        takeHList myPrimsProxyList primValues $ \myPrimValues otherPrimValues -> do
-            primDecode myPrimValues :/ decode otherPrimValues)
-
-encode :: All IsValue ts => HList Maybe ts -> HList PrimValue (MapPrims ts)
-encode values = constrainHList (Proxy :: Proxy IsValue) values
-    E
-    (\me rest -> do
-        let myPrims = case me of
-                Just x -> primEncode x
-                Nothing -> toNulls (primProxies me)
-        myPrims ++/ encode rest)
-  where
-    toNulls :: HList f ts -> HList PrimValue ts
-    toNulls E = E
-    toNulls (_ :/ rest) = VNull :/ toNulls rest
-
-data Where = forall ts. (All IsValue ts, AllWith Maybe Show ts) => Where String (HList Maybe ts)
-deriving instance Show Where
-
--- instance Eq Where where
-    -- Where sA tA == Where sB tB = sA == sB && encode tA ~= encode tB
+data Condition
+    = Where String
+    | forall a. (Show a, IsValue a) => WhereIs a String
+    | forall a. (Show a, IsValue a) => WhereWith a String
+    | forall a. (Show a, IsValue a) => WhereWithList String [a] String
+deriving instance Show Condition
 
 data RowRange
     = RowRange Int64 Int64
     | AllRows
 deriving instance Show RowRange
--- deriving instance Eq RowRange
 
 data RowOrder
     = Asc FieldName
     | Desc FieldName
 deriving instance Show RowOrder
--- deriving instance Eq RowOrder
 
 data ForeignKeyResolution
     = FKRNoAction
@@ -199,40 +186,38 @@ data ForeignKeyResolution
     | FKRSetNull
     | FKRSetDefault
 deriving instance Show ForeignKeyResolution
--- deriving instance Eq ForeignKeyResolution
 
 data ColumnConstraint (a :: PrimType) where
     CCPrimaryKey :: ColumnConstraint a
     CCNotNull :: ColumnConstraint a
+    CCCheck :: String -> ColumnConstraint a
     CCReferences :: TableName -> FieldName -> ForeignKeyResolution -> ForeignKeyResolution -> ColumnConstraint a
 deriving instance Show (ColumnConstraint a)
-
--- instance HEq1 ColumnConstraint where
-    -- CCPrimaryKey ~= CCPrimaryKey = True
-    -- CCNotNull ~= CCNotNull = True
-    -- CCReferences tableA fieldA onUpdateA onDeleteA ~= CCReferences tableB fieldB onUpdateB onDeleteB =
-        -- tableA == tableB && fieldA == fieldB && onUpdateA == onUpdateB && onDeleteA == onDeleteB
-    -- _ ~= _ = False
 
 data ColumnDecl = forall a. ColumnDecl (PrimField a) [ColumnConstraint a]
 deriving instance Show ColumnDecl
 
--- instance Eq ColumnDecl where
-    -- ColumnDecl fA cA == ColumnDecl fB cB =
-        -- fA ~= fB && setMatchBy (~=) cA cB
-
 data TableConstraint = TCPrimaryKey [FieldName]
 deriving instance Show TableConstraint
--- deriving instance Eq TableConstraint
+
+data RowSource
+    = TableSource TableName
+    | forall rs. AllWith Field Show rs => RecursiveSource TableName (HList Field rs) (Select rs) (Select rs)
+deriving instance Show RowSource
+
+instance IsString RowSource where
+    fromString = TableSource . TableName
+
+type Select rs = Query [HList Maybe rs]
 
 data Query result where
     CreateTable :: TableName -> [ColumnDecl] -> [TableConstraint] -> Query ()
     CreateIndex :: IndexName -> TableName -> [RowOrder] -> Query ()
     DropTable :: TableName -> Query ()
-    Select :: All IsValue rs => [TableName] -> HList Field rs -> [Where] -> [RowOrder] -> RowRange -> Query [HList Maybe rs]
-    Insert :: (All IsValue vs, All IsValue rs) => TableName -> HList Field vs -> HList Maybe vs -> HList Field rs -> Query (Maybe (HList Maybe rs))
-    Update :: All IsValue vs => TableName -> HList Field vs -> HList Maybe vs -> [Where] -> Query Int
-    Delete :: TableName -> [Where] -> Query Int
+    Select :: All IsValue rs => [RowSource] -> HList Field rs -> [Condition] -> [RowOrder] -> RowRange -> Select rs
+    Insert :: (AllWith Value Show vs, All IsValue rs) => TableName -> HList Field vs -> HList Value vs -> HList Field rs -> Query (Maybe (HList Maybe rs))
+    Update :: AllWith Value Show vs => TableName -> HList Field vs -> HList Value vs -> [Condition] -> Query Int64
+    Delete :: TableName -> [Condition] -> Query Int64
 
 instance Show (Query ts) where
     showsPrec d (CreateTable table columns constr) = showParen (d > 10)
@@ -254,12 +239,12 @@ instance Show (Query ts) where
     showsPrec d (Insert table fields values rets) = showParen (d > 10)
         $ showString "Insert " . showsPrec 11 table
         . showString " " . showPrimFields 11 (primFields fields)
-        . showString " " . showPrimValues 11 (encode values)
+        . showString " " . showsPrec 11 values
         . showString " " . showPrimFields 11 (primFields rets)
     showsPrec d (Update table fields values cond) = showParen (d > 10)
         $ showString "Update " . showsPrec 11 table
         . showString " " . showPrimFields 11 (primFields fields)
-        . showString " " . showPrimValues 11 (encode values)
+        . showString " " . showsPrec 11 values
         . showString " " . showsPrec 11 cond
     showsPrec d (Delete table cond) = showParen (d > 10)
         $ showString "Delete " . showsPrec 11 table
@@ -273,41 +258,21 @@ showPrimValues :: Int -> HList PrimValue ts -> ShowS
 showPrimValues _ E = showString "E"
 showPrimValues d (x :/ xs) = showParen (d > 6) $ showsPrec 7 x . showString " :/ " . showPrimValues 7 xs
 
--- instance HEq1 Query where
-    -- CreateTable tableA columnsA constrA ~= CreateTable tableB columnsB constrB =
-        -- tableA == tableB && setMatchBy (==) columnsA columnsB && setMatchBy (==) constrA constrB
-    -- CreateIndex indexA tableA orderA ~= CreateIndex indexB tableB orderB =
-        -- indexA == indexB && tableA == tableB && orderA == orderB
-    -- DropTable tableA ~= DropTable tableB =
-        -- tableA == tableB
-    -- Select tableListA fieldsA condA orderA rangeA ~= Select tableListB fieldsB condB orderB rangeB =
-        -- tableListA == tableListB && primFields fieldsA ~= primFields fieldsB && condA == condB && orderA == orderB && rangeA == rangeB
-    -- Insert tableA fieldsA valuesA retsA ~= Insert tableB fieldsB valuesB retsB =
-        -- tableA == tableB && primFields fieldsA ~= primFields fieldsB && encode valuesA ~= encode valuesB && primFields retsA ~= primFields retsB
-    -- Update tableA fieldsA valuesA condA ~= Update tableB fieldsB valuesB condB =
-        -- tableA == tableB && primFields fieldsA ~= primFields fieldsB && encode valuesA ~= encode valuesB && condA == condB
-    -- Delete tableA condA ~= Delete tableB condB =
-        -- tableA == tableB && condA == condB
-    -- _ ~= _ = False
-
--- setMatchBy :: (a -> b -> Bool) -> [a] -> [b] -> Bool
--- setMatchBy _ [] [] = True
--- setMatchBy test2 (x:xs) b = case setExcludeBy (test2 x) b of
-    -- Just ys -> setMatchBy test2 xs ys
-    -- Nothing -> False
-
--- setExcludeBy :: (b -> Bool) -> [b] -> Maybe [b]
--- setExcludeBy _ [] = Nothing
--- setExcludeBy test (y:ys)
-    -- | test y = Just ys
-    -- | otherwise = (y:) <$> setExcludeBy test ys
-
 primFieldName :: PrimField a -> String
 primFieldName (FInt (FieldName name)) = name
 primFieldName (FReal (FieldName name)) = name
+primFieldName (FBool (FieldName name)) = name
 primFieldName (FText (FieldName name)) = name
 primFieldName (FBlob (FieldName name)) = name
 primFieldName (FTime (FieldName name)) = name
+
+showBlob :: String -> BS.ByteString -> ShowS
+showBlob m bs = showString $ "[" ++ m ++ "|" ++ inner ++ "|]"
+  where
+    inner = do
+        c <- BS.unpack bs
+        [hchar (c `div` 16), hchar (c `mod` 16)]
+    hchar n = BSChar.index "0123456789abcdef" $ fromIntegral n
 
 instance IsValue Int64 where
     type Prims Int64 = '[ 'TInt ]
@@ -319,14 +284,14 @@ fInt :: FieldName -> Field Int64
 fInt a = Field (FInt a :/ E)
 
 instance IsValue Bool where
-    type Prims Bool = '[ 'TInt ]
-    primDecode (VInt x :/ E) = Just (x /= 0)
-    primDecode _ = Just False
-    primEncode True = VInt 1 :/ E
-    primEncode False = VInt 0 :/ E
+    type Prims Bool = '[ 'TBool ]
+    primDecode (VBool x :/ E) = Just x
+    primDecode _ = Nothing
+    primEncode True = VBool True :/ E
+    primEncode False = VBool False :/ E
 
 fBool :: FieldName -> Field Bool
-fBool a = Field (FInt a :/ E)
+fBool a = Field (FBool a :/ E)
 
 instance IsValue Double where
     type Prims Double = '[ 'TReal ]
