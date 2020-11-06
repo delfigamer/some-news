@@ -84,7 +84,7 @@ renderQuery (DropTable (TableName table)) =
 renderQuery (Select sources fields cond order range) =
     delimConcat " " (map renderRecursiveSource sources)
         <> "SELECT " <> renderFieldList fields
-        <> " FROM " <> delimConcat ", " (map renderTableSource sources)
+        <> " FROM " <> renderTableSourceList sources
         <> renderWhere cond
         <> case order of
             [] -> mempty
@@ -139,9 +139,22 @@ renderFKR FKRCascade = " CASCADE"
 renderFKR FKRSetNull = " SET NULL"
 renderFKR FKRSetDefault = " SET DEFAULT"
 
-renderTableSource :: RowSource -> Render
-renderTableSource (TableSource (TableName tableName)) = fromString tableName
-renderTableSource (RecursiveSource (TableName tableName) _ _ _) = fromString tableName
+renderTableSourceList :: [RowSource] -> Render
+renderTableSourceList [] = error "Sql.Query.Render: SELECT statement with no sources"
+renderTableSourceList (first : rest) =
+    case first of
+        TableSource (TableName tableName) -> fromString tableName <> doRest rest
+        RecursiveSource (TableName tableName) _ _ _ -> fromString tableName <> doRest rest
+        _ -> error "Sql.Query.Render: SELECT statement must start with a simple source"
+  where
+    doRest [] = mempty
+    doRest (TableSource (TableName tableName) : rest) =
+        ", " <> fromString tableName <> doRest rest
+    doRest (OuterJoinSource (TableName tableName) condition : rest) =
+        " LEFT JOIN " <> fromString tableName
+            <> " ON " <> renderCondition condition <> doRest rest
+    doRest (RecursiveSource (TableName tableName) _ _ _ : rest) =
+        ", " <> fromString tableName <> doRest rest
 
 renderRecursiveSource :: RowSource -> Render
 renderRecursiveSource (RecursiveSource (TableName tableName) recFields initQuery recQuery) =
@@ -178,6 +191,7 @@ renderWhere cond = " WHERE " <> delimConcat " AND " (map renderCondition cond)
 
 renderCondition :: Condition -> Render
 renderCondition (Where str) = "(" <> fromString str <> ")"
+renderCondition (WhereFieldIs sa sb) = "(" <> fromString sa <> detailString detailNullEquality <> fromString sb <> ")"
 renderCondition (WhereIs value str) = "(" <> fromString str <> detailString detailNullEquality <> renderValue (Value value) <> ")"
 renderCondition (WhereWith value str) = "(" <> fromString str <> ")" <> primValues (primEncode value)
 renderCondition (WhereWithList _ [] _) = "FALSE"

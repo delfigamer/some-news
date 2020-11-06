@@ -158,7 +158,7 @@ upgradeEmptyToCurrent logger db = do
         ExceptT $ Db.makeQuery db2 $
             CreateTable "sn_tags"
                 [ ColumnDecl (FBlob "tag_id") [CCPrimaryKey]
-                , ColumnDecl (FBlob "tag_name") [CCNotNull]
+                , ColumnDecl (FText "tag_name") [CCNotNull]
                 ]
                 []
         ExceptT $ Db.makeQuery db2 $

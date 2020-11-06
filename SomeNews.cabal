@@ -4,7 +4,7 @@ cabal-version: 1.12
 --
 -- see: https://github.com/sol/hpack
 --
--- hash: 2a02b7f58a2451aa96935f81fe1bad8501f7fd2564e9d5b226845cab3b02e5ed
+-- hash: 7577033032f9992d052ce637af731e66e792d3088bfdc579002a8f3744830aee
 
 name:           SomeNews
 version:        0.1.0.0
@@ -102,7 +102,6 @@ test-suite SomeNews-test
   main-is: Spec.hs
   other-modules:
       Gen
-      Storage.Model
       StorageSpec
       Paths_SomeNews
   hs-source-dirs:

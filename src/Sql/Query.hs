@@ -164,6 +164,7 @@ primFields (Field fs :/ rest) = fs ++/ primFields rest
 
 data Condition
     = Where String
+    | WhereFieldIs String String
     | forall a. (Show a, IsValue a) => WhereIs a String
     | forall a. (Show a, IsValue a) => WhereWith a String
     | forall a. (Show a, IsValue a) => WhereWithList String [a] String
@@ -202,6 +203,7 @@ deriving instance Show TableConstraint
 
 data RowSource
     = TableSource TableName
+    | OuterJoinSource TableName Condition
     | forall rs. AllWith Field Show rs => RecursiveSource TableName (HList Field rs) (Select rs) (Select rs)
 deriving instance Show RowSource
 

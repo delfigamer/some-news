@@ -168,7 +168,8 @@ performRandomStorageTest testConf logger db = do
         testAccessKeys storage sampleSize userTable
         userAuthorConnSet <- testAuthorUserConns storage sampleSize userTable authorTable
         categoryTable <- testCategories storage sampleSize
-        articleTable <- testArticles storage sampleSize userTable authorTable categoryTable
+        articleTable <- testArticles storage sampleSize userTable authorTable userAuthorConnSet categoryTable
+        tagTable <- testTags storage sampleSize
         return ()
 
 testUsers
@@ -428,28 +429,33 @@ testAuthorUserConns storage sampleSize userTable authorTable = do
     return connSet
   where
     checkConns connSet = do
-        connSet <- readIORef connSet
+        conns <- readIORef connSet
         users <- readIORef userTable
         authors <- readIORef authorTable
         parallelFor_ (Map.toList users) $ \(userRef, _) -> do
-            let authorRefList = authorsOfUser connSet userRef
+            let authorRefList = authorsOfUser conns userRef
             let authorList = map (authors Map.!) authorRefList
             perform storage (AuthorList (ListView 0 maxBound [FilterAuthorUserId userRef] []))
                 `shouldReturn`
                 Right authorList
         parallelFor_ (Map.toList authors) $ \(authorRef, _) -> do
-            let userRefList = usersOfAuthor connSet authorRef
+            let userRefList = usersOfAuthor conns authorRef
             let userList = map (users Map.!) userRefList
             perform storage (UserList (ListView 0 maxBound [FilterUserAuthorId authorRef] []))
                 `shouldReturn`
                 Right userList
-    usersOfAuthor set authorRef = sort $ do
-        (uref, aref) <- Set.toList set
-        guard $ aref == authorRef
-        [uref]
-    authorsOfUser set userRef = do
-        let (_, eq, _) = splitSetOn ((compare userRef) . fst) set
-        map (\(_, aref) -> aref) $ Set.toAscList eq
+
+usersOfAuthor :: Set.Set (Reference User, Reference Author) -> Reference Author -> [Reference User]
+usersOfAuthor set authorRef = sort $
+    [ uref
+        | (uref, aref) <- Set.toList set
+        , aref == authorRef
+    ]
+
+authorsOfUser :: Set.Set (Reference User, Reference Author) -> Reference User -> [Reference Author]
+authorsOfUser set userRef = do
+    let (_, eq, _) = splitSetOn ((compare userRef) . fst) set
+    map (\(_, aref) -> aref) $ Set.toAscList eq
 
 testCategories
     :: Handle -> Int
@@ -478,14 +484,18 @@ testCategories storage sampleSize = do
     do
         categoryMap <- readIORef categoryTable
         toAlter <- generate $ chooseFrom (sampleSize `div` 5) (Map.elems categoryMap)
+        let toAlterIdSet = Set.fromList $ map categoryId toAlter
+        let stableCategories = Map.filter
+                (\cat -> Set.fromList (parentList categoryMap (categoryId cat)) `Set.disjoint` toAlterIdSet)
+                categoryMap
         parallelFor_ toAlter $ \category -> do
             [parent] <- generate $ do
                 b <- randomBool
                 if b
                     then return [Reference ""]
                     else chooseFromSuch
-                        (\cref -> categoryId category `notElem` parentList categoryMap cref)
-                        1 (Map.keys categoryMap)
+                        (\cref -> categoryId category `notElem` parentList stableCategories cref)
+                        1 (Map.keys stableCategories)
             assertRight =<< perform storage (CategorySetParent (categoryId category) parent)
             atomicModifyIORef_ categoryTable $ Map.insert (categoryId category) $
                 category {categoryParent = parent}
@@ -493,13 +503,14 @@ testCategories storage sampleSize = do
     do
         categoryList <- Map.elems <$> readIORef categoryTable
         toDelete <- generate $ chooseFrom (sampleSize `div` 5) categoryList
-        parallelFor_ toDelete $ \category -> do
-            assertRight =<< perform storage (CategoryDelete (categoryId category))
+        let toDeleteNorm = Map.toList $ normalizeCategoryDeletionList toDelete
+        parallelFor_ toDeleteNorm $ \(categoryRef, parent) -> do
+            assertRight =<< perform storage (CategoryDelete categoryRef)
             atomicModifyIORef_ categoryTable $ \cats1 -> do
-                let cats2 = Map.delete (categoryId category) cats1
+                let cats2 = Map.delete categoryRef cats1
                 flip Map.map cats2 $ \cat ->
-                    if categoryParent cat == categoryId category
-                        then cat {categoryParent = categoryParent category}
+                    if categoryParent cat == categoryRef
+                        then cat {categoryParent = parent}
                         else cat
         checkCategories categoryTable
     do
@@ -524,23 +535,19 @@ testCategories storage sampleSize = do
         perform storage (CategoryList (ListView 0 maxBound [] [(OrderCategoryName, Ascending)]))
             `shouldReturn`
             Right (sortOn categoryName categoryList)
-        let strictSubcategories = Map.mapWithKey
-                (\cref _ -> Map.keysSet $ Map.filter (\cat -> categoryParent cat == cref) categoryMap)
-                categoryMap
+        let (strictSubcategories, transitiveSubcategories) = subcategoryMaps categoryMap
         parallelFor_ (Map.toList strictSubcategories) $ \(categoryRef, subcatSet) -> do
             perform storage (CategoryList (ListView 0 maxBound [FilterCategoryParentId categoryRef] []))
                 `shouldReturn`
                 Right (map (categoryMap Map.!) (Set.toList subcatSet))
-        let transitiveSubcategories = MapLazy.mapWithKey
-                (\cref subcats -> Set.insert cref $
-                    Set.unions $
-                        subcats :
-                            map (transitiveSubcategories Map.!) (Set.toList subcats))
-                strictSubcategories
         parallelFor_ (Map.toList transitiveSubcategories) $ \(categoryRef, subcatSet) -> do
+            let subcatList = map (categoryMap Map.!) (Set.toList subcatSet)
             perform storage (CategoryList (ListView 0 maxBound [FilterCategoryTransitiveParentId categoryRef] []))
                 `shouldReturn`
-                Right (map (categoryMap Map.!) (Set.toList subcatSet))
+                Right subcatList
+            perform storage (CategoryList (ListView 0 maxBound [FilterCategoryTransitiveParentId categoryRef] [(OrderCategoryName, Ascending)]))
+                `shouldReturn`
+                Right (sortOn categoryName subcatList)
             someSubcats <- generate $ chooseFrom 2 $ Set.toList subcatSet
             parallelFor_ someSubcats $ \subcat -> do
                 perform storage (CategorySetParent categoryRef subcat) `shouldReturn` Left InvalidRequestError
@@ -554,13 +561,40 @@ testCategories storage sampleSize = do
     parentList catMap (Reference "") = []
     parentList catMap cref = cref : parentList catMap (categoryParent $ catMap Map.! cref)
 
+normalizeCategoryDeletionList :: [Category] -> MapLazy.Map (Reference Category) (Reference Category)
+normalizeCategoryDeletionList toDelete = do
+    normParentMap
+  where
+    rawParentMap = Map.fromList $ map (\cat -> (categoryId cat, categoryParent cat)) toDelete
+    normParentMap = flip MapLazy.map rawParentMap $ \parent1 -> do
+        case MapLazy.lookup parent1 normParentMap of
+            Nothing -> parent1
+            Just parent2 -> parent2
+
+subcategoryMaps
+    :: Map.Map (Reference Category) Category
+    -> ( Map.Map (Reference Category) (Set.Set (Reference Category))
+       , MapLazy.Map (Reference Category) (Set.Set (Reference Category)))
+subcategoryMaps categoryMap = (strictSubcategories, transitiveSubcategories)
+  where
+    strictSubcategories = Map.mapWithKey
+        (\cref _ -> Map.keysSet $ Map.filter (\cat -> categoryParent cat == cref) categoryMap)
+        categoryMap
+    transitiveSubcategories = MapLazy.mapWithKey
+        (\cref subcats -> Set.insert cref $
+            Set.unions $
+                subcats :
+                    map (transitiveSubcategories Map.!) (Set.toList subcats))
+        strictSubcategories
+
 testArticles
     :: Handle -> Int
     -> IORef (Map.Map (Reference User) User)
     -> IORef (Map.Map (Reference Author) Author)
+    -> IORef (Set.Set (Reference User, Reference Author))
     -> IORef (Map.Map (Reference Category) Category)
     -> IO (IORef (Map.Map (Reference Article) Article))
-testArticles storage sampleSize userTable authorTable categoryTable = do
+testArticles storage sampleSize userTable authorTable userAuthorConnSet categoryTable = do
     authorRefs <- Map.keys <$> readIORef authorTable
     categoryRefs <- Map.keys <$> readIORef categoryTable
     articleTable <- newIORef Map.empty
@@ -682,12 +716,30 @@ testArticles storage sampleSize userTable authorTable categoryTable = do
         parallelFor_ authorsToDelete $ \authorRef -> do
             assertRight =<< perform storage (AuthorDelete authorRef)
             atomicModifyIORef_ authorTable $ Map.delete authorRef
+            atomicModifyIORef_ userAuthorConnSet $ Set.filter $ \(_, aref) -> aref /= authorRef
         atomicModifyIORef_ articleTable $ Map.mapMaybe $ \article ->
             if articleAuthor article `elem` authorsToDelete
                 then case articlePublicationStatus article of
                     PublishAt _ -> Just $ article {articleAuthor = Reference ""}
                     NonPublished -> Nothing
                 else Just article
+        checkArticles articleTable
+    do
+        categoryList <- Map.elems <$> readIORef categoryTable
+        categoriesToDelete <- generate $ chooseFrom (sampleSize `div` 5) categoryList
+        let toDeleteNorm = normalizeCategoryDeletionList categoriesToDelete
+        parallelFor_ (Map.toList toDeleteNorm) $ \(categoryRef, parent) -> do
+            assertRight =<< perform storage (CategoryDelete categoryRef)
+            atomicModifyIORef_ categoryTable $ \cats1 -> do
+                let cats2 = Map.delete categoryRef cats1
+                flip Map.map cats2 $ \cat ->
+                    if categoryParent cat == categoryRef
+                        then cat {categoryParent = parent}
+                        else cat
+        atomicModifyIORef_ articleTable $ Map.map $ \article ->
+            case Map.lookup (articleCategory article) toDeleteNorm of
+                Nothing -> article
+                Just newCategory -> article {articleCategory = newCategory}
         checkArticles articleTable
     do
         articleList <- Map.elems <$> readIORef articleTable
@@ -702,6 +754,55 @@ testArticles storage sampleSize userTable authorTable categoryTable = do
             perform storage (ArticleList True (ListView 0 maxBound [FilterArticleAuthorId authorRef] []))
                 `shouldReturn`
                 Right (filter (\article -> articleAuthor article == authorRef) articleList)
+        userAuthorConns <- readIORef userAuthorConnSet
+        let userAuthorConnMap = Map.fromAscListWith Set.union $
+                map (\(uref, aref) -> (uref, Set.singleton aref)) $
+                    Set.toAscList userAuthorConns
+        let userAuthorList = (Reference "", Set.singleton (Reference "")) : Map.toList userAuthorConnMap
+        parallelFor_ userAuthorList $ \(userRef, authorSet) -> do
+            perform storage (ArticleList True (ListView 0 maxBound [FilterArticleUserId userRef] []))
+                `shouldReturn`
+                Right (filter (\article -> articleAuthor article `Set.member` authorSet) articleList)
+        categoryMap <- readIORef categoryTable
+        let (_, transitiveSubcategories) = subcategoryMaps categoryMap
+        let subcategoryList = (Reference "", Set.singleton (Reference "")) : Map.toList transitiveSubcategories
+        parallelFor_ subcategoryList $ \(categoryRef, subcatSet) -> do
+            perform storage (ArticleList True (ListView 0 maxBound [FilterArticleCategoryId categoryRef] []))
+                `shouldReturn`
+                Right (filter (\article -> articleCategory article == categoryRef) articleList)
+            perform storage (ArticleList True (ListView 0 maxBound [FilterArticleTransitiveCategoryId categoryRef] []))
+                `shouldReturn`
+                Right (filter (\article -> articleCategory article `Set.member` subcatSet) articleList)
+        let timeA = addUTCTime (86400 * (-500)) timeGenBase
+        let timeB = addUTCTime (86400 * (365 * 10 + 500)) timeGenBase
+        perform storage (ArticleList True (ListView 0 maxBound [FilterArticlePublishedBefore timeB] []))
+            `shouldReturn`
+            Right (filter (publishedBefore timeB) articleList)
+        perform storage (ArticleList False (ListView 0 maxBound [FilterArticlePublishedBefore timeB] []))
+            `shouldReturn`
+            Right (filter (publishedBefore timeGenBase) articleList)
+        perform storage (ArticleList True (ListView 0 maxBound [FilterArticlePublishedAfter timeA] []))
+            `shouldReturn`
+            Right (filter (publishedAfter timeA) articleList)
+        perform storage (ArticleList False (ListView 0 maxBound [FilterArticlePublishedAfter timeA] []))
+            `shouldReturn`
+            Right (filter (publishedWithin timeA timeGenBase) articleList)
+        perform storage (ArticleList True (ListView 0 maxBound [FilterArticlePublishedAfter timeA, FilterArticlePublishedBefore timeB] []))
+            `shouldReturn`
+            Right (filter (publishedWithin timeA timeB) articleList)
+        perform storage (ArticleList False (ListView 0 maxBound [FilterArticlePublishedAfter timeA, FilterArticlePublishedBefore timeB] []))
+            `shouldReturn`
+            Right (filter (publishedWithin timeA timeGenBase) articleList)
+        perform storage (ArticleList True (ListView 0 maxBound [] [(OrderArticleName, Ascending)]))
+            `shouldReturn`
+            Right (sortOn articleName articleList)
+        perform storage (ArticleList True (ListView 0 maxBound [] [(OrderArticleDate, Ascending)]))
+            `shouldReturn`
+            Right (sortOn articlePublicationStatus articleList)
+        authorMap <- readIORef authorTable
+        perform storage (ArticleList True (ListView 0 maxBound [] [(OrderArticleAuthorName, Ascending)]))
+            `shouldReturn`
+            Right (sortOn (articleAuthorName authorMap) articleList)
     return articleTable
   where
     checkArticles articleTable = do
@@ -713,3 +814,63 @@ testArticles storage sampleSize userTable authorTable categoryTable = do
             `shouldReturn`
             Right (filter isPublished articleList)
     isPublished article = articlePublicationStatus article >= PublishAt timeGenBase
+    publishedBefore ta article = articlePublicationStatus article >= PublishAt ta
+    publishedAfter ta article = articlePublicationStatus article <= PublishAt ta
+    publishedWithin ta tb article = publishedAfter ta article && publishedBefore tb article
+    articleAuthorName authorMap article = authorName <$> Map.lookup (articleAuthor article) authorMap
+
+testTags
+    :: Handle -> Int
+    -> IO (IORef (Map.Map (Reference Tag) Tag))
+testTags storage sampleSize = do
+    tagTable <- newIORef Map.empty
+    do
+        parallelFor_ [1 .. sampleSize] $ \_ -> do
+            name <- generate $ randomText
+            tag <- assertRight =<< perform storage (TagCreate name)
+            tagName tag `shouldBe` name
+            atomicModifyIORef_ tagTable $ Map.insert (tagId tag) tag
+        checkTags tagTable
+    do
+        tagList <- Map.elems <$> readIORef tagTable
+        toAlter <- generate $ chooseFrom (sampleSize `div` 5) tagList
+        parallelFor_ toAlter $ \tag -> do
+            name <- generate $ randomText
+            assertRight =<< perform storage (TagSetName (tagId tag) name)
+            atomicModifyIORef_ tagTable $ Map.insert (tagId tag) $
+                tag {tagName = name}
+        checkTags tagTable
+    do
+        tagList <- Map.elems <$> readIORef tagTable
+        toDelete <- generate $ chooseFrom (sampleSize `div` 5) tagList
+        parallelFor_ toDelete $ \tag -> do
+            assertRight =<< perform storage (TagDelete (tagId tag))
+            atomicModifyIORef_ tagTable $ Map.delete (tagId tag)
+        checkTags tagTable
+    do
+        tagMap <- readIORef tagTable
+        badRefs <- generate $
+            replicateM 20 $
+                randomReference `suchThat` (\ref -> not (Map.member ref tagMap))
+        parallelFor_ badRefs $ \ref -> do
+            perform storage (TagSetName ref "foo") `shouldReturn` Left NotFoundError
+            perform storage (TagDelete ref) `shouldReturn` Left NotFoundError
+            perform storage (TagList (ListView 0 1 [FilterTagId ref] []))
+                `shouldReturn`
+                Right []
+    do
+        tagList <- Map.elems <$> readIORef tagTable
+        parallelFor_ tagList $ \tag -> do
+            perform storage (TagList (ListView 0 1 [FilterTagId (tagId tag)] []))
+                `shouldReturn`
+                Right [tag]
+        perform storage (TagList (ListView 0 maxBound [] [(OrderTagName, Ascending)]))
+            `shouldReturn`
+            Right (sortOn tagName tagList)
+    return tagTable
+  where
+    checkTags tagTable = do
+        tagList <- Map.elems <$> readIORef tagTable
+        perform storage (TagList (ListView 0 maxBound [] []))
+            `shouldReturn`
+            Right tagList

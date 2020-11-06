@@ -425,7 +425,7 @@ performStorage (AuthorSetOwnership authorRef userRef False) = runTransactionRela
             [WhereIs userRef "a2u_user_id", WhereIs authorRef "a2u_author_id"])
 
 performStorage (CategoryCreate name parentRef) = runTransactionRelaxed $ do
-    ref <- Reference <$> generateBytes 2
+    ref <- Reference <$> generateBytes 4
     doQuery
         (Insert "sn_categories"
             (fReference "category_id" :/ fText "category_name" :/ fReference "category_parent_id" :/ E)
@@ -802,7 +802,7 @@ instance ListableObject User where
     applyFilter (FilterUserIsAdmin True) = demandCondition (Where "user_is_admin")
     applyFilter (FilterUserIsAdmin False) = demandCondition (Where "NOT user_is_admin")
     applyFilter (FilterUserAuthorId ref) = demandCondition (WhereIs ref "a2u_author_id")
-        <> demandJoin "sn_author2user" (Where "a2u_user_id = user_id")
+        <> demandJoin "sn_author2user" [Where "a2u_user_id = user_id"]
     applyOrder OrderUserName = demandOrder "user_name"
     applyOrder OrderUserSurname = demandOrder "user_surname"
     applyOrder OrderUserJoinDate = demandOrder "user_join_date" . inverseDirection
@@ -815,39 +815,40 @@ instance ListableObject AccessKey where
 instance ListableObject Author where
     applyFilter (FilterAuthorId ref) = demandCondition (WhereIs ref "author_id")
     applyFilter (FilterAuthorUserId ref) = demandCondition (WhereIs ref "a2u_user_id")
-        <> demandJoin "sn_author2user" (Where "a2u_author_id = author_id")
+        <> demandJoin "sn_author2user" [Where "a2u_author_id = author_id"]
     applyOrder OrderAuthorName = demandOrder "author_name"
 
 instance ListableObject Category where
     applyFilter (FilterCategoryId ref) = demandCondition (WhereIs ref "category_id")
     applyFilter (FilterCategoryParentId ref) = demandCondition (WhereIs ref "category_parent_id")
-    applyFilter (FilterCategoryTransitiveParentId ref) = demandJoin (subcategoriesSource ref) (Where "category_id = subcategory_id")
+    applyFilter (FilterCategoryTransitiveParentId ref) = demandJoin (subcategoriesSource ref) [Where "category_id = subcategory_id"]
     applyOrder OrderCategoryName = demandOrder "category_name"
 
 instance ListableObject Article where
     applyFilter (FilterArticleId ref) = demandCondition (WhereIs ref "article_id")
     applyFilter (FilterArticleAuthorId ref) = demandCondition (WhereIs ref "article_author_id")
     applyFilter (FilterArticleUserId ref) = demandCondition (WhereIs ref "a2u_user_id")
-        <> demandJoin "sn_author2user" (Where "a2u_author_id = article_author_id")
+        <> demandJoin (OuterJoinSource "sn_author2user" (WhereFieldIs "a2u_author_id" "article_author_id")) []
     applyFilter (FilterArticleCategoryId ref) = demandCondition (WhereIs ref "article_category_id")
-    applyFilter (FilterArticleTransitiveCategoryId ref) = demandJoin (subcategoriesSource ref) (Where "article_category_id = subcategory_id")
+    applyFilter (FilterArticleTransitiveCategoryId (Reference "")) = demandCondition (Where "article_category_id IS NULL")
+    applyFilter (FilterArticleTransitiveCategoryId ref) = demandJoin (subcategoriesSource ref) [Where "article_category_id = subcategory_id"]
     applyFilter (FilterArticlePublishedBefore end) = demandCondition (WhereWith end "article_publication_date < ?")
     applyFilter (FilterArticlePublishedAfter begin) = demandCondition (WhereWith begin "article_publication_date >= ?")
     applyFilter (FilterArticleTagId []) = mempty
     applyFilter (FilterArticleTagId [ref]) = demandCondition (WhereIs ref "a2t_tag_id")
-        <> demandJoin "sn_article2tag" (Where "a2t_article_id = article_id")
+        <> demandJoin "sn_article2tag" [Where "a2t_article_id = article_id"]
     applyFilter (FilterArticleTagId tagRefs) = demandCondition (WhereWithList "EXISTS (SELECT * FROM sn_article2tag WHERE a2t_article_id = article_id AND a2t_tag_id IN " tagRefs ")")
     applyOrder OrderArticleName = demandOrder "article_name"
-    applyOrder OrderArticleDate = demandOrder "article_publication_date"
-    applyOrder OrderArticleAuthorName = demandOrder "author_name"
-        <> pure (demandJoin "sn_authors" (Where "author_id = article_author_id"))
-    applyOrder OrderArticleCategoryName = demandOrder "category_name"
-        <> pure (demandJoin "sn_categories" (Where "category_id = article_category_id"))
+    applyOrder OrderArticleDate = demandOrder "article_publication_date" . inverseDirection
+    applyOrder OrderArticleAuthorName = demandOrder "COALESCE(author_name, '')"
+        <> pure (demandJoin (OuterJoinSource "sn_authors" (WhereFieldIs "author_id" "article_author_id")) [])
+    applyOrder OrderArticleCategoryName = demandOrder "COALESCE(category_name, '')"
+        <> pure (demandJoin (OuterJoinSource "sn_categories" (WhereFieldIs "category_id" "article_category_id")) [])
 
 instance ListableObject Tag where
     applyFilter (FilterTagId ref) = demandCondition (WhereIs ref "tag_id")
     applyFilter (FilterTagArticleId ref) = demandCondition (WhereIs ref "a2t_article_id")
-        <> demandJoin "sn_article2tag" (Where "a2t_tag_id = tag_id")
+        <> demandJoin "sn_article2tag" [Where "a2t_tag_id = tag_id"]
     applyOrder OrderTagName = demandOrder "tag_name"
 
 instance ListableObject Comment where
@@ -866,6 +867,7 @@ data JoinDemand = JoinDemand RowSource (Endo [Condition])
 
 instance Eq JoinDemand where
     JoinDemand (TableSource t1) _ == JoinDemand (TableSource t2) _ = t1 == t2
+    JoinDemand (OuterJoinSource t1 _) _ == JoinDemand (OuterJoinSource t2 _) _ = t1 == t2
     JoinDemand (RecursiveSource t1 _ _ _) _ == JoinDemand (RecursiveSource t2 _ _ _) _ = t1 == t2
     _ == _ = False
 
@@ -884,9 +886,9 @@ instance Semigroup QueryDemand where
 instance Monoid QueryDemand where
     mempty = QueryDemand $ \_ cont -> cont mempty mempty mempty
 
-demandJoin :: RowSource -> Condition -> QueryDemand
+demandJoin :: RowSource -> [Condition] -> QueryDemand
 demandJoin source cond = QueryDemand $ \_ cont -> do
-    let demand = JoinDemand source (Endo (cond :))
+    let demand = JoinDemand source (Endo (cond ++))
     cont (Endo (demand :)) mempty mempty
 
 demandCondition :: Condition -> QueryDemand
