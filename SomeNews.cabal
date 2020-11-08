@@ -4,7 +4,7 @@ cabal-version: 1.12
 --
 -- see: https://github.com/sol/hpack
 --
--- hash: 7577033032f9992d052ce637af731e66e792d3088bfdc579002a8f3744830aee
+-- hash: e65b190b57ebed048aad98fe18d915dac0b10d44fa1d8151ef2813b011c04b1f
 
 name:           SomeNews
 version:        0.1.0.0
@@ -61,6 +61,7 @@ library
     , stm
     , text
     , time
+    , transformers
     , unordered-containers
     , warp
     , yaml
@@ -92,6 +93,7 @@ executable SomeNews-exe
     , stm
     , text
     , time
+    , transformers
     , unordered-containers
     , warp
     , yaml
@@ -101,8 +103,10 @@ test-suite SomeNews-test
   type: exitcode-stdio-1.0
   main-is: Spec.hs
   other-modules:
+      Bimap
       Gen
       StorageSpec
+      TreeMap
       Paths_SomeNews
   hs-source-dirs:
       test
@@ -126,6 +130,7 @@ test-suite SomeNews-test
     , stm
     , text
     , time
+    , transformers
     , unordered-containers
     , warp
     , yaml

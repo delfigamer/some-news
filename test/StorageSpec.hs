@@ -14,6 +14,7 @@ import Data.List
 import Data.Maybe
 import Data.Ord
 import Data.Time.Clock
+import Data.Tuple
 import Data.Yaml
 import System.IO.Unsafe
 import Test.Hspec
@@ -28,9 +29,11 @@ import Gen
 import Sql.Query
 import Storage
 import Tuple
+import qualified Bimap
 import qualified Logger
 import qualified Sql.Database as Db
 import qualified Sql.Database.Config as Db
+import qualified Tree
 
 data TestConfig = TestConfig
     { databaseConfig :: Db.Config
@@ -170,6 +173,7 @@ performRandomStorageTest testConf logger db = do
         categoryTable <- testCategories storage sampleSize
         articleTable <- testArticles storage sampleSize userTable authorTable userAuthorConnSet categoryTable
         tagTable <- testTags storage sampleSize
+        articleTagConnSet <- testArticleTagConns storage sampleSize articleTable tagTable
         return ()
 
 testUsers
@@ -281,7 +285,7 @@ testAccessKeys storage sampleSize userTable = do
         userKeys <- readIORef akeyTable
         let allKeys = do
                 (userRef, akeys) <- Map.toList userKeys
-                key <- Set.toList akeys
+                key <- Set.elems akeys
                 [(userRef, key)]
         toDelete <- generate $ chooseFrom (sampleSize `div` 5) allKeys
         parallelFor_ toDelete $ \(userRef, akey) -> do
@@ -292,7 +296,7 @@ testAccessKeys storage sampleSize userTable = do
         userKeys <- readIORef akeyTable
         let oneKeys = do
                 (userRef, akeys) <- Map.toList userKeys
-                oneKey : _ <- return $ Set.toList akeys
+                oneKey : _ <- return $ Set.elems akeys
                 [(userRef, oneKey)]
         let (users, keys) = unzip oneKeys
         let badKeysFull = zip users (drop 1 keys)
@@ -310,7 +314,7 @@ testAccessKeys storage sampleSize userTable = do
             perform storage (AccessKeyList userRef (ListView 0 maxBound [] []))
                 `shouldReturn`
                 Right (map accessKeyId $ Set.toAscList akeySet)
-            parallelFor_ (Set.toList akeySet) $ \akey -> do
+            parallelFor_ (Set.elems akeySet) $ \akey -> do
                 perform storage (AccessKeyLookup akey)
                     `shouldReturn`
                     Right userRef
@@ -387,18 +391,18 @@ testAuthorUserConns
     :: Handle -> Int
     -> IORef (Map.Map (Reference User) User)
     -> IORef (Map.Map (Reference Author) Author)
-    -> IO (IORef (Set.Set (Reference User, Reference Author)))
+    -> IO (IORef (Bimap.Bimap (Reference User) (Reference Author)))
 testAuthorUserConns storage sampleSize userTable authorTable = do
-    connSet <- newIORef Set.empty
     userRefs <- Map.keys <$> readIORef userTable
     authorRefs <- Map.keys <$> readIORef authorTable
+    connSet <- newIORef $ Bimap.fromKeys userRefs authorRefs
     do
         parallelFor_ authorRefs $ \authorRef -> do
             parallelFor_ userRefs $ \userRef -> do
                 byChance 1 3
                     (do
                         assertRight =<< perform storage (AuthorSetOwnership authorRef userRef True)
-                        atomicModifyIORef_ connSet $ Set.insert (userRef, authorRef))
+                        atomicModifyIORef_ connSet $ Bimap.insert (userRef, authorRef))
                     (return ())
         checkConns connSet
     do
@@ -407,117 +411,97 @@ testAuthorUserConns storage sampleSize userTable authorTable = do
                 conn <- generate $ randomBool
                 assertRight =<< perform storage (AuthorSetOwnership authorRef userRef conn)
                 atomicModifyIORef_ connSet $ if conn
-                    then Set.insert (userRef, authorRef)
-                    else Set.delete (userRef, authorRef)
+                    then Bimap.insert (userRef, authorRef)
+                    else Bimap.delete (userRef, authorRef)
         checkConns connSet
     do
         usersToDelete <- generate $ chooseFrom (sampleSize `div` 5) userRefs
         parallelFor_ usersToDelete $ \userRef -> do
             assertRight =<< perform storage (UserDelete userRef)
             atomicModifyIORef_ userTable $ Map.delete userRef
-            atomicModifyIORef_ connSet $ \set -> do
-                let (lt, _, gt) = splitSetOn ((compare userRef) . fst) set
-                Set.union lt gt
+            atomicModifyIORef_ connSet $ Bimap.removeLeft userRef
         checkConns connSet
     do
         authorsToDelete <- generate $ chooseFrom (sampleSize `div` 5) authorRefs
         parallelFor_ authorsToDelete $ \authorRef -> do
             assertRight =<< perform storage (AuthorDelete authorRef)
             atomicModifyIORef_ authorTable $ Map.delete authorRef
-            atomicModifyIORef_ connSet $ Set.filter $ \(_, aref) -> aref /= authorRef
+            atomicModifyIORef_ connSet $ Bimap.removeRight authorRef
         checkConns connSet
     return connSet
   where
     checkConns connSet = do
         conns <- readIORef connSet
-        users <- readIORef userTable
-        authors <- readIORef authorTable
-        parallelFor_ (Map.toList users) $ \(userRef, _) -> do
-            let authorRefList = authorsOfUser conns userRef
-            let authorList = map (authors Map.!) authorRefList
+        authorMap <- readIORef authorTable
+        parallelFor_ (Map.toList (Bimap.left conns)) $ \(userRef, authorSet) -> do
             perform storage (AuthorList (ListView 0 maxBound [FilterAuthorUserId userRef] []))
                 `shouldReturn`
-                Right authorList
-        parallelFor_ (Map.toList authors) $ \(authorRef, _) -> do
-            let userRefList = usersOfAuthor conns authorRef
-            let userList = map (users Map.!) userRefList
+                Right (map (authorMap Map.!) $ Set.elems authorSet)
+        userMap <- readIORef userTable
+        parallelFor_ (Map.toList (Bimap.right conns)) $ \(authorRef, userSet) -> do
             perform storage (UserList (ListView 0 maxBound [FilterUserAuthorId authorRef] []))
                 `shouldReturn`
-                Right userList
-
-usersOfAuthor :: Set.Set (Reference User, Reference Author) -> Reference Author -> [Reference User]
-usersOfAuthor set authorRef = sort $
-    [ uref
-        | (uref, aref) <- Set.toList set
-        , aref == authorRef
-    ]
-
-authorsOfUser :: Set.Set (Reference User, Reference Author) -> Reference User -> [Reference Author]
-authorsOfUser set userRef = do
-    let (_, eq, _) = splitSetOn ((compare userRef) . fst) set
-    map (\(_, aref) -> aref) $ Set.toAscList eq
+                Right (map (userMap Map.!) $ Set.elems userSet)
 
 testCategories
     :: Handle -> Int
-    -> IO (IORef (Map.Map (Reference Category) Category))
+    -> IO (IORef (Tree.Tree (Reference Category) Text.Text))
 testCategories storage sampleSize = do
-    categoryTable <- newIORef Map.empty
+    categoryTable <- newIORef Tree.empty
     do
         parallelFor_ [1 .. sampleSize] $ \_ -> do
-            prevCats <- Map.keys <$> readIORef categoryTable
+            prevCats <- Tree.keys <$> readIORef categoryTable
             name <- generate $ randomText
-            [parent] <- generate $ chooseFrom 1 $ Reference "" : prevCats
+            parent <- generate $ do
+                x <- randomWithin 0 (length prevCats)
+                y <- randomWithin 0 x
+                case y of
+                    0 -> return $ Reference ""
+                    _ -> return $ prevCats !! (y - 1)
             category <- assertRight =<< perform storage (CategoryCreate name parent)
             categoryName category `shouldBe` name
             categoryParent category `shouldBe` parent
-            atomicModifyIORef_ categoryTable $ Map.insert (categoryId category) category
+            atomicModifyIORef_ categoryTable $ Tree.include (categoryId category) name parent
         checkCategories categoryTable
     do
-        categoryList <- Map.elems <$> readIORef categoryTable
+        categoryList <- categoryElems <$> readIORef categoryTable
         toAlter <- generate $ chooseFrom (sampleSize `div` 5) categoryList
         parallelFor_ toAlter $ \category -> do
             name <- generate $ randomText
             assertRight =<< perform storage (CategorySetName (categoryId category) name)
-            atomicModifyIORef_ categoryTable $ Map.insert (categoryId category) $
-                category {categoryName = name}
+            atomicModifyIORef_ categoryTable $ Tree.adjust
+                (\_ -> name)
+                (categoryId category)
         checkCategories categoryTable
     do
-        categoryMap <- readIORef categoryTable
-        toAlter <- generate $ chooseFrom (sampleSize `div` 5) (Map.elems categoryMap)
-        let toAlterIdSet = Set.fromList $ map categoryId toAlter
-        let stableCategories = Map.filter
-                (\cat -> Set.fromList (parentList categoryMap (categoryId cat)) `Set.disjoint` toAlterIdSet)
-                categoryMap
+        categoryTree <- readIORef categoryTable
+        toAlter <- generate $ chooseFrom (sampleSize `div` 5) (categoryElems categoryTree)
+        let stableCategories = Tree.excludeSubtreeSet
+                (Set.fromList $ map categoryId toAlter)
+                categoryTree
         parallelFor_ toAlter $ \category -> do
             [parent] <- generate $ do
                 b <- randomBool
                 if b
                     then return [Reference ""]
                     else chooseFromSuch
-                        (\cref -> categoryId category `notElem` parentList stableCategories cref)
-                        1 (Map.keys stableCategories)
+                        (\cref -> categoryId category `notElem` Tree.ancestors cref stableCategories)
+                        1 (Tree.keys stableCategories)
             assertRight =<< perform storage (CategorySetParent (categoryId category) parent)
-            atomicModifyIORef_ categoryTable $ Map.insert (categoryId category) $
-                category {categoryParent = parent}
+            atomicModifyIORef_ categoryTable $ fromJust . Tree.trySetParent (categoryId category) parent
         checkCategories categoryTable
     do
-        categoryList <- Map.elems <$> readIORef categoryTable
+        categoryList <- categoryElems <$> readIORef categoryTable
         toDelete <- generate $ chooseFrom (sampleSize `div` 5) categoryList
-        let toDeleteNorm = Map.toList $ normalizeCategoryDeletionList toDelete
-        parallelFor_ toDeleteNorm $ \(categoryRef, parent) -> do
-            assertRight =<< perform storage (CategoryDelete categoryRef)
-            atomicModifyIORef_ categoryTable $ \cats1 -> do
-                let cats2 = Map.delete categoryRef cats1
-                flip Map.map cats2 $ \cat ->
-                    if categoryParent cat == categoryRef
-                        then cat {categoryParent = parent}
-                        else cat
+        parallelFor_ toDelete $ \category -> do
+            assertRight =<< perform storage (CategoryDelete (categoryId category))
+            atomicModifyIORef_ categoryTable $ snd . Tree.exclude (categoryId category)
         checkCategories categoryTable
     do
-        categoryMap <- readIORef categoryTable
+        categoryTree <- readIORef categoryTable
         badRefs <- generate $
             replicateM 20 $
-                randomReference `suchThat` (\ref -> not (Map.member ref categoryMap))
+                randomReference `suchThat` (\ref -> not (Tree.member ref categoryTree))
         parallelFor_ badRefs $ \ref -> do
             perform storage (CategorySetName ref "foo") `shouldReturn` Left NotFoundError
             perform storage (CategorySetParent ref (Reference "")) `shouldReturn` Left NotFoundError
@@ -526,8 +510,8 @@ testCategories storage sampleSize = do
                 `shouldReturn`
                 Right []
     do
-        categoryMap <- readIORef categoryTable
-        let categoryList = Map.elems categoryMap
+        categoryTree <- readIORef categoryTable
+        let categoryList = categoryElems categoryTree
         parallelFor_ categoryList $ \category -> do
             perform storage (CategoryList (ListView 0 1 [FilterCategoryId (categoryId category)] []))
                 `shouldReturn`
@@ -535,68 +519,53 @@ testCategories storage sampleSize = do
         perform storage (CategoryList (ListView 0 maxBound [] [(OrderCategoryName, Ascending)]))
             `shouldReturn`
             Right (sortOn categoryName categoryList)
-        let (strictSubcategories, transitiveSubcategories) = subcategoryMaps categoryMap
+        let strictSubcategories = Tree.childMap categoryTree
         parallelFor_ (Map.toList strictSubcategories) $ \(categoryRef, subcatSet) -> do
             perform storage (CategoryList (ListView 0 maxBound [FilterCategoryParentId categoryRef] []))
                 `shouldReturn`
-                Right (map (categoryMap Map.!) (Set.toList subcatSet))
+                Right (map (categoryGet categoryTree) (Set.elems subcatSet))
+        let transitiveSubcategories = Tree.descendantMap categoryTree
         parallelFor_ (Map.toList transitiveSubcategories) $ \(categoryRef, subcatSet) -> do
-            let subcatList = map (categoryMap Map.!) (Set.toList subcatSet)
+            let subcatList = map (categoryGet categoryTree) (Set.elems subcatSet)
             perform storage (CategoryList (ListView 0 maxBound [FilterCategoryTransitiveParentId categoryRef] []))
                 `shouldReturn`
                 Right subcatList
             perform storage (CategoryList (ListView 0 maxBound [FilterCategoryTransitiveParentId categoryRef] [(OrderCategoryName, Ascending)]))
                 `shouldReturn`
                 Right (sortOn categoryName subcatList)
-            someSubcats <- generate $ chooseFrom 2 $ Set.toList subcatSet
+            someSubcats <- generate $ chooseFrom 2 $ Set.elems subcatSet
             parallelFor_ someSubcats $ \subcat -> do
                 perform storage (CategorySetParent categoryRef subcat) `shouldReturn` Left InvalidRequestError
     return categoryTable
   where
     checkCategories categoryTable = do
-        categoryList <- Map.elems <$> readIORef categoryTable
+        categoryList <- categoryElems <$> readIORef categoryTable
         perform storage (CategoryList (ListView 0 maxBound [] []))
             `shouldReturn`
             Right categoryList
-    parentList catMap (Reference "") = []
-    parentList catMap cref = cref : parentList catMap (categoryParent $ catMap Map.! cref)
+    parentValue (Reference "") = Nothing
+    parentValue ref = Just ref
 
-normalizeCategoryDeletionList :: [Category] -> MapLazy.Map (Reference Category) (Reference Category)
-normalizeCategoryDeletionList toDelete = do
-    normParentMap
-  where
-    rawParentMap = Map.fromList $ map (\cat -> (categoryId cat, categoryParent cat)) toDelete
-    normParentMap = flip MapLazy.map rawParentMap $ \parent1 -> do
-        case MapLazy.lookup parent1 normParentMap of
-            Nothing -> parent1
-            Just parent2 -> parent2
+categoryElems :: Tree.Tree (Reference Category) Text.Text -> [Category]
+categoryElems = Tree.foldr
+    (\ref name parent rest -> Category ref name parent : rest)
+    []
 
-subcategoryMaps
-    :: Map.Map (Reference Category) Category
-    -> ( Map.Map (Reference Category) (Set.Set (Reference Category))
-       , MapLazy.Map (Reference Category) (Set.Set (Reference Category)))
-subcategoryMaps categoryMap = (strictSubcategories, transitiveSubcategories)
-  where
-    strictSubcategories = Map.mapWithKey
-        (\cref _ -> Map.keysSet $ Map.filter (\cat -> categoryParent cat == cref) categoryMap)
-        categoryMap
-    transitiveSubcategories = MapLazy.mapWithKey
-        (\cref subcats -> Set.insert cref $
-            Set.unions $
-                subcats :
-                    map (transitiveSubcategories Map.!) (Set.toList subcats))
-        strictSubcategories
+categoryGet :: Tree.Tree (Reference Category) Text.Text -> Reference Category -> Category
+categoryGet tree ref = case Tree.lookup ref tree of
+    Nothing -> error "invalid category id"
+    Just (name, parent) -> Category ref name parent
 
 testArticles
     :: Handle -> Int
     -> IORef (Map.Map (Reference User) User)
     -> IORef (Map.Map (Reference Author) Author)
-    -> IORef (Set.Set (Reference User, Reference Author))
-    -> IORef (Map.Map (Reference Category) Category)
+    -> IORef (Bimap.Bimap (Reference User) (Reference Author))
+    -> IORef (Tree.Tree (Reference Category) Text.Text)
     -> IO (IORef (Map.Map (Reference Article) Article))
 testArticles storage sampleSize userTable authorTable userAuthorConnSet categoryTable = do
     authorRefs <- Map.keys <$> readIORef authorTable
-    categoryRefs <- Map.keys <$> readIORef categoryTable
+    categoryRefs <- Tree.keys <$> readIORef categoryTable
     articleTable <- newIORef Map.empty
     do
         parallelFor_ [1 .. sampleSize] $ \_ -> do
@@ -716,7 +685,7 @@ testArticles storage sampleSize userTable authorTable userAuthorConnSet category
         parallelFor_ authorsToDelete $ \authorRef -> do
             assertRight =<< perform storage (AuthorDelete authorRef)
             atomicModifyIORef_ authorTable $ Map.delete authorRef
-            atomicModifyIORef_ userAuthorConnSet $ Set.filter $ \(_, aref) -> aref /= authorRef
+            atomicModifyIORef_ userAuthorConnSet $ Bimap.removeRight authorRef
         atomicModifyIORef_ articleTable $ Map.mapMaybe $ \article ->
             if articleAuthor article `elem` authorsToDelete
                 then case articlePublicationStatus article of
@@ -725,21 +694,15 @@ testArticles storage sampleSize userTable authorTable userAuthorConnSet category
                 else Just article
         checkArticles articleTable
     do
-        categoryList <- Map.elems <$> readIORef categoryTable
+        categoryList <- categoryElems <$> readIORef categoryTable
         categoriesToDelete <- generate $ chooseFrom (sampleSize `div` 5) categoryList
-        let toDeleteNorm = normalizeCategoryDeletionList categoriesToDelete
-        parallelFor_ (Map.toList toDeleteNorm) $ \(categoryRef, parent) -> do
-            assertRight =<< perform storage (CategoryDelete categoryRef)
-            atomicModifyIORef_ categoryTable $ \cats1 -> do
-                let cats2 = Map.delete categoryRef cats1
-                flip Map.map cats2 $ \cat ->
-                    if categoryParent cat == categoryRef
-                        then cat {categoryParent = parent}
-                        else cat
-        atomicModifyIORef_ articleTable $ Map.map $ \article ->
-            case Map.lookup (articleCategory article) toDeleteNorm of
-                Nothing -> article
-                Just newCategory -> article {articleCategory = newCategory}
+        parallelFor_ categoriesToDelete $ \category -> do
+            assertRight =<< perform storage (CategoryDelete (categoryId category))
+            Just parentRef <- atomicModifyIORef' categoryTable $ swap . Tree.exclude (categoryId category)
+            atomicModifyIORef_ articleTable $ Map.map $ \article ->
+                if articleCategory article == categoryId category
+                    then article {articleCategory = parentRef}
+                    else article
         checkArticles articleTable
     do
         articleList <- Map.elems <$> readIORef articleTable
@@ -755,17 +718,15 @@ testArticles storage sampleSize userTable authorTable userAuthorConnSet category
                 `shouldReturn`
                 Right (filter (\article -> articleAuthor article == authorRef) articleList)
         userAuthorConns <- readIORef userAuthorConnSet
-        let userAuthorConnMap = Map.fromAscListWith Set.union $
-                map (\(uref, aref) -> (uref, Set.singleton aref)) $
-                    Set.toAscList userAuthorConns
-        let userAuthorList = (Reference "", Set.singleton (Reference "")) : Map.toList userAuthorConnMap
+        let userAuthorList = (Reference "", Set.singleton (Reference ""))
+                : Map.toList (Bimap.left userAuthorConns)
         parallelFor_ userAuthorList $ \(userRef, authorSet) -> do
             perform storage (ArticleList True (ListView 0 maxBound [FilterArticleUserId userRef] []))
                 `shouldReturn`
                 Right (filter (\article -> articleAuthor article `Set.member` authorSet) articleList)
-        categoryMap <- readIORef categoryTable
-        let (_, transitiveSubcategories) = subcategoryMaps categoryMap
-        let subcategoryList = (Reference "", Set.singleton (Reference "")) : Map.toList transitiveSubcategories
+        categoryTree <- readIORef categoryTable
+        let transitiveSubcategories = Tree.descendantMap categoryTree
+        let subcategoryList = (Reference "", Set.singleton $ Reference "") : Map.toList transitiveSubcategories
         parallelFor_ subcategoryList $ \(categoryRef, subcatSet) -> do
             perform storage (ArticleList True (ListView 0 maxBound [FilterArticleCategoryId categoryRef] []))
                 `shouldReturn`
@@ -874,3 +835,75 @@ testTags storage sampleSize = do
         perform storage (TagList (ListView 0 maxBound [] []))
             `shouldReturn`
             Right tagList
+
+testArticleTagConns
+    :: Handle -> Int
+    -> IORef (Map.Map (Reference Article) Article)
+    -> IORef (Map.Map (Reference Tag) Tag)
+    -> IO (IORef (Bimap.Bimap (Reference Article) (Reference Tag)))
+testArticleTagConns storage sampleSize articleTable tagTable = do
+    articleRefs <- Map.keys <$> readIORef articleTable
+    tagRefs <- Map.keys <$> readIORef tagTable
+    connSet <- newIORef $ Bimap.fromKeys articleRefs tagRefs
+    do
+        parallelFor_ articleRefs $ \articleRef -> do
+            parallelFor_ tagRefs $ \tagRef -> do
+                byChance 1 3
+                    (do
+                        assertRight =<< perform storage (ArticleSetTag articleRef tagRef True)
+                        atomicModifyIORef_ connSet $ Bimap.insert (articleRef, tagRef))
+                    (return ())
+        checkConns connSet
+    do
+        parallelFor_ articleRefs $ \articleRef -> do
+            parallelFor_ tagRefs $ \tagRef -> do
+                conn <- generate $ randomBool
+                assertRight =<< perform storage (ArticleSetTag articleRef tagRef conn)
+                atomicModifyIORef_ connSet $ if conn
+                    then Bimap.insert (articleRef, tagRef)
+                    else Bimap.delete (articleRef, tagRef)
+        checkConns connSet
+    do
+        articlesToDelete <- generate $ chooseFrom (sampleSize `div` 5) articleRefs
+        parallelFor_ articlesToDelete $ \articleRef -> do
+            assertRight =<< perform storage (ArticleDelete articleRef)
+            atomicModifyIORef_ articleTable $ Map.delete articleRef
+            atomicModifyIORef_ connSet $ Bimap.removeLeft articleRef
+        checkConns connSet
+    do
+        tagsToDelete <- generate $ chooseFrom (sampleSize `div` 5) tagRefs
+        parallelFor_ tagsToDelete $ \tagRef -> do
+            assertRight =<< perform storage (TagDelete tagRef)
+            atomicModifyIORef_ tagTable $ Map.delete tagRef
+            atomicModifyIORef_ connSet $ Bimap.removeRight tagRef
+        checkConns connSet
+    do
+        conns <- readIORef connSet
+        articleMap <- readIORef articleTable
+        parallelFor_ [1..sampleSize] $ \_ -> do
+            sample <- generate $ do
+                n <- randomWithin 1 (sampleSize `div` 5)
+                chooseFrom n (Map.toList $ Bimap.right conns)
+            let tags = map fst sample
+            let articleUnionSet = Set.unions $ map snd sample
+            perform storage (ArticleList True (ListView 0 maxBound [FilterArticleTagIds tags] []))
+                `shouldReturn`
+                Right (map (articleMap Map.!) $ Set.elems articleUnionSet)
+            let articleIntersectionSet = foldl1' Set.intersection $ map snd sample
+            perform storage (ArticleList True (ListView 0 maxBound [FilterArticleTagIds [tag] | tag <- tags] []))
+                `shouldReturn`
+                Right (map (articleMap Map.!) $ Set.elems articleIntersectionSet)
+    return connSet
+  where
+    checkConns connSet = do
+        conns <- readIORef connSet
+        articleMap <- readIORef articleTable
+        parallelFor_ (Map.toList (Bimap.right conns)) $ \(tagRef, articleSet) -> do
+            perform storage (ArticleList True (ListView 0 maxBound [FilterArticleTagIds [tagRef]] []))
+                `shouldReturn`
+                Right (map (articleMap Map.!) $ Set.elems articleSet)
+        tagMap <- readIORef tagTable
+        parallelFor_ (Map.toList (Bimap.left conns)) $ \(articleRef, tagSet) -> do
+            perform storage (TagList (ListView 0 maxBound [FilterTagArticleId articleRef] []))
+                `shouldReturn`
+                Right (map (tagMap Map.!) $ Set.elems tagSet)

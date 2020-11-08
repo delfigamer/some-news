@@ -188,6 +188,7 @@ data Action a where
     ArticleSetPublicationStatus :: Reference Article -> PublicationStatus -> Action ()
     ArticleDelete :: Reference Article -> Action ()
     ArticleList :: Bool -> ListView Article -> Action [Article]
+    ArticleSetTag :: Reference Article -> Reference Tag -> Bool -> Action ()
 
     TagCreate :: Text.Text -> Action Tag
     TagSetName :: Reference Tag -> Text.Text -> Action ()
@@ -264,7 +265,7 @@ data instance ViewFilter Article
     | FilterArticleTransitiveCategoryId (Reference Category)
     | FilterArticlePublishedBefore UTCTime
     | FilterArticlePublishedAfter UTCTime
-    | FilterArticleTagId [Reference Tag]
+    | FilterArticleTagIds [Reference Tag]
     deriving (Show, Eq)
 
 data instance ViewOrder Article
@@ -604,6 +605,16 @@ performStorage (ArticleList showDrafts view) = runTransactionRelaxed $ do
                 (order "article_id")
                 range)
             (parseList $ parseOne Article)
+performStorage (ArticleSetTag articleRef tagRef True) = runTransactionRelaxed $ do
+    doQuery_
+        (Insert "sn_article2tag"
+            (fReference "a2t_article_id" :/ fReference "a2t_tag_id" :/ E)
+            (Value articleRef :/ Value tagRef :/ E)
+            E)
+performStorage (ArticleSetTag articleRef tagRef False) = runTransactionRelaxed $ do
+    doQuery_
+        (Delete "sn_article2tag"
+            [WhereIs articleRef "a2t_article_id", WhereIs tagRef "a2t_tag_id"])
 
 performStorage (TagCreate name) = runTransactionRelaxed $ do
     tagRef <- Reference <$> generateBytes 4
@@ -834,10 +845,10 @@ instance ListableObject Article where
     applyFilter (FilterArticleTransitiveCategoryId ref) = demandJoin (subcategoriesSource ref) [Where "article_category_id = subcategory_id"]
     applyFilter (FilterArticlePublishedBefore end) = demandCondition (WhereWith end "article_publication_date < ?")
     applyFilter (FilterArticlePublishedAfter begin) = demandCondition (WhereWith begin "article_publication_date >= ?")
-    applyFilter (FilterArticleTagId []) = mempty
-    applyFilter (FilterArticleTagId [ref]) = demandCondition (WhereIs ref "a2t_tag_id")
-        <> demandJoin "sn_article2tag" [Where "a2t_article_id = article_id"]
-    applyFilter (FilterArticleTagId tagRefs) = demandCondition (WhereWithList "EXISTS (SELECT * FROM sn_article2tag WHERE a2t_article_id = article_id AND a2t_tag_id IN " tagRefs ")")
+    applyFilter (FilterArticleTagIds []) = mempty
+    -- applyFilter (FilterArticleTagIds [ref]) = demandCondition (WhereIs ref "a2t_tag_id")
+        -- <> demandJoin "sn_article2tag" [Where "a2t_article_id = article_id"]
+    applyFilter (FilterArticleTagIds tagRefs) = demandCondition (WhereWithList "EXISTS (SELECT * FROM sn_article2tag WHERE a2t_article_id = article_id AND a2t_tag_id IN " tagRefs ")")
     applyOrder OrderArticleName = demandOrder "article_name"
     applyOrder OrderArticleDate = demandOrder "article_publication_date" . inverseDirection
     applyOrder OrderArticleAuthorName = demandOrder "COALESCE(author_name, '')"

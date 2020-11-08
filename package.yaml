@@ -38,6 +38,7 @@ dependencies:
 - stm
 - text
 - time
+- transformers
 - unordered-containers
 - warp
 - yaml
