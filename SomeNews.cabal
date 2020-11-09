@@ -4,7 +4,7 @@ cabal-version: 1.12
 --
 -- see: https://github.com/sol/hpack
 --
--- hash: e65b190b57ebed048aad98fe18d915dac0b10d44fa1d8151ef2813b011c04b1f
+-- hash: c9387bfeebcb030dab4f125b71f02ff9a215f6dd4c0961b2f5a2e6d5065520c4
 
 name:           SomeNews
 version:        0.1.0.0
@@ -106,7 +106,7 @@ test-suite SomeNews-test
       Bimap
       Gen
       StorageSpec
-      TreeMap
+      Tree
       Paths_SomeNews
   hs-source-dirs:
       test

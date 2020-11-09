@@ -135,6 +135,7 @@ data Comment = Comment
     , commentDate :: !UTCTime
     , commentEditDate :: !(Maybe UTCTime)
     }
+    deriving (Show, Eq, Ord)
 
 data Handle = Handle
     { perform :: forall a. Action a -> IO (Either StorageError a)
@@ -669,7 +670,7 @@ performStorage (CommentSetText commentRef text) = runTransactionRelaxed $ do
     editDate <- currentTime
     doQuery
         (Update "sn_comments"
-            (fText "comment_text" :/ fTime "comment_date" :/ E)
+            (fText "comment_text" :/ fTime "comment_edit_date" :/ E)
             (Value text :/ Value editDate :/ E)
             [WhereIs commentRef "comment_id"])
         parseCount
