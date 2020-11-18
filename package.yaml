@@ -36,10 +36,12 @@ dependencies:
 - splitmix == 0.1.*
 - sqlite-simple
 - stm
+- template-haskell
 - text
 - time
 - transformers
 - unordered-containers
+- vector
 - warp
 - yaml
 

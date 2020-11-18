@@ -22,30 +22,30 @@ import Database.SQLite.Simple.ToField
 import Database.SQLite.Simple.ToRow
 import qualified Data.ByteString as BS
 import qualified Data.Text as Text
+import Logger
 import ResourcePool
 import Tuple
-import qualified Logger
 import qualified Sql.Database as Db
 import qualified Sql.Query as Q
 import qualified Sql.Query.Render as Q
 
-withSqlite :: String -> Logger.Handle -> (Db.Handle -> IO r) -> IO r
+withSqlite :: String -> Logger -> (Db.Database -> IO r) -> IO r
 withSqlite path logger body = do
     nameCounter <- newIORef (1 :: Int)
     withResourcePool 1
         (if path == "" || path == ":memory:"then 1 else 16)
         (do
             newName <- fmap (Text.pack . show) $ atomicModifyIORef' nameCounter $ \x -> (x+1, x)
-            Logger.info logger $ "Sqlite: " <> newName <> ": open connection"
+            logInfo logger $ "Sqlite: " <<|| newName << ": open connection"
             newConn <- initialize path
             return (newName, newConn))
         (\(name, conn) -> do
-            Logger.info logger $ "Sqlite: " <> name <> ": close connection"
+            logInfo logger $ "Sqlite: " <<|| name << ": close connection"
             close conn)
         (\(name, _) err -> do
-            Logger.err logger $ "Sqlite: " <> name <> ": " <> Text.pack (displayException err))
+            logErr logger $ "Sqlite: " <<|| name << ": " <<|| displayException err)
         (\pool -> do
-            body $ Db.Handle
+            body $ Db.Database
                 { Db.makeQuery  = \query ->
                     withResource pool $ \(connName, conn) ->
                         sqliteMakeQuery logger connName conn query
@@ -62,11 +62,11 @@ initialize path = do
     return conn
 
 sqliteMakeQuery
-    :: Logger.Handle -> Text.Text -> Connection
+    :: Logger -> Text.Text -> Connection
     -> Q.Query result -> IO (Either Db.QueryError result)
 sqliteMakeQuery logger connName conn queryData = do
     Q.withQueryRender sqliteRenderDetail queryData $ \queryValues queryText -> do
-        Logger.debug logger $ "Sqlite: " <> connName <> ": " <> Text.pack queryText <> "; -- " <> Text.pack (Q.showPrimValues 0 queryValues "")
+        logDebug logger $ "Sqlite: " <<|| connName << ": " <<|| queryText << "; -- " <<|| Q.showPrimValues 0 queryValues ""
         let sqlQuery = fromString queryText :: Query
         case queryData of
             Q.CreateTable {} -> sqlitePcall logger connName $ execute_ conn sqlQuery
@@ -90,12 +90,12 @@ sqliteMakeQuery logger connName conn queryData = do
 
 sqliteInsertReturning
     :: (All Q.IsValue rs, AllWith Q.Value Show vs)
-    => Logger.Handle -> Text.Text -> Connection
+    => Logger -> Text.Text -> Connection
     -> Q.TableName -> HList Q.Field vs -> HList Q.Value vs -> HList Q.Field rs -> IO (Maybe (HList Maybe rs))
 sqliteInsertReturning logger connName conn table fields values rets = do
     let queryData1 = Q.Insert table fields values E
     Q.withQueryRender sqliteRenderDetail queryData1 $ \queryValues1 queryText1 -> do
-        Logger.debug logger $ "Sqlite: " <> connName <> ": " <> Text.pack queryText1 <> "; -- " <> Text.pack (Q.showPrimValues 0 queryValues1 "")
+        logDebug logger $ "Sqlite: " <<|| connName << ": " <<|| queryText1 << "; -- " <<|| Q.showPrimValues 0 queryValues1 ""
         execute conn (fromString queryText1) queryValues1
         n <-changes conn
         case n of
@@ -104,19 +104,19 @@ sqliteInsertReturning logger connName conn table fields values rets = do
                 lastRowId <- lastInsertRowId conn
                 let queryData2 = Q.Select [Q.TableSource table] rets [Q.WhereWith lastRowId "_rowid_ = ?"] [] Q.AllRows
                 Q.withQueryRender sqliteRenderDetail queryData2 $ \queryValues2 queryText2 -> do
-                    Logger.debug logger $ "Sqlite: " <> connName <> ": " <> Text.pack queryText2 <> "; -- " <> Text.pack (Q.showPrimValues 0 queryValues2 "")
+                    logDebug logger $ "Sqlite: " <<|| connName << ": " <<|| queryText2 << "; -- " <<|| Q.showPrimValues 0 queryValues2 ""
                     rets <- query conn (fromString queryText2) queryValues2
                     case rets of
                         [result] -> return $ Just result
                         _ -> return Nothing
 
 sqliteWithTransaction
-    :: Logger.Handle -> Text.Text -> Connection
-    -> Db.TransactionLevel -> (Db.Handle -> IO (Either Db.QueryError r)) -> IO (Either Db.QueryError r)
+    :: Logger -> Text.Text -> Connection
+    -> Db.TransactionLevel -> (Db.Database -> IO (Either Db.QueryError r)) -> IO (Either Db.QueryError r)
 sqliteWithTransaction logger connName conn _ body = do
     tresult <- sqlitePcall logger connName $ do
         withCancelableTransaction $ do
-            body $ Db.Handle
+            body $ Db.Database
                 { Db.makeQuery = sqliteMakeQuery logger connName conn
                 , Db.withTransaction = error "Sql.Database.Sqlite: nested transaction"
                 }
@@ -134,7 +134,7 @@ sqliteWithTransaction logger connName conn _ body = do
                 _ -> doQuery "ROLLBACK TRANSACTION"
             return aresult
     doQuery str = do
-        Logger.debug logger $ "Sqlite: " <> connName <> ": " <> Text.pack str
+        logDebug logger $ "Sqlite: " <<|| connName << ": " <<|| str
         execute_ conn (fromString str)
 
 sqliteRenderDetail :: Q.RenderDetail
@@ -151,7 +151,7 @@ sqliteRenderDetail = Q.RenderDetail
     , Q.detailNullEquality = " IS "
     }
 
-sqlitePcall :: Logger.Handle -> Text.Text -> IO a -> IO (Either Db.QueryError a)
+sqlitePcall :: Logger -> Text.Text -> IO a -> IO (Either Db.QueryError a)
 sqlitePcall logger connName act = do
     eret <- try act
     case eret of
@@ -164,10 +164,10 @@ sqlitePcall logger connName act = do
                         ErrorLocked -> Db.SerializationError
                         _ -> Db.QueryError
             case ecode of
-                Db.SerializationError -> Logger.debug logger $
-                    "Sqlite: " <> connName <> ": Serialization failure: " <> Text.pack (displayException ex)
-                Db.QueryError -> Logger.warn logger $
-                    "Sqlite: " <> connName <> ": Error: " <> Text.pack (displayException ex)
+                Db.SerializationError -> logDebug logger $
+                    "Sqlite: " <<|| connName << ": Serialization failure: " <<|| displayException ex
+                Db.QueryError -> logWarn logger $
+                    "Sqlite: " <<|| connName << ": Error: " <<|| displayException ex
             return $ Left ecode
 
 instance forall ts. (All Q.IsValue ts) => FromRow (HList Maybe ts) where

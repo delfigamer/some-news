@@ -13,10 +13,10 @@ import Control.Monad.Except
 import Data.Int
 import Data.Proxy
 import qualified Data.Text as Text
-import qualified Logger
+import Logger
 import Sql.Query
-import qualified Sql.Database as Db
 import Tuple
+import qualified Sql.Database as Db
 
 data SchemaVersion = SomeNewsSchema Int Int
     deriving (Show, Read, Eq)
@@ -30,7 +30,7 @@ data InitFailure
     | InitFailureDatabaseError -- other error
     deriving (Show, Eq)
 
-matchCurrentSchema :: Logger.Handle -> Db.Handle -> (InitFailure -> IO r) -> IO r -> IO r
+matchCurrentSchema :: Logger -> Db.Database -> (InitFailure -> IO r) -> IO r -> IO r
 matchCurrentSchema logger db onFail onMatch = do
     withSchemaVersion logger db
         (onFail InitFailureInvalidSchema)
@@ -44,7 +44,7 @@ matchCurrentSchema logger db onFail onMatch = do
                     | dbMinor > myMinor -> onFail $ InitFailureAdvancedSchema dbSchema
                     | otherwise -> onMatch
 
-upgradeSchema :: Logger.Handle -> Db.Handle -> IO (Either InitFailure ())
+upgradeSchema :: Logger -> Db.Database -> IO (Either InitFailure ())
 upgradeSchema logger db = do
     withSchemaVersion logger db
         (return $ Left InitFailureInvalidSchema)
@@ -59,27 +59,27 @@ upgradeSchema logger db = do
                     | otherwise -> do
                         return $ Right ()
 
-withSchemaVersion :: Logger.Handle -> Db.Handle -> IO r -> IO r -> (SchemaVersion -> IO r) -> IO r
+withSchemaVersion :: Logger -> Db.Database -> IO r -> IO r -> (SchemaVersion -> IO r) -> IO r
 withSchemaVersion logger db onInvalid onEmpty onSchema = do
-    Logger.info logger $ "Storage: Current application schema: " <> Text.pack (show currentSchema)
+    logInfo logger $ "Storage: Current application schema: " <<| currentSchema
     selret <- Db.makeQuery db $ Select ["sn_metadata"] (fSchemaVersion "mvalue" :/ E) [Where "mkey = 'schema_version'"] [] AllRows
     case selret of
         Right [Just version :/ E] -> do
-            Logger.info logger $ "Storage: Database schema: " <> Text.pack (show version)
+            logInfo logger $ "Storage: Database schema: " <<| version
             onSchema version
         Right _ -> do
-            Logger.err logger $ "Storage: Invalid database schema"
+            logErr logger $ "Storage: Invalid database schema"
             onInvalid
         _ -> do
-            Logger.warn logger $ "Storage: No database schema"
+            logWarn logger $ "Storage: No database schema"
             onEmpty
 
 currentSchema :: SchemaVersion
 currentSchema = SomeNewsSchema 0 1
 
-upgradeEmptyToCurrent :: Logger.Handle -> Db.Handle -> IO (Either InitFailure ())
+upgradeEmptyToCurrent :: Logger -> Db.Database -> IO (Either InitFailure ())
 upgradeEmptyToCurrent logger db = do
-    Logger.info logger $ "Storage: Create a new database from scratch"
+    logInfo logger $ "Storage: Create a new database from scratch"
     tret <- Db.withTransaction db Db.ReadCommited $ \db2 -> runExceptT $ do
         ExceptT $ Db.makeQuery db2 $
             CreateTable "sn_metadata"
@@ -206,9 +206,9 @@ upgradeEmptyToCurrent logger db = do
         Right () -> return $ Right ()
         _ -> return $ Left InitFailureDatabaseError
 
-upgradeFromToCurrent :: Logger.Handle -> Db.Handle -> SchemaVersion -> IO (Either InitFailure ())
+upgradeFromToCurrent :: Logger -> Db.Database -> SchemaVersion -> IO (Either InitFailure ())
 upgradeFromToCurrent logger db version = do
-    Logger.err logger $ "Storage: Cannot upgrade from schema: " <> Text.pack (show version)
+    logErr logger $ "Storage: Cannot upgrade from schema: " <<| version
     return $ Left $ InitFailureIncompatibleSchema version
 
 instance IsValue SchemaVersion where

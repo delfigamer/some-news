@@ -52,6 +52,7 @@ import Data.Time.Clock
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BSChar
 import qualified Data.Text as Text
+import Hex
 import Tuple
 
 newtype TableName = TableName String
@@ -269,12 +270,7 @@ primFieldName (FBlob (FieldName name)) = name
 primFieldName (FTime (FieldName name)) = name
 
 showBlob :: String -> BS.ByteString -> ShowS
-showBlob m bs = showString $ "[" ++ m ++ "|" ++ inner ++ "|]"
-  where
-    inner = do
-        c <- BS.unpack bs
-        [hchar (c `div` 16), hchar (c `mod` 16)]
-    hchar n = BSChar.index "0123456789abcdef" $ fromIntegral n
+showBlob m bs = showString $ "[" ++ m ++ "|" ++ toHex (BS.unpack bs) ++ "|]"
 
 instance IsValue Int64 where
     type Prims Int64 = '[ 'TInt ]

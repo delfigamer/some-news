@@ -1,26 +1,26 @@
 module Sql.Database.Config
-    ( Config
+    ( DatabaseConfig
     , withDatabase
     ) where
 
 import Control.Monad
 import Data.Aeson
-import qualified Data.HashMap.Strict as H
+import qualified Data.HashMap.Strict as Map
 import qualified Data.Text as Text
-import qualified Logger
+import Logger
 import Sql.Database
 import Sql.Database.Postgres
 import Sql.Database.Sqlite
 
-data Config
+data DatabaseConfig
     = PostgresConfig String
     | SqliteConfig String
 
-withDatabase :: Config -> Logger.Handle -> (Handle -> IO r) -> IO r
+withDatabase :: DatabaseConfig -> Logger -> (Database -> IO r) -> IO r
 withDatabase (PostgresConfig conf) = withPostgres conf
 withDatabase (SqliteConfig conf) = withSqlite conf
 
-instance FromJSON Config where
+instance FromJSON DatabaseConfig where
     parseJSON = withObject "DatabaseConfig" $ \v -> do
         msum
             [ do
@@ -28,7 +28,7 @@ instance FromJSON Config where
                 return $ SqliteConfig conf
             , do
                 table <- v .: "postgres"
-                let conf = H.foldrWithKey prependParam "" table
+                let conf = Map.foldrWithKey prependParam "" table
                 return $ PostgresConfig conf
             ]
 

@@ -1,14 +1,14 @@
 module Sql.Database
-    ( Handle(..)
+    ( Database(..)
     , QueryError(..)
     , TransactionLevel(..)
     ) where
 
 import Sql.Query
 
-data Handle = Handle
+data Database = Database
     { makeQuery :: forall result. Query result -> IO (Either QueryError result)
-    , withTransaction :: forall r. TransactionLevel -> (Handle -> IO (Either QueryError r)) -> IO (Either QueryError r)
+    , withTransaction :: forall r. TransactionLevel -> (Database -> IO (Either QueryError r)) -> IO (Either QueryError r)
     }
 
 data QueryError

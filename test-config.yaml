@@ -1,9 +1,9 @@
-# - database:
-    # sqlite: ""
-  # sample-size: 20
-
 - database:
-    postgres:
-      user: me
-      password: me
+    sqlite: ""
   sample-size: 20
+
+# - database:
+    # postgres:
+      # user: me
+      # password: me
+  # sample-size: 20

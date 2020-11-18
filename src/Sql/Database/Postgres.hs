@@ -25,30 +25,30 @@ import System.IO.Unsafe
 import qualified Data.ByteString as BS
 import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text
+import Logger
 import ResourcePool
 import Tuple
-import qualified Logger
 import qualified Sql.Database as Db
 import qualified Sql.Query as Q
 import qualified Sql.Query.Render as Q
 
-withPostgres :: String -> Logger.Handle -> (Db.Handle -> IO r) -> IO r
+withPostgres :: String -> Logger -> (Db.Database -> IO r) -> IO r
 withPostgres conf logger body = do
     let pgconfig = Text.encodeUtf8 $ Text.pack conf
     nameCounter <- newIORef (1 :: Int)
     withResourcePool 4 16
         (do
             newName <- fmap (Text.pack . show) $ atomicModifyIORef' nameCounter $ \x -> (x+1, x)
-            Logger.info logger $ "Postgres: " <> newName <> ": open connection"
+            logInfo logger $ "Postgres: " <<|| newName << ": open connection"
             newConn <- connectPostgreSQL pgconfig
             return (newName, newConn))
         (\(name, conn) -> do
-            Logger.info logger $ "Postgres: " <> name <> ": close connection"
+            logInfo logger $ "Postgres: " <<|| name << ": close connection"
             close conn)
         (\(name, _) err -> do
-            Logger.err logger $ "Postgres: " <> name <> ": " <> Text.pack (displayException err))
+            logErr logger $ "Postgres: " <<|| name << ": " <<|| displayException err)
         (\pool -> do
-            body $ Db.Handle
+            body $ Db.Database
                 { Db.makeQuery = \query ->
                     withResource pool $ \(connName, conn) ->
                         postgresMakeQuery logger connName conn query
@@ -58,11 +58,11 @@ withPostgres conf logger body = do
                 })
 
 postgresMakeQuery
-    :: Logger.Handle -> Text.Text -> Connection
+    :: Logger -> Text.Text -> Connection
     -> Q.Query result -> IO (Either Db.QueryError result)
 postgresMakeQuery logger connName conn queryData = do
     Q.withQueryRender postgresRenderDetail queryData $ \queryValues queryText -> do
-        Logger.debug logger $ "Postgres: " <> connName <> ": " <> Text.pack queryText <> "; -- " <> Text.pack (Q.showPrimValues 0 queryValues "")
+        logDebug logger $ "Postgres: " <<|| connName << ": " <<|| queryText << "; -- " <<|| Q.showPrimValues 0 queryValues ""
         let sqlQuery = fromString queryText :: Query
         case queryData of
             Q.CreateTable {} -> postgresPcall_ logger connName $ execute_ conn sqlQuery
@@ -84,12 +84,12 @@ postgresMakeQuery logger connName conn queryData = do
     foldInsert _ = Nothing
 
 postgresWithTransaction
-    :: Logger.Handle -> Text.Text -> Connection
-    -> Db.TransactionLevel -> (Db.Handle -> IO (Either Db.QueryError r)) -> IO (Either Db.QueryError r)
+    :: Logger -> Text.Text -> Connection
+    -> Db.TransactionLevel -> (Db.Database -> IO (Either Db.QueryError r)) -> IO (Either Db.QueryError r)
 postgresWithTransaction logger connName conn level body = do
     tresult <- postgresPcall logger connName $ do
         withCancelableTransaction $ do
-            body $ Db.Handle
+            body $ Db.Database
                 { Db.makeQuery = postgresMakeQuery logger connName conn
                 , Db.withTransaction = error "Sql.Database.Postgres: nested transaction"
                 }
@@ -110,7 +110,7 @@ postgresWithTransaction logger connName conn level body = do
                 _ -> doQuery "ROLLBACK TRANSACTION"
             return aresult
     doQuery str = do
-        Logger.debug logger $ "Postgres: " <> connName <> ": " <> Text.pack str
+        logDebug logger $ "Postgres: " <<|| connName << ": " <<|| str
         execute_ conn (fromString str)
 
 postgresRenderDetail :: Q.RenderDetail
@@ -127,7 +127,7 @@ postgresRenderDetail = Q.RenderDetail
     , Q.detailNullEquality = " IS NOT DISTINCT FROM "
     }
 
-postgresPcall :: Logger.Handle -> Text.Text -> IO a -> IO (Either Db.QueryError a)
+postgresPcall :: Logger -> Text.Text -> IO a -> IO (Either Db.QueryError a)
 postgresPcall logger connName act = do
     eret <- try act
     case eret of
@@ -139,13 +139,13 @@ postgresPcall logger connName act = do
                         then Db.SerializationError
                         else Db.QueryError
             case ecode of
-                Db.SerializationError -> Logger.debug logger $
-                    "Postgres: " <> connName <> ": Serialization failure: " <> Text.pack (displayException ex)
-                Db.QueryError -> Logger.warn logger $
-                    "Postgres: " <> connName <> ": Error: " <> Text.pack (displayException ex)
+                Db.SerializationError -> logDebug logger $
+                    "Postgres: " <<|| connName << ": Serialization failure: " <<|| displayException ex
+                Db.QueryError -> logWarn logger $
+                    "Postgres: " <<|| connName << ": Error: " <<|| displayException ex
             return $ Left ecode
 
-postgresPcall_ :: Logger.Handle -> Text.Text -> IO a -> IO (Either Db.QueryError ())
+postgresPcall_ :: Logger.Logger -> Text.Text -> IO a -> IO (Either Db.QueryError ())
 postgresPcall_ logger connName act = do
     r <- postgresPcall logger connName act
     return $ r >> Right ()

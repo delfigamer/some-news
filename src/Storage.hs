@@ -4,6 +4,7 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE StandaloneDeriving #-}
+{-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE UndecidableInstances #-}
 
@@ -19,7 +20,7 @@ module Storage
     , Tag(..)
     , Comment(..)
     , InitFailure(..)
-    , Handle
+    , Storage(..)
     , withSqlStorage
     , currentSchema
     , upgradeSchema
@@ -29,7 +30,6 @@ module Storage
     , ViewFilter(..)
     , ViewOrder(..)
     , OrderDirection(..)
-    , perform
     ) where
 
 import Control.Applicative
@@ -52,10 +52,11 @@ import qualified Crypto.Random as CRand
 import qualified Data.ByteArray as BA
 import qualified Data.ByteString as BS
 import qualified Data.Text as Text
+import HEq1
+import Logger
 import Sql.Query
 import Storage.Schema
 import Tuple
-import qualified Logger
 import qualified Sql.Database as Db
 
 data Reference a = Reference !BS.ByteString
@@ -83,7 +84,14 @@ data AccessKey = AccessKey
     { accessKeyId :: !(Reference AccessKey)
     , accessKeyToken :: !BS.ByteString
     }
-    deriving (Show, Eq, Ord)
+    deriving (Eq, Ord)
+
+instance Show AccessKey where
+    showsPrec d ak@(AccessKey ref _) = showParen (d > 10)
+        $ showString "AccessKey "
+        . showsPrec 11 ref
+        . showString " "
+        . showBlob "hash" (hashAccessKey ak)
 
 data Author = Author
     { authorId :: !(Reference Author)
@@ -137,24 +145,33 @@ data Comment = Comment
     }
     deriving (Show, Eq, Ord)
 
-data Handle = Handle
-    { perform :: forall a. Action a -> IO (Either StorageError a)
+data Storage = Storage
+    { doStorage :: forall a. Action a -> IO (Either StorageError a)
     }
 
 data SqlStorage = SqlStorage
-    { storageLogger :: Logger.Handle
-    , storageDb :: Db.Handle
+    { storageLogger :: Logger
+    , storageDb :: Db.Database
     , storageGen :: IORef CRand.ChaChaDRG
     }
 
-withSqlStorage :: Logger.Handle -> Db.Handle -> (InitFailure -> IO r) -> (Handle -> IO r) -> IO r
+withSqlStorage :: Logger -> Db.Database -> (InitFailure -> IO r) -> (Storage -> IO r) -> IO r
 withSqlStorage logger db onFail onSuccess = do
     matchCurrentSchema logger db onFail $ do
         pgen <- newIORef =<< CRand.drgNew
         let storage = SqlStorage logger db pgen
-        onSuccess $ Handle
-            { perform = \action -> performStorage action storage
+        onSuccess $ Storage
+            { doStorage = \action -> do
+                logDebug logger $ "SqlStorage: Request: " <<| action
+                doSqlStorage action storage $ \result -> do
+                    {- use CPS to bring (Show r) into scope -}
+                    logSend logger (resultLogLevel result) $
+                        "SqlStorage: Request finished: " <<| action << " -> " <<| result
+                    return result
             }
+  where
+    resultLogLevel (Left InternalError) = LevelWarn
+    resultLogLevel _ = LevelDebug
 
 data Action a where
     UserCreate :: Text.Text -> Text.Text -> Action User
@@ -166,7 +183,6 @@ data Action a where
     AccessKeyCreate :: Reference User -> Action AccessKey
     AccessKeyDelete :: Reference User -> Reference AccessKey -> Action ()
     AccessKeyList :: Reference User -> ListView AccessKey -> Action [Reference AccessKey]
-    AccessKeyLookup :: AccessKey -> Action (Reference User)
 
     AuthorCreate :: Text.Text -> Text.Text -> Action Author
     AuthorSetName :: Reference Author -> Text.Text -> Action ()
@@ -224,6 +240,7 @@ data instance ViewFilter User
     = FilterUserId (Reference User)
     | FilterUserIsAdmin Bool
     | FilterUserAuthorId (Reference Author)
+    | FilterUserAccessKey AccessKey
     deriving (Show, Eq)
 
 data instance ViewOrder User
@@ -302,8 +319,8 @@ data StorageError
     | InternalError
     deriving (Show, Eq, Ord)
 
-performStorage :: Action a -> SqlStorage -> IO (Either StorageError a)
-performStorage (UserCreate name surname) = runTransactionRelaxed $ do
+doSqlStorage :: Action a -> SqlStorage -> (Show a => Either StorageError a -> IO r) -> IO r
+doSqlStorage (UserCreate name surname) = runTransactionRelaxed $ do
     ref <- Reference <$> generateBytes 16
     joinDate <- currentTime
     doQuery
@@ -312,26 +329,26 @@ performStorage (UserCreate name surname) = runTransactionRelaxed $ do
             (Value ref :/ Value name :/ Value surname :/ Value joinDate :/ Value False :/ E)
             E)
         (parseInsert $ User ref name surname joinDate False)
-performStorage (UserSetName userRef name surname) = runTransactionRelaxed $ do
+doSqlStorage (UserSetName userRef name surname) = runTransactionRelaxed $ do
     doQuery
         (Update "sn_users"
             (fText "user_name" :/ fText "user_surname" :/ E)
             (Value name :/ Value surname :/ E)
             [WhereIs userRef "user_id"])
         parseCount
-performStorage (UserSetIsAdmin userRef isAdmin) = runTransactionRelaxed $ do
+doSqlStorage (UserSetIsAdmin userRef isAdmin) = runTransactionRelaxed $ do
     doQuery
         (Update "sn_users"
             (fBool "user_is_admin" :/ E)
             (Value isAdmin :/ E)
             [WhereIs userRef "user_id"])
         parseCount
-performStorage (UserDelete userRef) = runTransactionRelaxed $ do
+doSqlStorage (UserDelete userRef) = runTransactionRelaxed $ do
     doQuery
         (Delete "sn_users"
             [WhereIs userRef "user_id"])
         parseCount
-performStorage (UserList view) = runTransactionRelaxed $ do
+doSqlStorage (UserList view) = runTransactionRelaxed $ do
     withView view $ \tables filter order range _ -> do
         doQuery
             (Select ("sn_users" : tables)
@@ -341,7 +358,7 @@ performStorage (UserList view) = runTransactionRelaxed $ do
                 range)
             (parseList $ parseOne User)
 
-performStorage (AccessKeyCreate userRef) = runTransactionRelaxed $ do
+doSqlStorage (AccessKeyCreate userRef) = runTransactionRelaxed $ do
     keyBack <- generateBytes 48
     keyFront <- Reference <$> generateBytes 16
     let key = AccessKey keyFront keyBack
@@ -352,12 +369,12 @@ performStorage (AccessKeyCreate userRef) = runTransactionRelaxed $ do
             (Value keyFront :/ Value keyHash :/ Value userRef :/ E)
             E)
         (parseInsert key)
-performStorage (AccessKeyDelete userRef keyRef) = runTransactionRelaxed $ do
+doSqlStorage (AccessKeyDelete userRef keyRef) = runTransactionRelaxed $ do
     doQuery
         (Delete "sn_access_keys"
             [WhereIs userRef "access_key_user_id", WhereIs keyRef "access_key_id"])
         parseCount
-performStorage (AccessKeyList userRef view) = runTransactionRelaxed $ do
+doSqlStorage (AccessKeyList userRef view) = runTransactionRelaxed $ do
     withView view $ \tables filter order range _ -> do
         doQuery
             (Select ("sn_access_keys" : tables)
@@ -366,17 +383,8 @@ performStorage (AccessKeyList userRef view) = runTransactionRelaxed $ do
                 (order "access_key_id")
                 range)
             (parseList $ parseOne id)
-performStorage (AccessKeyLookup key@(AccessKey keyFront keyBack)) = runTransactionRelaxed $ do
-    let keyHash = hashAccessKey key
-    doQuery
-        (Select ["sn_access_keys"]
-            (fReference "access_key_user_id" :/ E)
-            [WhereIs keyFront "access_key_id", WhereWith keyHash "access_key_hash = ?"]
-            []
-            (RowRange 0 1))
-        (parseHead $ parseOne id)
 
-performStorage (AuthorCreate name description) = runTransactionRelaxed $ do
+doSqlStorage (AuthorCreate name description) = runTransactionRelaxed $ do
     ref <- Reference <$> generateBytes 16
     doQuery
         (Insert "sn_authors"
@@ -384,21 +392,21 @@ performStorage (AuthorCreate name description) = runTransactionRelaxed $ do
             (Value ref :/ Value name :/ Value description :/ E)
             E)
         (parseInsert $ Author ref name description)
-performStorage (AuthorSetName authorRef name) = runTransactionRelaxed $ do
+doSqlStorage (AuthorSetName authorRef name) = runTransactionRelaxed $ do
     doQuery
         (Update "sn_authors"
             (fText "author_name" :/ E)
             (Value name :/ E)
             [WhereIs authorRef "author_id"])
         parseCount
-performStorage (AuthorSetDescription authorRef description) = runTransactionRelaxed $ do
+doSqlStorage (AuthorSetDescription authorRef description) = runTransactionRelaxed $ do
     doQuery
         (Update "sn_authors"
             (fText "author_description" :/ E)
             (Value description :/ E)
             [WhereIs authorRef "author_id"])
         parseCount
-performStorage (AuthorDelete authorRef) = runTransactionRelaxed $ do
+doSqlStorage (AuthorDelete authorRef) = runTransactionRelaxed $ do
     doQuery_
         (Delete "sn_articles"
             [WhereIs authorRef "article_author_id", WhereWith NonPublished "article_publication_date = ?"])
@@ -406,7 +414,7 @@ performStorage (AuthorDelete authorRef) = runTransactionRelaxed $ do
         (Delete "sn_authors"
             [WhereIs authorRef "author_id"])
         parseCount
-performStorage (AuthorList view) = runTransactionRelaxed $ do
+doSqlStorage (AuthorList view) = runTransactionRelaxed $ do
     withView view $ \tables filter order range _ -> do
         doQuery
             (Select ("sn_authors" : tables)
@@ -415,18 +423,18 @@ performStorage (AuthorList view) = runTransactionRelaxed $ do
                 (order "author_id")
                 range)
             (parseList $ parseOne Author)
-performStorage (AuthorSetOwnership authorRef userRef True) = runTransactionRelaxed $ do
+doSqlStorage (AuthorSetOwnership authorRef userRef True) = runTransactionRelaxed $ do
     doQuery_
         (Insert "sn_author2user"
             (fReference "a2u_user_id" :/ fReference "a2u_author_id" :/ E)
             (Value userRef :/ Value authorRef :/ E)
             E)
-performStorage (AuthorSetOwnership authorRef userRef False) = runTransactionRelaxed $ do
+doSqlStorage (AuthorSetOwnership authorRef userRef False) = runTransactionRelaxed $ do
     doQuery_
         (Delete "sn_author2user"
             [WhereIs userRef "a2u_user_id", WhereIs authorRef "a2u_author_id"])
 
-performStorage (CategoryCreate name parentRef) = runTransactionRelaxed $ do
+doSqlStorage (CategoryCreate name parentRef) = runTransactionRelaxed $ do
     ref <- Reference <$> generateBytes 4
     doQuery
         (Insert "sn_categories"
@@ -434,14 +442,14 @@ performStorage (CategoryCreate name parentRef) = runTransactionRelaxed $ do
             (Value ref :/ Value name :/ Value parentRef :/ E)
             E)
         (parseInsert $ Category ref name parentRef)
-performStorage (CategorySetName categoryRef name) = runTransactionRelaxed $ do
+doSqlStorage (CategorySetName categoryRef name) = runTransactionRelaxed $ do
     doQuery
         (Update "sn_categories"
             (fText "category_name" :/ E)
             (Value name :/ E)
             [WhereIs categoryRef "category_id"])
         parseCount
-performStorage (CategorySetParent categoryRef parentRef) = runTransactionSerial $ do
+doSqlStorage (CategorySetParent categoryRef parentRef) = runTransactionSerial $ do
     doQuery
         (Select
             [ RecursiveSource "ancestors"
@@ -470,7 +478,7 @@ performStorage (CategorySetParent categoryRef parentRef) = runTransactionSerial 
             (Value parentRef :/ E)
             [WhereIs categoryRef "category_id"])
         parseCount
-performStorage (CategoryDelete categoryRef) = runTransactionSerial $ do
+doSqlStorage (CategoryDelete categoryRef) = runTransactionSerial $ do
     parent <- doQuery
         (Select ["sn_categories"]
             (fReference "category_parent_id" :/ E)
@@ -491,7 +499,7 @@ performStorage (CategoryDelete categoryRef) = runTransactionSerial $ do
     doQuery_
         (Delete "sn_categories"
             [WhereIs categoryRef "category_id"])
-performStorage (CategoryList view) = runTransactionRelaxed $ do
+doSqlStorage (CategoryList view) = runTransactionRelaxed $ do
     withView view $ \tables filter order range _ -> do
         doQuery
             (Select ("sn_categories" : tables)
@@ -501,7 +509,7 @@ performStorage (CategoryList view) = runTransactionRelaxed $ do
                 range)
             (parseList $ parseOne Category)
 
-performStorage (ArticleCreate authorRef) = runTransactionRelaxed $ do
+doSqlStorage (ArticleCreate authorRef) = runTransactionRelaxed $ do
     articleRef <- Reference <$> generateBytes 16
     articleVersion <- Version <$> generateBytes 4
     doQuery
@@ -524,14 +532,14 @@ performStorage (ArticleCreate authorRef) = runTransactionRelaxed $ do
             :/ E)
             E)
         (parseInsert $ Article articleRef articleVersion authorRef "" "" NonPublished (Reference ""))
-performStorage (ArticleSetAuthor articleRef authorRef) = runTransactionRelaxed $ do
+doSqlStorage (ArticleSetAuthor articleRef authorRef) = runTransactionRelaxed $ do
     doQuery
         (Update "sn_articles"
             (fReference "article_author_id" :/ E)
             (Value authorRef :/ E)
             [WhereIs articleRef "article_id"])
         parseCount
-performStorage (ArticleSetName articleRef oldVersion name) = runTransactionSerial $ do
+doSqlStorage (ArticleSetName articleRef oldVersion name) = runTransactionSerial $ do
     doQuery
         (Select ["sn_articles"]
             (fVersion "article_version" :/ E)
@@ -551,7 +559,7 @@ performStorage (ArticleSetName articleRef oldVersion name) = runTransactionSeria
             (Value newVersion :/ Value name :/ E)
             [WhereIs articleRef "article_id"])
     return newVersion
-performStorage (ArticleSetText articleRef oldVersion text) = runTransactionSerial $ do
+doSqlStorage (ArticleSetText articleRef oldVersion text) = runTransactionSerial $ do
     doQuery
         (Select ["sn_articles"]
             (fVersion "article_version" :/ E)
@@ -571,26 +579,26 @@ performStorage (ArticleSetText articleRef oldVersion text) = runTransactionSeria
             (Value newVersion :/ Value text :/ E)
             [WhereIs articleRef "article_id"])
     return newVersion
-performStorage (ArticleSetCategory articleRef categoryRef) = runTransactionRelaxed $ do
+doSqlStorage (ArticleSetCategory articleRef categoryRef) = runTransactionRelaxed $ do
     doQuery
         (Update "sn_articles"
             (fReference "article_category_id" :/ E)
             (Value categoryRef :/ E)
             [WhereIs articleRef "article_id"])
         parseCount
-performStorage (ArticleSetPublicationStatus articleRef pubStatus) = runTransactionRelaxed $ do
+doSqlStorage (ArticleSetPublicationStatus articleRef pubStatus) = runTransactionRelaxed $ do
     doQuery
         (Update "sn_articles"
             (fPublicationStatus "article_publication_date" :/ E)
             (Value pubStatus :/ E)
             [WhereIs articleRef "article_id"])
         parseCount
-performStorage (ArticleDelete articleRef) = runTransactionRelaxed $ do
+doSqlStorage (ArticleDelete articleRef) = runTransactionRelaxed $ do
     doQuery
         (Delete "sn_articles"
             [WhereIs articleRef "article_id"])
         parseCount
-performStorage (ArticleList showDrafts view) = runTransactionRelaxed $ do
+doSqlStorage (ArticleList showDrafts view) = runTransactionRelaxed $ do
     withView view $ \tables filter order range time -> do
         doQuery
             (Select ("sn_articles" : tables)
@@ -606,18 +614,18 @@ performStorage (ArticleList showDrafts view) = runTransactionRelaxed $ do
                 (order "article_id")
                 range)
             (parseList $ parseOne Article)
-performStorage (ArticleSetTag articleRef tagRef True) = runTransactionRelaxed $ do
+doSqlStorage (ArticleSetTag articleRef tagRef True) = runTransactionRelaxed $ do
     doQuery_
         (Insert "sn_article2tag"
             (fReference "a2t_article_id" :/ fReference "a2t_tag_id" :/ E)
             (Value articleRef :/ Value tagRef :/ E)
             E)
-performStorage (ArticleSetTag articleRef tagRef False) = runTransactionRelaxed $ do
+doSqlStorage (ArticleSetTag articleRef tagRef False) = runTransactionRelaxed $ do
     doQuery_
         (Delete "sn_article2tag"
             [WhereIs articleRef "a2t_article_id", WhereIs tagRef "a2t_tag_id"])
 
-performStorage (TagCreate name) = runTransactionRelaxed $ do
+doSqlStorage (TagCreate name) = runTransactionRelaxed $ do
     tagRef <- Reference <$> generateBytes 4
     doQuery
         (Insert "sn_tags"
@@ -625,19 +633,19 @@ performStorage (TagCreate name) = runTransactionRelaxed $ do
             (Value tagRef :/ Value name :/ E)
             E)
         (parseInsert $ Tag tagRef name)
-performStorage (TagSetName tagRef name) = runTransactionRelaxed $ do
+doSqlStorage (TagSetName tagRef name) = runTransactionRelaxed $ do
     doQuery
         (Update "sn_tags"
             (fText "tag_name" :/ E)
             (Value name :/ E)
             [WhereIs tagRef "tag_id"])
         parseCount
-performStorage (TagDelete tagRef) = runTransactionRelaxed $ do
+doSqlStorage (TagDelete tagRef) = runTransactionRelaxed $ do
     doQuery
         (Delete "sn_tags"
             [WhereIs tagRef "tag_id"])
         parseCount
-performStorage (TagList view) = runTransactionRelaxed $ do
+doSqlStorage (TagList view) = runTransactionRelaxed $ do
     withView view $ \tables filter order range time -> do
         doQuery
             (Select ("sn_tags" : tables)
@@ -647,7 +655,7 @@ performStorage (TagList view) = runTransactionRelaxed $ do
                 range)
             (parseList $ parseOne Tag)
 
-performStorage (CommentCreate articleRef userRef text) = runTransactionRelaxed $ do
+doSqlStorage (CommentCreate articleRef userRef text) = runTransactionRelaxed $ do
     commentRef <- Reference <$> generateBytes 16
     commentDate <- currentTime
     doQuery
@@ -666,7 +674,7 @@ performStorage (CommentCreate articleRef userRef text) = runTransactionRelaxed $
             :/ E)
             E)
         (parseInsert $ Comment commentRef articleRef userRef text commentDate Nothing)
-performStorage (CommentSetText commentRef text) = runTransactionRelaxed $ do
+doSqlStorage (CommentSetText commentRef text) = runTransactionRelaxed $ do
     editDate <- currentTime
     doQuery
         (Update "sn_comments"
@@ -674,12 +682,12 @@ performStorage (CommentSetText commentRef text) = runTransactionRelaxed $ do
             (Value text :/ Value editDate :/ E)
             [WhereIs commentRef "comment_id"])
         parseCount
-performStorage (CommentDelete commentRef) = runTransactionRelaxed $ do
+doSqlStorage (CommentDelete commentRef) = runTransactionRelaxed $ do
     doQuery
         (Delete "sn_comments"
             [WhereIs commentRef "comment_id"])
         parseCount
-performStorage (CommentList view) = runTransactionRelaxed $ do
+doSqlStorage (CommentList view) = runTransactionRelaxed $ do
     withView view $ \tables filter order range time -> do
         doQuery
             (Select ("sn_comments" : tables)
@@ -721,22 +729,22 @@ doQuery query mapf = ReaderT $ \SqlStorage {storageDb = db} -> do
 doQuery_ :: Query qr -> Transaction ()
 doQuery_ query = doQuery query (const $ Right ())
 
-runTransaction :: Db.TransactionLevel -> Transaction r -> SqlStorage -> IO (Either StorageError r)
-runTransaction level body storage = doTry 100
+runTransaction :: Show a => Db.TransactionLevel -> Transaction a -> SqlStorage -> (Show a => Either StorageError a -> IO r) -> IO r
+runTransaction level body storage cont = doTry 100
   where
-    doTry 0 = return $ Left InternalError
+    doTry 0 = cont $ Left InternalError
     doTry n = do
         tret <- Db.withTransaction (storageDb storage) level $ \db2 -> do
             runExceptT $ runExceptT $ runReaderT body $ storage {storageDb = db2}
         case tret of
-            Right bret -> return bret
-            Left Db.QueryError -> return $ Left InternalError
+            Right bret -> cont bret
+            Left Db.QueryError -> cont $ Left InternalError
             Left Db.SerializationError -> doTry (n-1)
 
-runTransactionRelaxed :: Transaction r -> SqlStorage -> IO (Either StorageError r)
+runTransactionRelaxed :: Show a => Transaction a -> SqlStorage -> (Show a => Either StorageError a -> IO r) -> IO r
 runTransactionRelaxed = runTransaction Db.ReadCommited
 
-runTransactionSerial :: Transaction r -> SqlStorage -> IO (Either StorageError r)
+runTransactionSerial :: Show a => Transaction a -> SqlStorage -> (Show a => Either StorageError a -> IO r) -> IO r
 runTransactionSerial = runTransaction Db.Serializable
 
 parseInsert :: a -> Maybe (HList Maybe '[]) -> Either StorageError a
@@ -815,6 +823,10 @@ instance ListableObject User where
     applyFilter (FilterUserIsAdmin False) = demandCondition (Where "NOT user_is_admin")
     applyFilter (FilterUserAuthorId ref) = demandCondition (WhereIs ref "a2u_author_id")
         <> demandJoin "sn_author2user" [Where "a2u_user_id = user_id"]
+    applyFilter (FilterUserAccessKey key@(AccessKey keyFront _)) =
+        demandCondition (WhereIs keyFront "access_key_id")
+            <> demandCondition (WhereIs (hashAccessKey key) "access_key_hash")
+            <> demandJoin "sn_access_keys" [Where "access_key_user_id = user_id"]
     applyOrder OrderUserName = demandOrder "user_name"
     applyOrder OrderUserSurname = demandOrder "user_surname"
     applyOrder OrderUserJoinDate = demandOrder "user_join_date" . inverseDirection
@@ -847,8 +859,6 @@ instance ListableObject Article where
     applyFilter (FilterArticlePublishedBefore end) = demandCondition (WhereWith end "article_publication_date < ?")
     applyFilter (FilterArticlePublishedAfter begin) = demandCondition (WhereWith begin "article_publication_date >= ?")
     applyFilter (FilterArticleTagIds []) = mempty
-    -- applyFilter (FilterArticleTagIds [ref]) = demandCondition (WhereIs ref "a2t_tag_id")
-        -- <> demandJoin "sn_article2tag" [Where "a2t_article_id = article_id"]
     applyFilter (FilterArticleTagIds tagRefs) = demandCondition (WhereWithList "EXISTS (SELECT * FROM sn_article2tag WHERE a2t_article_id = article_id AND a2t_tag_id IN " tagRefs ")")
     applyOrder OrderArticleName = demandOrder "article_name"
     applyOrder OrderArticleDate = demandOrder "article_publication_date" . inverseDirection
@@ -936,3 +946,5 @@ withView view cont = do
             (\fieldName -> appEndo orderEndo [Asc fieldName])
             (RowRange (viewOffset view) (viewLimit view))
             time
+
+declareHEq1Instance ''Action

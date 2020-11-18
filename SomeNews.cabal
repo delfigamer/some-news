@@ -4,7 +4,7 @@ cabal-version: 1.12
 --
 -- see: https://github.com/sol/hpack
 --
--- hash: c9387bfeebcb030dab4f125b71f02ff9a215f6dd4c0961b2f5a2e6d5065520c4
+-- hash: 730cdd249ecc7491dc4d006856a45deaf7ce0e91fa11c493e10fd5eaeabafde0
 
 name:           SomeNews
 version:        0.1.0.0
@@ -27,6 +27,9 @@ source-repository head
 
 library
   exposed-modules:
+      HEq1
+      Hex
+      JsonInterface
       Lib
       Logger
       ResourcePool
@@ -59,10 +62,12 @@ library
     , splitmix ==0.1.*
     , sqlite-simple
     , stm
+    , template-haskell
     , text
     , time
     , transformers
     , unordered-containers
+    , vector
     , warp
     , yaml
   default-language: Haskell2010
@@ -91,10 +96,12 @@ executable SomeNews-exe
     , splitmix ==0.1.*
     , sqlite-simple
     , stm
+    , template-haskell
     , text
     , time
     , transformers
     , unordered-containers
+    , vector
     , warp
     , yaml
   default-language: Haskell2010
@@ -105,6 +112,9 @@ test-suite SomeNews-test
   other-modules:
       Bimap
       Gen
+      HexSpec
+      JsonInterfaceSpec
+      Storage.Fake
       StorageSpec
       Tree
       Paths_SomeNews
@@ -128,10 +138,12 @@ test-suite SomeNews-test
     , splitmix ==0.1.*
     , sqlite-simple
     , stm
+    , template-haskell
     , text
     , time
     , transformers
     , unordered-containers
+    , vector
     , warp
     , yaml
   default-language: Haskell2010

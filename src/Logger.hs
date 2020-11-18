@@ -1,87 +1,139 @@
+{-# LANGUAGE DefaultSignatures #-}
+{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
+
 module Logger
-    ( LogLevel(..)
-    , Handle(..)
+    ( ToLog(..)
+    , showLog
+    , (<<)
+    , (<<|)
+    , (<<||)
+    , LogLevel(..)
+    , Logger(..)
+    , logDebug
+    , logInfo
+    , logWarn
+    , logErr
     , loggerFilter
-    , withNullLogger
+    , nullLogger
     , withFileLogger
     , withHtmlLogger
     , withTestLogger
-    , withStdLogger
-    , withMultiLogger
-    , debug
-    , info
-    , warn
-    , err
+    , stdLogger
+    , joinLoggers
     ) where
 
 import Control.Concurrent.MVar
 import Control.Exception
 import Control.Monad
 import Data.IORef
-import Data.Text (Text, pack)
-import Data.Time.Clock (getCurrentTime)
-import Data.Time.Format (defaultTimeLocale, formatTime)
+import Data.String
 import System.Console.ANSI
-import qualified Data.Text.IO as TextIO
+import System.IO.Unsafe (unsafePerformIO)
+import qualified Data.Text as TextStrict
+import qualified Data.Text.Lazy as Text
+import qualified Data.Text.Lazy.Builder as Builder
+import qualified Data.Text.Lazy.IO as TextIO
+import qualified Data.Time.Clock as Time
+import qualified Data.Time.Format as Time
 import qualified System.IO as IO
 
-data Handle =
-    Handle
-        { send :: LogLevel -> Text -> IO ()
-        }
+newtype Log = Log (Builder.Builder -> Builder.Builder)
+
+instance IsString Log where
+    fromString s = Log $ \z -> Builder.fromString s <> z
+
+class ToLog a where
+    toLog :: a -> Log
+
+instance ToLog Log where
+    toLog = id
+
+instance ToLog Builder.Builder where
+    toLog b = Log $ \z -> b <> z
+
+instance ToLog Text.Text where
+    toLog = toLog . Builder.fromLazyText
+
+instance ToLog TextStrict.Text where
+    toLog = toLog . Builder.fromText
+
+instance ToLog String where
+    toLog = toLog . Builder.fromString
+
+showLog :: Show a => a -> Log
+showLog = toLog . show
+
+infixl 1 <<
+(<<) :: Log -> Log -> Log
+Log f << Log g = Log $ \z -> f (g z)
+
+infixl 1 <<|
+(<<|) :: Show a => Log -> a -> Log
+x <<| y = x << showLog y
+
+infixl 1 <<||
+(<<||) :: ToLog a => Log -> a -> Log
+x <<|| y = x << toLog y
 
 data LogLevel
-    = Debug
-    | Info
-    | Warn
-    | Err
-    | Topmost
+    = LevelDebug
+    | LevelInfo
+    | LevelWarn
+    | LevelErr
+    | LevelTopmost
     deriving (Ord, Eq)
 
 instance Show LogLevel where
-    show Debug = "DEBUG"
-    show Info  = "INFO "
-    show Warn  = "WARN "
-    show Err   = "ERROR"
-    show Topmost = "TOP  "
+    show LevelDebug = "DEBUG"
+    show LevelInfo  = "INFO "
+    show LevelWarn  = "WARN "
+    show LevelErr   = "ERROR"
+    show LevelTopmost = "TOP  "
 
-debug :: Handle -> Text -> IO ()
-debug h = send h Debug
+newtype Logger =
+    Logger
+        { logSend :: LogLevel -> Log -> IO ()
+        }
 
-info :: Handle -> Text -> IO ()
-info h = send h Info
+logDebug :: Logger -> Log -> IO ()
+logDebug h = logSend h LevelDebug
 
-warn :: Handle -> Text -> IO ()
-warn h = send h Warn
+logInfo :: Logger -> Log -> IO ()
+logInfo h = logSend h LevelInfo
 
-err :: Handle -> Text -> IO ()
-err h = send h Err
+logWarn :: Logger -> Log -> IO ()
+logWarn h = logSend h LevelWarn
 
-loggerFilter :: LogLevel -> Handle -> Handle
+logErr :: Logger -> Log -> IO ()
+logErr h = logSend h LevelErr
+
+builderFromLevel :: LogLevel -> Builder.Builder
+builderFromLevel = Builder.fromString . show
+
+loggerFilter :: LogLevel -> Logger -> Logger
 loggerFilter minlevel inner = do
-    Handle
-        { send = \level text -> do
-            when (level >= minlevel) $ send inner level text
+    Logger
+        { logSend = \level text -> do
+            when (level >= minlevel) $ logSend inner level text
         }
 
-withNullLogger :: (Handle -> IO r) -> IO r
-withNullLogger body = do
-    body $ Handle
-        { send = \_ _ -> return ()
-        }
+nullLogger :: Logger
+nullLogger = Logger
+    { logSend = \_ _ -> return ()
+    }
 
-withFileLogger :: FilePath -> Bool -> (Handle -> IO r) -> IO r
+withFileLogger :: FilePath -> Bool -> (Logger -> IO r) -> IO r
 withFileLogger path clear body = do
     mutex <- newMVar ()
     bracket (IO.openFile path openMode) (IO.hClose) $ \fh -> do
         IO.hSetEncoding fh =<< IO.mkTextEncoding "UTF-8//TRANSLIT"
-        body $ Handle
-            { send = \level text -> do
+        body $ Logger
+            { logSend = \level (Log line) -> do
                 withMVar mutex $ \() -> do
-                    time <- getCurrentTime
-                    let timestr = formatTime defaultTimeLocale "%F %T.%q" time
-                    TextIO.hPutStrLn fh $
-                        pack (timestr <> ": " <> show level) <> ": " <> text
+                    timestr <- currentTimestamp
+                    TextIO.hPutStrLn fh $ Builder.toLazyText $
+                        timestr <> ": " <> builderFromLevel level <> ": " <> line mempty
                     IO.hFlush fh
             }
   where
@@ -89,7 +141,7 @@ withFileLogger path clear body = do
         then IO.WriteMode
         else IO.AppendMode
 
-withHtmlLogger :: FilePath -> (Handle -> IO r) -> IO r
+withHtmlLogger :: FilePath -> (Logger -> IO r) -> IO r
 withHtmlLogger path body = do
     mutex <- newMVar ()
     bracket
@@ -110,65 +162,71 @@ withHtmlLogger path body = do
             IO.hClose fh)
         (\fh -> do
             IO.hSetEncoding fh =<< IO.mkTextEncoding "UTF-8//TRANSLIT"
-            body $ Handle
-                { send = \level text -> do
+            body $ Logger
+                { logSend = \level (Log line) -> do
                     withMVar mutex $ \() -> do
-                        time <- getCurrentTime
-                        let timestr = formatTime defaultTimeLocale "%F %T.%q" time
-                        let innerline = pack (timestr <> ": " <> show level) <> ": " <> text
-                        let outerline = case level of
-                                Debug -> "<p class=\"debug\">" <> innerline <> "</p>"
-                                Info -> "<p class=\"info\">" <> innerline <> "</p>"
-                                Warn -> "<p class=\"warn\">" <> innerline <> "</p>"
-                                Err -> "<p class=\"err\">" <> innerline <> "</p>"
-                                Topmost -> "<p class=\"top\">" <> innerline <> "</p>"
-                        TextIO.hPutStrLn fh outerline
+                        timestr <- currentTimestamp
+                        let inner = timestr <> ": " <> builderFromLevel level <> ": " <> line mempty
+                        let outer = case level of
+                                LevelDebug -> "<p class=\"debug\">" <> inner <> "</p>"
+                                LevelInfo -> "<p class=\"info\">" <> inner <> "</p>"
+                                LevelWarn -> "<p class=\"warn\">" <> inner <> "</p>"
+                                LevelErr -> "<p class=\"err\">" <> inner <> "</p>"
+                                LevelTopmost -> "<p class=\"top\">" <> inner <> "</p>"
+                        TextIO.hPutStrLn fh $ Builder.toLazyText outer
                         IO.hFlush fh
                 })
 
--- this logger is intended to be used in test suites
--- if the test within `body` runs successfully, then all the output gets dropped
--- otherwise, if `body` throws - all the output gets written into the console, and the exception (test failure) is passed along unchanged
--- in other words: if `body` doesn't throw, `withTestLogger` behaves like `withNullLogger`
--- otherwise, if `body` does throw, then `withTestLogger` behaves as if it was `withStdLogger` all along
-withTestLogger :: (Handle -> IO r) -> IO r
+currentTimestamp :: IO Builder.Builder
+currentTimestamp = do
+    time <- Time.getCurrentTime
+    return $ Builder.fromString $
+        Time.formatTime Time.defaultTimeLocale "%F %T.%q" time
+
+{- this logger is intended to be used in test suites -}
+{- if the test within `body` runs successfully, then all the output gets dropped -}
+{- otherwise, if `body` throws - all the output gets written into the console, and the exception (test failure) is passed along unchanged -}
+{- in other words: if `body` doesn't throw, `withTestLogger` behaves like `withNullLogger` -}
+{- otherwise, if `body` does throw, then `withTestLogger` behaves as if it was `withStdLogger` all along -}
+withTestLogger :: (Logger -> IO r) -> IO r
 withTestLogger body = do
     pbuf <- newIORef $ id
     doBody pbuf `onException` writeOutput pbuf
   where
     doBody pbuf = do
-        body $ Handle
-            { send = \level text -> do
+        body $ Logger
+            { logSend = \level (Log line) -> do
                 atomicModifyIORef pbuf $ \buf1 -> do
-                    let buf2 = \a -> buf1 ((level, text) : a)
+                    let buf2 = \a -> buf1 ((level, Builder.toLazyText $ line mempty) : a)
                     (buf2, ())
             }
     writeOutput pbuf = do
         buf <- readIORef pbuf
-        forM_ (buf []) $ \(level, text) -> writeToStd level text
+        forM_ (buf []) $ \(level, text) -> writeToStd level (toLog text)
 
-withStdLogger :: (Handle -> IO r) -> IO r
-withStdLogger body = do
-    mutex <- newMVar ()
-    body $ Handle
-        { send = \level text -> do
-            withMVar mutex $ \() -> writeToStd level text
-        }
+stdLogger :: Logger
+stdLogger = Logger
+    { logSend = \level text -> do
+        withMVar stdOutputMutex $ \() -> writeToStd level text
+    }
 
-writeToStd :: LogLevel -> Text -> IO ()
-writeToStd level text = do
+writeToStd :: LogLevel -> Log -> IO ()
+writeToStd level (Log line) = do
     case level of
-        Debug -> setSGR [SetColor Foreground Dull Yellow]
-        Warn -> setSGR [SetColor Foreground Vivid Yellow]
-        Err -> setSGR [SetColor Foreground Vivid Red]
+        LevelDebug -> setSGR [SetColor Foreground Dull Yellow]
+        LevelWarn -> setSGR [SetColor Foreground Vivid Yellow]
+        LevelErr -> setSGR [SetColor Foreground Vivid Red]
         _ -> return ()
-    TextIO.putStrLn $ pack (show level) <> ": " <> text
+    TextIO.putStrLn $ Builder.toLazyText $
+        builderFromLevel level <> ": " <> line mempty
     setSGR [Reset]
 
-withMultiLogger :: Handle -> Handle -> (Handle -> IO r) -> IO r
-withMultiLogger a b body = do
-    body $ Handle
-        { send = \level text -> do
-            send a level text
-            send b level text
-        }
+stdOutputMutex :: MVar ()
+stdOutputMutex = unsafePerformIO $ newMVar ()
+{-# NOINLINE stdOutputMutex #-}
+
+joinLoggers :: [Logger] -> Logger
+joinLoggers hs = Logger
+    { logSend = \level text -> do
+        forM_ hs $ \h -> logSend h level text
+    }
