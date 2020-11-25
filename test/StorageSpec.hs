@@ -1,13 +1,16 @@
+{-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE StandaloneDeriving #-}
+
 module StorageSpec
     ( spec
     ) where
 
 import Control.Concurrent
 import Control.Concurrent.MVar
-import Control.Concurrent.QSemN
 import Control.Exception
 import Control.Monad
 import Data.Aeson hiding (Result)
+import Data.Hashable
 import Data.IORef
 import Data.Int
 import Data.List
@@ -16,24 +19,34 @@ import Data.Ord
 import Data.Time.Clock
 import Data.Tuple
 import Data.Yaml
+import GHC.Generics
 import System.IO.Unsafe
 import Test.Hspec
 import qualified Data.ByteString as BS
+import qualified Data.ByteString.Builder as Builder
+import qualified Data.ByteString.Lazy as LBS
 import qualified Data.Char as Char
-import qualified Data.Map.Strict as Map
-import qualified Data.Map.Lazy as MapLazy
-import qualified Data.Set as Set
+import qualified Data.Map as PureMap
 import qualified Data.Text as Text
 import qualified System.IO as IO
 import Gen
+import Parallel
 import Sql.Query
 import Storage
 import Tuple
-import qualified Bimap
 import qualified Logger
 import qualified Sql.Database as Db
 import qualified Sql.Database.Config as Db
-import qualified Tree
+import qualified TData.Map as Map
+import qualified TData.Multimap as Multimap
+import qualified TData.Relmap as Relmap
+import qualified TData.Tree as Tree
+
+deriving instance Generic (Reference a)
+instance Hashable (Reference a)
+
+deriving instance Generic AccessKey
+instance Hashable AccessKey
 
 data TestConfig = TestConfig
     { databaseConfig :: Db.DatabaseConfig
@@ -70,50 +83,6 @@ randomReference = Reference <$> randomByteString 16
 randomVersion :: Gen (Version a)
 randomVersion = Version <$> randomByteString 16
 
-inParallel :: (a -> b -> r) -> IO a -> IO b -> IO r
-inParallel combine aleft aright = mask $ \restore -> do
-    mvar <- newEmptyMVar
-    tid <- forkIOWithUnmask $ \unmask -> do
-        r <- trySome $ unmask $ yield >> aright
-        putMVar mvar r
-    lret <- trySome $ restore aleft
-    case lret of
-        Left ex -> do
-            _ <- killThread tid
-            _ <- takeMVar mvar
-            throwIO ex
-        Right x -> do
-            rret <- takeMVar mvar
-            case rret of
-                Right y -> return $ combine x y
-                Left ex -> throwIO ex
-  where
-    trySome :: IO a -> IO (Either SomeException a)
-    trySome = try
-
-parallelTraverse :: [IO a] -> IO [a]
-parallelTraverse [] = return []
-parallelTraverse (t : ts) = inParallel (:) t $ parallelTraverse ts
-
-parallelTraverse_ :: [IO ()] -> IO ()
-parallelTraverse_ [] = return ()
-parallelTraverse_ (t : ts) = inParallel (\_ _ -> ()) t $ parallelTraverse_ ts
-
-parallelFor :: [a] -> (a -> IO b) -> IO [b]
-parallelFor xs f = parallelTraverse (map f xs)
-
-parallelFor_ :: [a] -> (a -> IO ()) -> IO ()
-parallelFor_ xs f = parallelTraverse_ (map f xs)
-
-splitSetOn :: (a -> Ordering) -> Set.Set a -> (Set.Set a, Set.Set a, Set.Set a)
-splitSetOn func init = do
-    let (lt, ge) = Set.spanAntitone ((== GT) . func) init
-    let (eq, gt) = Set.spanAntitone ((== EQ) . func) ge
-    (lt, eq, gt)
-
-atomicModifyIORef_ :: IORef a -> (a -> a) -> IO ()
-atomicModifyIORef_ ioref f = atomicModifyIORef' ioref $ \x -> (f x, ())
-
 byChance :: Int -> Int -> IO a -> IO a -> IO a
 byChance num den ma mb = do
     i <- generate $ randomWithin 1 den
@@ -128,7 +97,7 @@ repeatSome_ lo hi act = do
 
 clearDatabase :: Db.Database -> IO ()
 clearDatabase db = do
-    mapM_ (Db.makeQuery db . DropTable) $ reverse $
+    mapM_ (Db.execute db Db.ReadCommited . Db.query . DropTable) $ reverse $
         [ "sn_metadata"
         , "sn_users"
         , "sn_access_keys"
@@ -141,11 +110,37 @@ clearDatabase db = do
         , "sn_comments"
         , "sn_files"
         , "sn_file_chunks"
+        , "sn_tickets"
         ]
 
 assertRight :: (Show a, Show b, HasCallStack) => Either a b -> IO b
 assertRight (Right x) = return x
 assertRight r = expectationFailure ("Expected a Right, got " ++ show r) >> undefined
+
+sampleBadRefs :: (Reference a -> IO Bool) -> IO [Reference a]
+sampleBadRefs memberF = do
+    forM [1..20] $ \_ -> do
+        makeOne
+  where
+    makeOne = do
+        ref <- generate $ randomReference
+        isMember <- memberF ref
+        if isMember
+            then makeOne
+            else return ref
+
+sampleSubsetProduct :: Int -> Map.Map a b -> Map.Map c d -> (a -> c -> IO ()) -> IO ()
+sampleSubsetProduct sampleSize atable btable func = do
+    let subsize = ceiling (sqrt (fromIntegral sampleSize :: Float))
+    akeys <- Map.keys atable
+    asample <- generate $ chooseFrom subsize akeys
+    bkeys <- Map.keys btable
+    bsample <- generate $ chooseFrom subsize bkeys
+    parallelFor_ asample $ \a -> do
+        parallelFor_ bsample $ \b -> do
+            byChance 1 2
+                (func a b)
+                (return ())
 
 spec :: Spec
 spec = do
@@ -167,36 +162,39 @@ spec = do
                 userAuthorRels <- generateUserAuthorRels storage sampleSize userTable authorTable
                 minceUserAuthorRels storage sampleSize userTable authorTable userAuthorRels
             clearStorage "handles category objects" $ \sampleSize storage -> do
-                categoryTable <- generateCategories storage sampleSize
-                minceCategories storage sampleSize categoryTable
+                categoryTree <- generateCategories storage sampleSize
+                minceCategories storage sampleSize categoryTree
             clearStorage "handles article objects" $ \sampleSize storage -> do
                 userTable <- generateUsers storage sampleSize
                 authorTable <- generateAuthors storage sampleSize
                 userAuthorRels <- generateUserAuthorRels storage sampleSize userTable authorTable
-                categoryTable <- generateCategories storage sampleSize
-                articleTable <- generateArticles storage sampleSize userTable authorTable userAuthorRels categoryTable
-                minceArticles storage sampleSize userTable authorTable userAuthorRels categoryTable articleTable
+                categoryTree <- generateCategories storage sampleSize
+                articleTable <- generateArticles storage sampleSize authorTable categoryTree
+                minceArticles storage sampleSize userTable authorTable userAuthorRels categoryTree articleTable
             clearStorage "handles tag objects" $ \sampleSize storage -> do
                 tagTable <- generateTags storage sampleSize
                 minceTags storage sampleSize tagTable
             clearStorage "handles article-tag relations" $ \sampleSize storage -> do
-                userTable <- generateUsers storage sampleSize
-                authorTable <- generateAuthors storage sampleSize
-                userAuthorRels <- generateUserAuthorRels storage sampleSize userTable authorTable
-                categoryTable <- generateCategories storage sampleSize
-                articleTable <- generateArticles storage sampleSize userTable authorTable userAuthorRels categoryTable
+                authorTable <- generateAuthors storage 1
+                categoryTree <- generateCategories storage 1
+                articleTable <- generateArticles storage sampleSize authorTable categoryTree
                 tagTable <- generateTags storage sampleSize
                 articleTagRels <- generateArticleTagRels storage sampleSize articleTable tagTable
                 minceArticleTagRels storage sampleSize articleTable tagTable articleTagRels
             clearStorage "handles comment objects" $ \sampleSize storage -> do
                 userTable <- generateUsers storage sampleSize
-                authorTable <- generateAuthors storage sampleSize
-                userAuthorRels <- generateUserAuthorRels storage sampleSize userTable authorTable
-                categoryTable <- generateCategories storage sampleSize
-                articleTable <- generateArticles storage sampleSize userTable authorTable userAuthorRels categoryTable
-                tagTable <- generateTags storage sampleSize
+                authorTable <- generateAuthors storage 1
+                categoryTree <- generateCategories storage 1
+                articleTable <- generateArticles storage sampleSize authorTable categoryTree
                 commentTable <- generateComments storage sampleSize userTable articleTable
                 minceComments storage sampleSize userTable articleTable commentTable
+            clearStorage "handles files" $ \sampleSize storage -> do
+                userTable <- generateUsers storage sampleSize
+                authorTable <- generateAuthors storage 1
+                categoryTree <- generateCategories storage 1
+                articleTable <- generateArticles storage sampleSize authorTable categoryTree
+                fileTable <- generateFiles storage sampleSize userTable articleTable
+                minceFiles storage sampleSize userTable articleTable fileTable
 
 clearStorage :: String -> (Int -> Storage -> IO ()) -> SpecWith [TestConfig]
 clearStorage name body = do
@@ -212,479 +210,461 @@ clearStorage name body = do
 
 generateUsers
     :: Storage -> Int
-    -> IO (IORef (Map.Map (Reference User) User))
+    -> IO (Map.Map (Reference User) User)
 generateUsers storage sampleSize = do
-    userTable <- newIORef Map.empty
+    userTable <- Map.new
     parallelFor_ [1 .. sampleSize] $ \_ -> do
         name <- generate $ randomText
         surname <- generate $ randomText
-        user <- assertRight =<< doStorage storage (UserCreate name surname)
+        user <- assertRight =<< storagePerform storage (UserCreate name surname)
         userName user `shouldBe` name
         userSurname user `shouldBe` surname
         userIsAdmin user `shouldBe` False
         isAdmin <- generate $ randomBool
         when isAdmin $
-            assertRight =<< doStorage storage (UserSetIsAdmin (userId user) True)
-        atomicModifyIORef_ userTable $ Map.insert (userId user) $
+            assertRight =<< storagePerform storage (UserSetIsAdmin (userId user) True)
+        Map.insert userTable (userId user) $
             user {userIsAdmin = isAdmin}
     return userTable
 
 validateUsers
-    :: Storage
-    -> IORef (Map.Map (Reference User) User)
+    :: HasCallStack
+    => Storage
+    -> Map.Map (Reference User) User
     -> IO ()
 validateUsers storage userTable = do
-    userList <- Map.elems <$> readIORef userTable
-    doStorage storage (UserList (ListView 0 maxBound [] []))
+    userList <- sortOn userId <$> Map.elems userTable
+    storagePerform storage (UserList (ListView 0 maxBound [] []))
         `shouldReturn`
         Right userList
 
 minceUsers
     :: Storage -> Int
-    -> IORef (Map.Map (Reference User) User)
+    -> Map.Map (Reference User) User
     -> IO ()
 minceUsers storage sampleSize userTable = do
     validateUsers storage userTable
     do
-        userList <- Map.elems <$> readIORef userTable
+        userList <- Map.elems userTable
         toAlter <- generate $ chooseFrom (sampleSize `div` 5) userList
         parallelFor_ toAlter $ \user -> do
             name <- generate $ randomText
             surname <- generate $ randomText
-            assertRight =<< doStorage storage (UserSetName (userId user) name surname)
-            atomicModifyIORef_ userTable $ Map.insert (userId user) $
+            assertRight =<< storagePerform storage (UserSetName (userId user) name surname)
+            Map.insert userTable (userId user) $
                 user {userName = name, userSurname = surname}
         validateUsers storage userTable
     do
-        userList <- Map.elems <$> readIORef userTable
+        userList <- Map.elems userTable
         toAlter <- generate $ chooseFrom (sampleSize `div` 5) userList
         parallelFor_ toAlter $ \user -> do
             isAdmin <- generate $ randomBool
-            assertRight =<< doStorage storage (UserSetIsAdmin (userId user) isAdmin)
-            atomicModifyIORef_ userTable $ Map.insert (userId user) $
+            assertRight =<< storagePerform storage (UserSetIsAdmin (userId user) isAdmin)
+            Map.insert userTable (userId user) $
                 user {userIsAdmin = isAdmin}
         validateUsers storage userTable
     do
-        userList <- Map.elems <$> readIORef userTable
+        userList <- Map.elems userTable
         toDelete <- generate $ chooseFrom (sampleSize `div` 5) userList
         parallelFor_ toDelete $ \user -> do
-            assertRight =<< doStorage storage (UserDelete (userId user))
-            atomicModifyIORef_ userTable $ Map.delete (userId user)
+            assertRight =<< storagePerform storage (UserDelete (userId user))
+            Map.delete userTable (userId user)
         validateUsers storage userTable
     do
-        userMap <- readIORef userTable
-        badRefs <- generate $
-            replicateM 20 $
-                randomReference `suchThat` (\ref -> not (Map.member ref userMap))
+        badRefs <- sampleBadRefs $ Map.member userTable
         parallelFor_ badRefs $ \ref -> do
-            doStorage storage (UserSetName ref "foo" "bar") `shouldReturn` Left NotFoundError
-            doStorage storage (UserSetIsAdmin ref True) `shouldReturn` Left NotFoundError
-            doStorage storage (UserDelete ref) `shouldReturn` Left NotFoundError
-            doStorage storage (UserList (ListView 0 1 [FilterUserId ref] []))
+            storagePerform storage (UserSetName ref "foo" "bar") `shouldReturn` Left NotFoundError
+            storagePerform storage (UserSetIsAdmin ref True) `shouldReturn` Left NotFoundError
+            storagePerform storage (UserDelete ref) `shouldReturn` Left NotFoundError
+            storagePerform storage (UserList (ListView 0 1 [FilterUserId ref] []))
                 `shouldReturn`
                 Right []
     do
-        userList <- Map.elems <$> readIORef userTable
+        userList <- sortOn userId <$> Map.elems userTable
         parallelFor_ userList $ \user -> do
-            doStorage storage (UserList (ListView 0 1 [FilterUserId (userId user)] []))
+            storagePerform storage (UserList (ListView 0 1 [FilterUserId (userId user)] []))
                 `shouldReturn`
                 Right [user]
-        doStorage storage (UserList (ListView 0 maxBound [FilterUserIsAdmin True] []))
+        storagePerform storage (UserList (ListView 0 maxBound [FilterUserIsAdmin True] []))
             `shouldReturn`
             Right (filter userIsAdmin userList)
-        doStorage storage (UserList (ListView 0 maxBound [FilterUserIsAdmin False] []))
+        storagePerform storage (UserList (ListView 0 maxBound [FilterUserIsAdmin False] []))
             `shouldReturn`
             Right (filter (not . userIsAdmin) userList)
-        doStorage storage (UserList (ListView 0 maxBound [] [(OrderUserName, Ascending)]))
+        storagePerform storage (UserList (ListView 0 maxBound [] [(OrderUserName, Ascending)]))
             `shouldReturn`
             Right (sortOn userName userList)
-        doStorage storage (UserList (ListView 0 maxBound [] [(OrderUserName, Descending)]))
+        storagePerform storage (UserList (ListView 0 maxBound [] [(OrderUserName, Descending)]))
             `shouldReturn`
             Right (sortOn (Down . userName) userList)
-        doStorage storage (UserList (ListView 0 maxBound [] [(OrderUserSurname, Ascending)]))
+        storagePerform storage (UserList (ListView 0 maxBound [] [(OrderUserSurname, Ascending)]))
             `shouldReturn`
             Right (sortOn userSurname userList)
-        doStorage storage (UserList (ListView 0 maxBound [] [(OrderUserJoinDate, Ascending)]))
+        storagePerform storage (UserList (ListView 0 maxBound [] [(OrderUserJoinDate, Ascending)]))
             `shouldReturn`
             Right (sortOn (Down . userJoinDate) userList)
-        doStorage storage (UserList (ListView 0 maxBound [] [(OrderUserIsAdmin, Ascending), (OrderUserName, Descending)]))
+        storagePerform storage (UserList (ListView 0 maxBound [] [(OrderUserIsAdmin, Ascending), (OrderUserName, Descending)]))
             `shouldReturn`
             Right (sortOn (\u -> (Down (userIsAdmin u), Down (userName u))) userList)
     return ()
 
 generateAccessKeys
     :: Storage -> Int
-    -> IORef (Map.Map (Reference User) User)
-    -> IO (IORef (Map.Map (Reference User) (Set.Set AccessKey)))
+    -> Map.Map (Reference User) User
+    -> IO (Multimap.Multimap (Reference User) AccessKey)
 generateAccessKeys storage sampleSize userTable = do
-    userRefs <- Map.keys <$> readIORef userTable
-    akeyTable <- newIORef $ Map.fromList $ map (\uref -> (uref, Set.empty)) userRefs
+    akeyTable <- Multimap.new
+    userRefs <- Map.keys userTable
     parallelFor_ userRefs $ \userRef -> do
         repeatSome_ 1 5 $ do
-            akey <- assertRight =<< doStorage storage (AccessKeyCreate userRef)
-            atomicModifyIORef_ akeyTable $ Map.update (Just . Set.insert akey) userRef
-    validateAccessKeys storage userTable akeyTable
+            akey <- assertRight =<< storagePerform storage (AccessKeyCreate userRef)
+            Multimap.insert akeyTable userRef akey
     return akeyTable
 
 minceAccessKeys
     :: Storage -> Int
-    -> IORef (Map.Map (Reference User) User)
-    -> IORef (Map.Map (Reference User) (Set.Set AccessKey))
+    -> Map.Map (Reference User) User
+    -> Multimap.Multimap (Reference User) AccessKey
     -> IO ()
 minceAccessKeys storage sampleSize userTable akeyTable = do
-    userRefs <- Map.keys <$> readIORef userTable
+    validateAccessKeys storage userTable akeyTable
+    userRefs <- Map.keys userTable
     do
-        userKeys <- readIORef akeyTable
-        let allKeys = do
-                (userRef, akeys) <- Map.toList userKeys
-                key <- Set.elems akeys
-                [(userRef, key)]
+        allKeys <- Multimap.toList akeyTable
         toDelete <- generate $ chooseFrom (sampleSize `div` 5) allKeys
         parallelFor_ toDelete $ \(userRef, akey) -> do
-            assertRight =<< doStorage storage (AccessKeyDelete userRef (accessKeyId akey))
-            atomicModifyIORef_ akeyTable $ Map.update (Just . Set.delete akey) userRef
+            assertRight =<< storagePerform storage (AccessKeyDelete userRef (accessKeyId akey))
+            Multimap.delete akeyTable userRef akey
         validateAccessKeys storage userTable akeyTable
     do
-        userKeys <- readIORef akeyTable
+        akeyGroups <- Multimap.toGroupsWith akeyTable userTable
         let oneKeys = do
-                (userRef, akeys) <- Map.toList userKeys
-                oneKey : _ <- return $ Set.elems akeys
+                (userRef, userAkeys) <- akeyGroups
+                oneKey : _ <- return userAkeys
                 [(userRef, oneKey)]
         let (users, keys) = unzip oneKeys
         let badKeysFull = zip users (drop 1 keys)
         badKeys <- generate $ chooseFrom (sampleSize `div` 5) badKeysFull
         parallelFor_ badKeys $ \(userRef, akey) -> do
-            doStorage storage (AccessKeyDelete userRef (accessKeyId akey))
+            storagePerform storage (AccessKeyDelete userRef (accessKeyId akey))
                 `shouldReturn`
                 Left NotFoundError
         validateAccessKeys storage userTable akeyTable
     return ()
 
 validateAccessKeys
-    :: Storage
-    -> IORef (Map.Map (Reference User) User)
-    -> IORef (Map.Map (Reference User) (Set.Set AccessKey))
+    :: HasCallStack
+    => Storage
+    -> Map.Map (Reference User) User
+    -> Multimap.Multimap (Reference User) AccessKey
     -> IO ()
 validateAccessKeys storage userTable akeyTable = do
-    userMap <- readIORef userTable
-    akeys <- Map.toList <$> readIORef akeyTable
-    parallelFor_ akeys $ \(userRef, akeySet) -> do
-        doStorage storage (AccessKeyList userRef (ListView 0 maxBound [] []))
+    akeyGroups <- Multimap.toGroupsWith akeyTable userTable
+    parallelFor_ akeyGroups $ \(userRef, userAkeys) -> do
+        storagePerform storage (AccessKeyList userRef (ListView 0 maxBound [] []))
             `shouldReturn`
-            Right (map accessKeyId $ Set.toAscList akeySet)
-        parallelFor_ (Set.elems akeySet) $ \akey -> do
-            doStorage storage (UserList (ListView 0 1 [FilterUserAccessKey akey] []))
+            Right (sort $ map accessKeyId $ userAkeys)
+        user <- Map.lookup' userTable userRef
+        parallelFor_ userAkeys $ \akey -> do
+            storagePerform storage (UserList (ListView 0 1 [FilterUserAccessKey akey] []))
                 `shouldReturn`
-                Right [userMap Map.! userRef]
+                Right [user]
 
 generateAuthors
     :: Storage -> Int
-    -> IO (IORef (Map.Map (Reference Author) Author))
+    -> IO (Map.Map (Reference Author) Author)
 generateAuthors storage sampleSize = do
-    authorTable <- newIORef Map.empty
+    authorTable <- Map.new
     parallelFor_ [1 .. sampleSize] $ \_ -> do
         name <- generate $ randomText
         description <- generate $ randomText
-        author <- assertRight =<< doStorage storage (AuthorCreate name description)
+        author <- assertRight =<< storagePerform storage (AuthorCreate name description)
         authorName author `shouldBe` name
         authorDescription author `shouldBe` description
-        atomicModifyIORef_ authorTable $ Map.insert (authorId author) author
-    validateAuthors storage authorTable
+        Map.insert authorTable (authorId author) author
     return authorTable
 
 minceAuthors
     :: Storage -> Int
-    -> IORef (Map.Map (Reference Author) Author)
+    -> Map.Map (Reference Author) Author
     -> IO ()
 minceAuthors storage sampleSize authorTable = do
+    validateAuthors storage authorTable
     do
-        authorList <- Map.elems <$> readIORef authorTable
+        authorList <- Map.elems authorTable
         toAlter <- generate $ chooseFrom (sampleSize `div` 5) authorList
         parallelFor_ toAlter $ \author -> do
             name <- generate $ randomText
-            assertRight =<< doStorage storage (AuthorSetName (authorId author) name)
-            atomicModifyIORef_ authorTable $ Map.insert (authorId author) $
+            assertRight =<< storagePerform storage (AuthorSetName (authorId author) name)
+            Map.insert authorTable (authorId author) $
                 author {authorName = name}
         validateAuthors storage authorTable
     do
-        authorList <- Map.elems <$> readIORef authorTable
+        authorList <- Map.elems authorTable
         toAlter <- generate $ chooseFrom (sampleSize `div` 5) authorList
         parallelFor_ toAlter $ \author -> do
             description <- generate $ randomText
-            assertRight =<< doStorage storage (AuthorSetDescription (authorId author) description)
-            atomicModifyIORef_ authorTable $ Map.insert (authorId author) $
+            assertRight =<< storagePerform storage (AuthorSetDescription (authorId author) description)
+            Map.insert authorTable (authorId author) $
                 author {authorDescription = description}
         validateAuthors storage authorTable
     do
-        authorList <- Map.elems <$> readIORef authorTable
+        authorList <- Map.elems authorTable
         toDelete <- generate $ chooseFrom (sampleSize `div` 5) authorList
         parallelFor_ toDelete $ \author -> do
-            assertRight =<< doStorage storage (AuthorDelete (authorId author))
-            atomicModifyIORef_ authorTable $ Map.delete (authorId author)
+            assertRight =<< storagePerform storage (AuthorDelete (authorId author))
+            Map.delete authorTable (authorId author)
         validateAuthors storage authorTable
     do
-        authorMap <- readIORef authorTable
-        badRefs <- generate $
-            replicateM 20 $
-                randomReference `suchThat` (\ref -> not (Map.member ref authorMap))
+        badRefs <- sampleBadRefs $ Map.member authorTable
         parallelFor_ badRefs $ \ref -> do
-            doStorage storage (AuthorSetName ref "foo") `shouldReturn` Left NotFoundError
-            doStorage storage (AuthorSetDescription ref "bar") `shouldReturn` Left NotFoundError
-            doStorage storage (AuthorDelete ref) `shouldReturn` Left NotFoundError
-            doStorage storage (AuthorList (ListView 0 1 [FilterAuthorId ref] []))
+            storagePerform storage (AuthorSetName ref "foo") `shouldReturn` Left NotFoundError
+            storagePerform storage (AuthorSetDescription ref "bar") `shouldReturn` Left NotFoundError
+            storagePerform storage (AuthorDelete ref) `shouldReturn` Left NotFoundError
+            storagePerform storage (AuthorList (ListView 0 1 [FilterAuthorId ref] []))
                 `shouldReturn`
                 Right []
     do
-        authorList <- Map.elems <$> readIORef authorTable
+        authorList <- sortOn authorId <$> Map.elems authorTable
         parallelFor_ authorList $ \author -> do
-            doStorage storage (AuthorList (ListView 0 1 [FilterAuthorId (authorId author)] []))
+            storagePerform storage (AuthorList (ListView 0 1 [FilterAuthorId (authorId author)] []))
                 `shouldReturn`
                 Right [author]
-        doStorage storage (AuthorList (ListView 0 maxBound [] [(OrderAuthorName, Ascending)]))
+        storagePerform storage (AuthorList (ListView 0 maxBound [] [(OrderAuthorName, Ascending)]))
             `shouldReturn`
             Right (sortOn authorName authorList)
     return ()
 
 validateAuthors
-    :: Storage
-    -> IORef (Map.Map (Reference Author) Author)
+    :: HasCallStack
+    => Storage
+    -> Map.Map (Reference Author) Author
     -> IO ()
 validateAuthors storage authorTable = do
-    authorList <- Map.elems <$> readIORef authorTable
-    doStorage storage (AuthorList (ListView 0 maxBound [] []))
+    authorList <- sortOn authorId <$> Map.elems authorTable
+    storagePerform storage (AuthorList (ListView 0 maxBound [] []))
         `shouldReturn`
         Right authorList
 
 generateUserAuthorRels
     :: Storage -> Int
-    -> IORef (Map.Map (Reference User) User)
-    -> IORef (Map.Map (Reference Author) Author)
-    -> IO (IORef (Bimap.Bimap (Reference User) (Reference Author)))
+    -> Map.Map (Reference User) User
+    -> Map.Map (Reference Author) Author
+    -> IO (Relmap.Relmap (Reference User) (Reference Author))
 generateUserAuthorRels storage sampleSize userTable authorTable = do
-    userRefs <- Map.keys <$> readIORef userTable
-    authorRefs <- Map.keys <$> readIORef authorTable
-    connSet <- newIORef $ Bimap.fromKeys userRefs authorRefs
-    parallelFor_ authorRefs $ \authorRef -> do
-        parallelFor_ userRefs $ \userRef -> do
-            byChance 1 3
-                (do
-                    assertRight =<< doStorage storage (AuthorSetOwnership authorRef userRef True)
-                    atomicModifyIORef_ connSet $ Bimap.insert (userRef, authorRef))
-                (return ())
-    validateUserAuthorRels storage userTable authorTable connSet
+    connSet <- Relmap.new
+    sampleSubsetProduct sampleSize userTable authorTable $ \userRef authorRef -> do
+        assertRight =<< storagePerform storage (AuthorSetOwnership authorRef userRef True)
+        Relmap.insert connSet userRef authorRef
     return connSet
 
 minceUserAuthorRels
     :: Storage -> Int
-    -> IORef (Map.Map (Reference User) User)
-    -> IORef (Map.Map (Reference Author) Author)
-    -> IORef (Bimap.Bimap (Reference User) (Reference Author))
+    -> Map.Map (Reference User) User
+    -> Map.Map (Reference Author) Author
+    -> Relmap.Relmap (Reference User) (Reference Author)
     -> IO ()
 minceUserAuthorRels storage sampleSize userTable authorTable connSet = do
-    userRefs <- Map.keys <$> readIORef userTable
-    authorRefs <- Map.keys <$> readIORef authorTable
+    validateUserAuthorRels storage userTable authorTable connSet
     do
-        parallelFor_ authorRefs $ \authorRef -> do
-            parallelFor_ userRefs $ \userRef -> do
-                conn <- generate $ randomBool
-                assertRight =<< doStorage storage (AuthorSetOwnership authorRef userRef conn)
-                atomicModifyIORef_ connSet $ if conn
-                    then Bimap.insert (userRef, authorRef)
-                    else Bimap.delete (userRef, authorRef)
+        sampleSubsetProduct sampleSize userTable authorTable $ \userRef authorRef -> do
+            conn <- generate $ randomBool
+            assertRight =<< storagePerform storage (AuthorSetOwnership authorRef userRef conn)
+            if conn
+                then Relmap.insert connSet userRef authorRef
+                else Relmap.delete connSet userRef authorRef
         validateUserAuthorRels storage userTable authorTable connSet
     do
+        userAuthorRels <- Multimap.toList (Relmap.left connSet)
+        parallelFor_ userAuthorRels $ \(userRef, authorRef) -> do
+            conn <- generate $ randomBool
+            assertRight =<< storagePerform storage (AuthorSetOwnership authorRef userRef conn)
+            if conn
+                then Relmap.insert connSet userRef authorRef
+                else Relmap.delete connSet userRef authorRef
+        validateUserAuthorRels storage userTable authorTable connSet
+    do
+        userRefs <- Map.keys userTable
         usersToDelete <- generate $ chooseFrom (sampleSize `div` 5) userRefs
         parallelFor_ usersToDelete $ \userRef -> do
-            assertRight =<< doStorage storage (UserDelete userRef)
-            atomicModifyIORef_ userTable $ Map.delete userRef
-            atomicModifyIORef_ connSet $ Bimap.removeLeft userRef
+            assertRight =<< storagePerform storage (UserDelete userRef)
+            Map.delete userTable userRef
+            Relmap.removeLeft connSet userRef
         validateUserAuthorRels storage userTable authorTable connSet
     do
+        authorRefs <- Map.keys authorTable
         authorsToDelete <- generate $ chooseFrom (sampleSize `div` 5) authorRefs
         parallelFor_ authorsToDelete $ \authorRef -> do
-            assertRight =<< doStorage storage (AuthorDelete authorRef)
-            atomicModifyIORef_ authorTable $ Map.delete authorRef
-            atomicModifyIORef_ connSet $ Bimap.removeRight authorRef
+            assertRight =<< storagePerform storage (AuthorDelete authorRef)
+            Map.delete authorTable authorRef
+            Relmap.removeRight connSet authorRef
         validateUserAuthorRels storage userTable authorTable connSet
     return ()
 
 validateUserAuthorRels
-    :: Storage
-    -> IORef (Map.Map (Reference User) User)
-    -> IORef (Map.Map (Reference Author) Author)
-    -> IORef (Bimap.Bimap (Reference User) (Reference Author))
+    :: HasCallStack
+    => Storage
+    -> Map.Map (Reference User) User
+    -> Map.Map (Reference Author) Author
+    -> Relmap.Relmap (Reference User) (Reference Author)
     -> IO ()
 validateUserAuthorRels storage userTable authorTable connSet = do
-    userMap <- readIORef userTable
-    authorMap <- readIORef authorTable
-    conns <- readIORef connSet
-    parallelFor_ (Map.toList (Bimap.left conns)) $ \(userRef, authorSet) -> do
-        doStorage storage (AuthorList (ListView 0 maxBound [FilterAuthorUserId userRef] []))
+    userAuthorGroups <- Multimap.toGroupsWith (Relmap.left connSet) userTable
+    parallelFor_ userAuthorGroups $ \(userRef, userAuthors) -> do
+        authorList <- parallelFor (sort userAuthors) $ Map.lookup' authorTable
+        storagePerform storage (AuthorList (ListView 0 maxBound [FilterAuthorUserId userRef] []))
             `shouldReturn`
-            Right (map (authorMap Map.!) $ Set.elems authorSet)
-    parallelFor_ (Map.toList (Bimap.right conns)) $ \(authorRef, userSet) -> do
-        doStorage storage (UserList (ListView 0 maxBound [FilterUserAuthorId authorRef] []))
+            Right authorList
+    authorUserGroups <- Multimap.toGroupsWith (Relmap.right connSet) authorTable
+    parallelFor_ authorUserGroups $ \(authorRef, authorUsers) -> do
+        userList <- parallelFor (sort authorUsers) $ Map.lookup' userTable
+        storagePerform storage (UserList (ListView 0 maxBound [FilterUserAuthorId authorRef] []))
             `shouldReturn`
-            Right (map (userMap Map.!) $ Set.elems userSet)
+            Right userList
 
 generateCategories
     :: Storage -> Int
-    -> IO (IORef (Tree.Tree (Reference Category) Text.Text))
+    -> IO (Tree.Tree (Reference Category) Text.Text)
 generateCategories storage sampleSize = do
-    categoryTable <- newIORef Tree.empty
+    categoryTree <- Tree.new
     parallelFor_ [1 .. sampleSize] $ \_ -> do
-        prevCats <- Tree.keys <$> readIORef categoryTable
+        prevCats <- Tree.keys categoryTree
         name <- generate $ randomText
         parent <- generate $ do
             x <- randomWithin 0 (length prevCats)
             y <- randomWithin 0 x
             case y of
-                0 -> return $ Reference ""
+                0 -> return $ ""
                 _ -> return $ prevCats !! (y - 1)
-        category <- assertRight =<< doStorage storage (CategoryCreate name parent)
+        category <- assertRight =<< storagePerform storage (CategoryCreate name parent)
         categoryName category `shouldBe` name
         categoryParent category `shouldBe` parent
-        atomicModifyIORef_ categoryTable $ Tree.include (categoryId category) name parent
-    validateCategories storage categoryTable
-    return categoryTable
+        Tree.include categoryTree (categoryId category) name parent
+    return categoryTree
 
 minceCategories
     :: Storage -> Int
-    -> IORef (Tree.Tree (Reference Category) Text.Text)
+    -> Tree.Tree (Reference Category) Text.Text
     -> IO ()
-minceCategories storage sampleSize categoryTable = do
+minceCategories storage sampleSize categoryTree = do
+    validateCategories storage categoryTree
     do
-        categoryList <- toCategoryList <$> readIORef categoryTable
+        categoryList <- map toCategory <$> Tree.toList categoryTree
         toAlter <- generate $ chooseFrom (sampleSize `div` 5) categoryList
         parallelFor_ toAlter $ \category -> do
             name <- generate $ randomText
-            assertRight =<< doStorage storage (CategorySetName (categoryId category) name)
-            atomicModifyIORef_ categoryTable $ Tree.adjust
-                (\_ -> name)
-                (categoryId category)
-        validateCategories storage categoryTable
+            assertRight =<< storagePerform storage (CategorySetName (categoryId category) name)
+            Tree.adjust categoryTree (categoryId category) $ \_ -> name
+        validateCategories storage categoryTree
     do
-        categoryTree <- readIORef categoryTable
-        toAlter <- generate $ chooseFrom (sampleSize `div` 5) (toCategoryList categoryTree)
-        let stableCategories = Tree.excludeSubtreeSet
-                (Set.fromList $ map categoryId toAlter)
-                categoryTree
+        categoryList <- map toCategory <$> Tree.toList categoryTree
+        toAlter <- generate $ chooseFrom (sampleSize `div` 5) categoryList
+        stableCategories <- map toCategory <$>
+            Tree.withoutSubtreesOf categoryTree (map categoryId toAlter)
         parallelFor_ toAlter $ \category -> do
-            [parent] <- generate $ do
+            parent <- generate $ do
                 b <- randomBool
                 if b
-                    then return [Reference ""]
-                    else chooseFromSuch
-                        (\cref -> categoryId category `notElem` Tree.ancestors cref stableCategories)
-                        1 (Tree.keys stableCategories)
-            assertRight =<< doStorage storage (CategorySetParent (categoryId category) parent)
-            atomicModifyIORef_ categoryTable $ fromJust . Tree.trySetParent (categoryId category) parent
-        validateCategories storage categoryTable
+                    then return $ ""
+                    else categoryId <$> chooseOne stableCategories
+            assertRight =<< storagePerform storage (CategorySetParent (categoryId category) parent)
+            _ <- Tree.trySetParent categoryTree (categoryId category) parent
+            return ()
+        validateCategories storage categoryTree
     do
-        categoryList <- toCategoryList <$> readIORef categoryTable
+        categoryList <- map toCategory <$> Tree.toList categoryTree
         toDelete <- generate $ chooseFrom (sampleSize `div` 5) categoryList
         parallelFor_ toDelete $ \category -> do
-            assertRight =<< doStorage storage (CategoryDelete (categoryId category))
-            atomicModifyIORef_ categoryTable $ snd . Tree.exclude (categoryId category)
-        validateCategories storage categoryTable
+            assertRight =<< storagePerform storage (CategoryDelete (categoryId category))
+            _ <- Tree.exclude categoryTree (categoryId category)
+            return ()
+        validateCategories storage categoryTree
     do
-        categoryTree <- readIORef categoryTable
-        badRefs <- generate $
-            replicateM 20 $
-                randomReference `suchThat` (\ref -> not (Tree.member ref categoryTree))
+        badRefs <- sampleBadRefs $ Tree.member categoryTree
         parallelFor_ badRefs $ \ref -> do
-            doStorage storage (CategorySetName ref "foo") `shouldReturn` Left NotFoundError
-            doStorage storage (CategorySetParent ref (Reference "")) `shouldReturn` Left NotFoundError
-            doStorage storage (CategoryDelete ref) `shouldReturn` Left NotFoundError
-            doStorage storage (CategoryList (ListView 0 1 [FilterCategoryId ref] []))
+            storagePerform storage (CategorySetName ref "foo") `shouldReturn` Left NotFoundError
+            storagePerform storage (CategorySetParent ref "") `shouldReturn` Left NotFoundError
+            storagePerform storage (CategoryDelete ref) `shouldReturn` Left NotFoundError
+            storagePerform storage (CategoryList (ListView 0 1 [FilterCategoryId ref] []))
                 `shouldReturn`
                 Right []
     do
-        categoryTree <- readIORef categoryTable
-        let categoryList = toCategoryList categoryTree
+        categoryList <- map toCategory <$> Tree.toList categoryTree
         parallelFor_ categoryList $ \category -> do
-            doStorage storage (CategoryList (ListView 0 1 [FilterCategoryId (categoryId category)] []))
+            storagePerform storage (CategoryList (ListView 0 1 [FilterCategoryId (categoryId category)] []))
                 `shouldReturn`
                 Right [category]
-        doStorage storage (CategoryList (ListView 0 maxBound [] [(OrderCategoryName, Ascending)]))
+        storagePerform storage (CategoryList (ListView 0 maxBound [] [(OrderCategoryName, Ascending)]))
             `shouldReturn`
-            Right (sortOn categoryName categoryList)
-        let strictSubcategories = Tree.childMap categoryTree
-        parallelFor_ (Map.toList strictSubcategories) $ \(categoryRef, subcatSet) -> do
-            doStorage storage (CategoryList (ListView 0 maxBound [FilterCategoryParentId categoryRef] []))
+            Right (sortOn (\cat -> (categoryName cat, categoryId cat)) categoryList)
+        parallelFor_ categoryList $ \category -> do
+            strictSubcats <- map toCategory <$> Tree.childrenList categoryTree (categoryId category)
+            storagePerform storage (CategoryList (ListView 0 maxBound [FilterCategoryParentId (categoryId category)] []))
                 `shouldReturn`
-                Right (map (lookupCategory categoryTree) (Set.elems subcatSet))
-        let transitiveSubcategories = Tree.descendantMap categoryTree
-        parallelFor_ (Map.toList transitiveSubcategories) $ \(categoryRef, subcatSet) -> do
-            let subcatList = map (lookupCategory categoryTree) (Set.elems subcatSet)
-            doStorage storage (CategoryList (ListView 0 maxBound [FilterCategoryTransitiveParentId categoryRef] []))
+                Right (sortOn categoryId strictSubcats)
+            transitiveSubcats <- map toCategory <$> Tree.subtreeList categoryTree (categoryId category)
+            storagePerform storage (CategoryList (ListView 0 maxBound [FilterCategoryTransitiveParentId (categoryId category)] []))
                 `shouldReturn`
-                Right subcatList
-            doStorage storage (CategoryList (ListView 0 maxBound [FilterCategoryTransitiveParentId categoryRef] [(OrderCategoryName, Ascending)]))
+                Right (sortOn categoryId transitiveSubcats)
+            storagePerform storage (CategoryList (ListView 0 maxBound [FilterCategoryTransitiveParentId (categoryId category)] [(OrderCategoryName, Ascending)]))
                 `shouldReturn`
-                Right (sortOn categoryName subcatList)
-            someSubcats <- generate $ chooseFrom 2 $ Set.elems subcatSet
+                Right (sortOn (\cat -> (categoryName cat, categoryId cat)) transitiveSubcats)
+            someSubcats <- generate $ chooseFrom 2 transitiveSubcats
             parallelFor_ someSubcats $ \subcat -> do
-                doStorage storage (CategorySetParent categoryRef subcat) `shouldReturn` Left InvalidRequestError
+                storagePerform storage (CategorySetParent (categoryId category) (categoryId subcat))
+                    `shouldReturn`
+                    Left InvalidRequestError
     return ()
 
 validateCategories
-    :: Storage
-    -> IORef (Tree.Tree (Reference Category) Text.Text)
+    :: HasCallStack
+    => Storage
+    -> Tree.Tree (Reference Category) Text.Text
     -> IO ()
-validateCategories storage categoryTable = do
-    categoryList <- toCategoryList <$> readIORef categoryTable
-    doStorage storage (CategoryList (ListView 0 maxBound [] []))
+validateCategories storage categoryTree = do
+    categoryList <- sortOn categoryId . map toCategory <$> Tree.toList categoryTree
+    storagePerform storage (CategoryList (ListView 0 maxBound [] []))
         `shouldReturn`
         Right categoryList
 
-toCategoryList :: Tree.Tree (Reference Category) Text.Text -> [Category]
-toCategoryList = Tree.foldr
-    (\ref name parent rest -> Category ref name parent : rest)
-    []
-
-lookupCategory :: Tree.Tree (Reference Category) Text.Text -> Reference Category -> Category
-lookupCategory tree ref = case Tree.lookup ref tree of
-    Nothing -> error "invalid category id"
-    Just (name, parent) -> Category ref name parent
+toCategory :: (Reference Category, Text.Text, Reference Category) -> Category
+toCategory (ref, name, parent) = Category ref name parent
 
 generateArticles
     :: Storage -> Int
-    -> IORef (Map.Map (Reference User) User)
-    -> IORef (Map.Map (Reference Author) Author)
-    -> IORef (Bimap.Bimap (Reference User) (Reference Author))
-    -> IORef (Tree.Tree (Reference Category) Text.Text)
-    -> IO (IORef (Map.Map (Reference Article) Article))
-generateArticles storage sampleSize userTable authorTable userAuthorConnSet categoryTable = do
-    authorRefs <- Map.keys <$> readIORef authorTable
-    categoryRefs <- Tree.keys <$> readIORef categoryTable
-    articleTable <- newIORef Map.empty
+    -> Map.Map (Reference Author) Author
+    -> Tree.Tree (Reference Category) Text.Text
+    -> IO (Map.Map (Reference Article) Article)
+generateArticles storage sampleSize authorTable categoryTree = do
+    articleTable <- Map.new
+    authorRefs <- Map.keys authorTable
+    categoryRefs <- Tree.keys categoryTree
     parallelFor_ [1 .. sampleSize] $ \_ -> do
-        [authorRef] <- generate $ chooseFrom 1 authorRefs
-        article <- assertRight =<< doStorage storage (ArticleCreate authorRef)
+        authorRef <- generate $ chooseOne authorRefs
+        article <- assertRight =<< storagePerform storage (ArticleCreate authorRef)
         articleAuthor article `shouldBe` authorRef
         articleName article `shouldBe` ""
         articleText article `shouldBe` ""
         articlePublicationStatus article `shouldBe` NonPublished
-        articleCategory article `shouldBe` Reference ""
+        articleCategory article `shouldBe` ""
         let version1 = articleVersion article
         name <- generate $ randomText
-        version2 <- assertRight =<< doStorage storage (ArticleSetName (articleId article) version1 name)
+        version2 <- assertRight =<< storagePerform storage (ArticleSetName (articleId article) version1 name)
         text <- generate $ randomText
-        version3 <- assertRight =<< doStorage storage (ArticleSetText (articleId article) version2 text)
+        version3 <- assertRight =<< storagePerform storage (ArticleSetText (articleId article) version2 text)
         category <- byChance 3 5
             (do
-                [category] <- generate $ chooseFrom 1 categoryRefs
-                assertRight =<< doStorage storage (ArticleSetCategory (articleId article) category)
+                category <- generate $ chooseOne categoryRefs
+                assertRight =<< storagePerform storage (ArticleSetCategory (articleId article) category)
                 return category)
-            (return $ Reference "")
+            (return "")
         pubStatus <- byChance 3 5
             (do
                 pubStatus <- generate $ PublishAt <$> randomTime
-                assertRight =<< doStorage storage (ArticleSetPublicationStatus (articleId article) pubStatus)
+                assertRight =<< storagePerform storage (ArticleSetPublicationStatus (articleId article) pubStatus)
                 return pubStatus)
             (return NonPublished)
-        atomicModifyIORef_ articleTable $ Map.insert (articleId article) $
+        Map.insert articleTable (articleId article) $
             article
                 { articleVersion = version3
                 , articleName = name
@@ -692,465 +672,488 @@ generateArticles storage sampleSize userTable authorTable userAuthorConnSet cate
                 , articleCategory = category
                 , articlePublicationStatus = pubStatus
                 }
-    validateArticles storage articleTable
     return articleTable
 
 minceArticles
     :: Storage -> Int
-    -> IORef (Map.Map (Reference User) User)
-    -> IORef (Map.Map (Reference Author) Author)
-    -> IORef (Bimap.Bimap (Reference User) (Reference Author))
-    -> IORef (Tree.Tree (Reference Category) Text.Text)
-    -> IORef (Map.Map (Reference Article) Article)
+    -> Map.Map (Reference User) User
+    -> Map.Map (Reference Author) Author
+    -> Relmap.Relmap (Reference User) (Reference Author)
+    -> Tree.Tree (Reference Category) Text.Text
+    -> Map.Map (Reference Article) Article
     -> IO ()
-minceArticles storage sampleSize userTable authorTable userAuthorConnSet categoryTable articleTable = do
-    authorRefs <- Map.keys <$> readIORef authorTable
-    categoryRefs <- Tree.keys <$> readIORef categoryTable
+minceArticles storage sampleSize userTable authorTable userAuthorConnSet categoryTree articleTable = do
+    validateArticles storage articleTable
     do
-        articleList <- Map.elems <$> readIORef articleTable
+        authorRefs <- Map.keys authorTable
+        articleList <- Map.elems articleTable
         toAlter <- generate $ chooseFrom (sampleSize `div` 5) articleList
         parallelFor_ toAlter $ \article -> do
-            [authorRef] <- generate $ chooseFrom 1 authorRefs
-            assertRight =<< doStorage storage (ArticleSetAuthor (articleId article) authorRef)
-            atomicModifyIORef_ articleTable $ Map.insert (articleId article) $
+            authorRef <- generate $ chooseOne authorRefs
+            assertRight =<< storagePerform storage (ArticleSetAuthor (articleId article) authorRef)
+            Map.insert articleTable (articleId article) $
                 article {articleAuthor = authorRef}
         validateArticles storage articleTable
     do
-        articleList <- Map.elems <$> readIORef articleTable
+        articleList <- Map.elems articleTable
         toAlter <- generate $ chooseFrom (sampleSize `div` 5) articleList
         parallelFor_ toAlter $ \article -> do
             name <- generate $ randomText
-            version <- assertRight =<< doStorage storage
+            version2 <- assertRight =<< storagePerform storage
                 (ArticleSetName (articleId article) (articleVersion article) name)
-            atomicModifyIORef_ articleTable $ Map.insert (articleId article) $
-                article {articleName = name, articleVersion = version}
+            Map.insert articleTable (articleId article) $
+                article {articleName = name, articleVersion = version2}
         validateArticles storage articleTable
     do
-        articleList <- Map.elems <$> readIORef articleTable
+        articleList <- Map.elems articleTable
         toAlter <- generate $ chooseFrom (sampleSize `div` 5) articleList
         parallelFor_ toAlter $ \article -> do
             text <- generate $ randomText
-            version <- assertRight =<< doStorage storage
+            version2 <- assertRight =<< storagePerform storage
                 (ArticleSetText (articleId article) (articleVersion article) text)
-            atomicModifyIORef_ articleTable $ Map.insert (articleId article) $
-                article {articleText = text, articleVersion = version}
+            Map.insert articleTable (articleId article) $
+                article {articleText = text, articleVersion = version2}
         validateArticles storage articleTable
     do
-        articleList <- Map.elems <$> readIORef articleTable
+        articleList <- Map.elems articleTable
         toAlter <- generate $ chooseFrom (sampleSize `div` 5) articleList
         parallelFor_ toAlter $ \article -> do
             pubStatus <- byChance 3 5
                 (generate $ PublishAt <$> randomTime)
                 (return NonPublished)
-            assertRight =<< doStorage storage (ArticleSetPublicationStatus (articleId article) pubStatus)
-            atomicModifyIORef_ articleTable $ Map.insert (articleId article) $
+            assertRight =<< storagePerform storage (ArticleSetPublicationStatus (articleId article) pubStatus)
+            Map.insert articleTable (articleId article) $
                 article {articlePublicationStatus = pubStatus}
         validateArticles storage articleTable
     do
-        articleList <- Map.elems <$> readIORef articleTable
+        categoryRefs <- Tree.keys categoryTree
+        articleList <- Map.elems articleTable
         toAlter <- generate $ chooseFrom (sampleSize `div` 5) articleList
         parallelFor_ toAlter $ \article -> do
             category <- byChance 3 5
-                (generate $ head <$> chooseFrom 1 categoryRefs)
-                (return $ Reference "")
-            assertRight =<< doStorage storage (ArticleSetCategory (articleId article) category)
-            atomicModifyIORef_ articleTable $ Map.insert (articleId article) $
+                (generate $ chooseOne categoryRefs)
+                (return "")
+            assertRight =<< storagePerform storage (ArticleSetCategory (articleId article) category)
+            Map.insert articleTable (articleId article) $
                 article {articleCategory = category}
         validateArticles storage articleTable
     do
-        articleList <- Map.elems <$> readIORef articleTable
+        articleList <- Map.elems articleTable
         toDelete <- generate $ chooseFrom (sampleSize `div` 5) articleList
         parallelFor_ toDelete $ \article -> do
-            assertRight =<< doStorage storage (ArticleDelete (articleId article))
-            atomicModifyIORef_ articleTable $ Map.delete (articleId article)
+            assertRight =<< storagePerform storage (ArticleDelete (articleId article))
+            Map.delete articleTable (articleId article)
         validateArticles storage articleTable
     do
-        articleMap <- readIORef articleTable
-        let articleList = Map.elems articleMap
+        articleList <- Map.elems articleTable
         parallelFor_ articleList $ \article -> do
             badVersion <- generate $ randomVersion `suchThat` (/= articleVersion article)
-            doStorage storage (ArticleSetName (articleId article) badVersion "foo") `shouldReturn` Left VersionError
-            doStorage storage (ArticleSetText (articleId article) badVersion "bar") `shouldReturn` Left VersionError
-        badRefs <- generate $
-            replicateM 20 $
-                randomReference `suchThat` (\ref -> not (Map.member ref articleMap))
+            storagePerform storage (ArticleSetName (articleId article) badVersion "foo") `shouldReturn` Left VersionError
+            storagePerform storage (ArticleSetText (articleId article) badVersion "bar") `shouldReturn` Left VersionError
+        badRefs <- sampleBadRefs $ Map.member articleTable
         parallelFor_ badRefs $ \ref -> do
-            doStorage storage (ArticleSetAuthor ref (Reference "")) `shouldReturn` Left NotFoundError
-            doStorage storage (ArticleSetName ref (Version "") "foo") `shouldReturn` Left NotFoundError
-            doStorage storage (ArticleSetText ref (Version "") "bar") `shouldReturn` Left NotFoundError
-            doStorage storage (ArticleSetCategory ref (Reference "")) `shouldReturn` Left NotFoundError
-            doStorage storage (ArticleSetPublicationStatus ref NonPublished) `shouldReturn` Left NotFoundError
-            doStorage storage (ArticleDelete ref) `shouldReturn` Left NotFoundError
-            doStorage storage (ArticleList True (ListView 0 1 [FilterArticleId ref] []))
+            storagePerform storage (ArticleSetAuthor ref "") `shouldReturn` Left NotFoundError
+            storagePerform storage (ArticleSetName ref "" "foo") `shouldReturn` Left NotFoundError
+            storagePerform storage (ArticleSetText ref "" "bar") `shouldReturn` Left NotFoundError
+            storagePerform storage (ArticleSetCategory ref "") `shouldReturn` Left NotFoundError
+            storagePerform storage (ArticleSetPublicationStatus ref NonPublished) `shouldReturn` Left NotFoundError
+            storagePerform storage (ArticleDelete ref) `shouldReturn` Left NotFoundError
+            storagePerform storage (ArticleList True (ListView 0 1 [FilterArticleId ref] []))
                 `shouldReturn`
                 Right []
     do
+        authorRefs <- Map.keys authorTable
         authorsToDelete <- generate $ chooseFrom (sampleSize `div` 5) authorRefs
         parallelFor_ authorsToDelete $ \authorRef -> do
-            assertRight =<< doStorage storage (AuthorDelete authorRef)
-            atomicModifyIORef_ authorTable $ Map.delete authorRef
-            atomicModifyIORef_ userAuthorConnSet $ Bimap.removeRight authorRef
-        atomicModifyIORef_ articleTable $ Map.mapMaybe $ \article ->
+            assertRight =<< storagePerform storage (AuthorDelete authorRef)
+            Map.delete authorTable authorRef
+            Relmap.removeRight userAuthorConnSet authorRef
+        articleList <- Map.elems articleTable
+        parallelFor_ articleList $ \article -> do
             if articleAuthor article `elem` authorsToDelete
                 then case articlePublicationStatus article of
-                    PublishAt _ -> Just $ article {articleAuthor = Reference ""}
-                    NonPublished -> Nothing
-                else Just article
+                    PublishAt _ -> Map.insert articleTable (articleId article) $
+                        article {articleAuthor = ""}
+                    NonPublished -> Map.delete articleTable (articleId article)
+                else return ()
         validateArticles storage articleTable
     do
-        categoryList <- toCategoryList <$> readIORef categoryTable
+        categoryList <- map toCategory <$> Tree.toList categoryTree
         categoriesToDelete <- generate $ chooseFrom (sampleSize `div` 5) categoryList
         parallelFor_ categoriesToDelete $ \category -> do
-            assertRight =<< doStorage storage (CategoryDelete (categoryId category))
-            Just parentRef <- atomicModifyIORef' categoryTable $ swap . Tree.exclude (categoryId category)
-            atomicModifyIORef_ articleTable $ Map.map $ \article ->
+            assertRight =<< storagePerform storage (CategoryDelete (categoryId category))
+            Just parentRef <- Tree.exclude categoryTree (categoryId category)
+            Map.modify articleTable $ \article ->
                 if articleCategory article == categoryId category
-                    then article {articleCategory = parentRef}
-                    else article
+                    then Just article {articleCategory = parentRef}
+                    else Nothing
         validateArticles storage articleTable
     do
-        articleList <- Map.elems <$> readIORef articleTable
+        articleList <- sortOn articleId <$> Map.elems articleTable
         parallelFor_ articleList $ \article -> do
-            doStorage storage (ArticleList True (ListView 0 1 [FilterArticleId (articleId article)] []))
+            storagePerform storage (ArticleList True (ListView 0 1 [FilterArticleId (articleId article)] []))
                 `shouldReturn`
                 Right [article]
-            doStorage storage (ArticleList False (ListView 0 1 [FilterArticleId (articleId article)] []))
+            storagePerform storage (ArticleList False (ListView 0 1 [FilterArticleId (articleId article)] []))
                 `shouldReturn`
                 Right [article | articlePublicationStatus article >= PublishAt timeGenBase]
-        parallelFor_ (Reference "" : authorRefs) $ \authorRef -> do
-            doStorage storage (ArticleList True (ListView 0 maxBound [FilterArticleAuthorId authorRef] []))
+        authorRefs <- Map.keys authorTable
+        parallelFor_ ("" : authorRefs) $ \authorRef -> do
+            storagePerform storage (ArticleList True (ListView 0 maxBound [FilterArticleAuthorId authorRef] []))
                 `shouldReturn`
                 Right (filter (\article -> articleAuthor article == authorRef) articleList)
-        userAuthorConns <- readIORef userAuthorConnSet
-        let userAuthorList = (Reference "", Set.singleton (Reference ""))
-                : Map.toList (Bimap.left userAuthorConns)
-        parallelFor_ userAuthorList $ \(userRef, authorSet) -> do
-            doStorage storage (ArticleList True (ListView 0 maxBound [FilterArticleUserId userRef] []))
+        userAuthorGroups <- Multimap.toGroupsWith (Relmap.left userAuthorConnSet) userTable
+        parallelFor_ userAuthorGroups $ \(userRef, userAuthors) -> do
+            storagePerform storage (ArticleList True (ListView 0 maxBound [FilterArticleUserId userRef] []))
                 `shouldReturn`
-                Right (filter (\article -> articleAuthor article `Set.member` authorSet) articleList)
-        categoryTree <- readIORef categoryTable
-        let transitiveSubcategories = Tree.descendantMap categoryTree
-        let subcategoryList = (Reference "", Set.singleton $ Reference "") : Map.toList transitiveSubcategories
-        parallelFor_ subcategoryList $ \(categoryRef, subcatSet) -> do
-            doStorage storage (ArticleList True (ListView 0 maxBound [FilterArticleCategoryId categoryRef] []))
+                Right (filter (\article -> articleAuthor article `elem` userAuthors) articleList)
+        authorUserGroups <- Multimap.toGroupsWith (Relmap.right userAuthorConnSet) authorTable
+        let orphanAuthors = "" : map fst (filter (null . snd) authorUserGroups)
+        storagePerform storage (ArticleList True (ListView 0 maxBound [FilterArticleUserId ""] []))
+            `shouldReturn`
+            Right (filter (\article -> articleAuthor article `elem` orphanAuthors) articleList)
+        categoryRefs <- Tree.keys categoryTree
+        parallelFor_ ("" : categoryRefs) $ \categoryRef -> do
+            storagePerform storage (ArticleList True (ListView 0 maxBound [FilterArticleCategoryId categoryRef] []))
                 `shouldReturn`
                 Right (filter (\article -> articleCategory article == categoryRef) articleList)
-            doStorage storage (ArticleList True (ListView 0 maxBound [FilterArticleTransitiveCategoryId categoryRef] []))
-                `shouldReturn`
-                Right (filter (\article -> articleCategory article `Set.member` subcatSet) articleList)
+            case categoryRef of
+                "" -> do
+                    storagePerform storage (ArticleList True (ListView 0 maxBound [FilterArticleTransitiveCategoryId categoryRef] []))
+                        `shouldReturn`
+                        Right (filter (\article -> articleCategory article == "") articleList)
+                _ -> do
+                    subcatRefs <- map (\(k, _, _) -> k) <$> Tree.subtreeList categoryTree categoryRef
+                    storagePerform storage (ArticleList True (ListView 0 maxBound [FilterArticleTransitiveCategoryId categoryRef] []))
+                        `shouldReturn`
+                        Right (filter (\article -> articleCategory article `elem` subcatRefs) articleList)
         let timeA = addUTCTime (86400 * (-500)) timeGenBase
         let timeB = addUTCTime (86400 * (365 * 10 + 500)) timeGenBase
-        doStorage storage (ArticleList True (ListView 0 maxBound [FilterArticlePublishedBefore timeB] []))
+        storagePerform storage (ArticleList True (ListView 0 maxBound [FilterArticlePublishedBefore timeB] []))
             `shouldReturn`
             Right (filter (publishedBefore timeB) articleList)
-        doStorage storage (ArticleList False (ListView 0 maxBound [FilterArticlePublishedBefore timeB] []))
+        storagePerform storage (ArticleList False (ListView 0 maxBound [FilterArticlePublishedBefore timeB] []))
             `shouldReturn`
             Right (filter (publishedBefore timeGenBase) articleList)
-        doStorage storage (ArticleList True (ListView 0 maxBound [FilterArticlePublishedAfter timeA] []))
+        storagePerform storage (ArticleList True (ListView 0 maxBound [FilterArticlePublishedAfter timeA] []))
             `shouldReturn`
             Right (filter (publishedAfter timeA) articleList)
-        doStorage storage (ArticleList False (ListView 0 maxBound [FilterArticlePublishedAfter timeA] []))
+        storagePerform storage (ArticleList False (ListView 0 maxBound [FilterArticlePublishedAfter timeA] []))
             `shouldReturn`
             Right (filter (publishedWithin timeA timeGenBase) articleList)
-        doStorage storage (ArticleList True (ListView 0 maxBound [FilterArticlePublishedAfter timeA, FilterArticlePublishedBefore timeB] []))
+        storagePerform storage (ArticleList True (ListView 0 maxBound [FilterArticlePublishedAfter timeA, FilterArticlePublishedBefore timeB] []))
             `shouldReturn`
             Right (filter (publishedWithin timeA timeB) articleList)
-        doStorage storage (ArticleList False (ListView 0 maxBound [FilterArticlePublishedAfter timeA, FilterArticlePublishedBefore timeB] []))
+        storagePerform storage (ArticleList False (ListView 0 maxBound [FilterArticlePublishedAfter timeA, FilterArticlePublishedBefore timeB] []))
             `shouldReturn`
             Right (filter (publishedWithin timeA timeGenBase) articleList)
-        doStorage storage (ArticleList True (ListView 0 maxBound [] [(OrderArticleName, Ascending)]))
+        storagePerform storage (ArticleList True (ListView 0 maxBound [] [(OrderArticleName, Ascending)]))
             `shouldReturn`
             Right (sortOn articleName articleList)
-        doStorage storage (ArticleList True (ListView 0 maxBound [] [(OrderArticleDate, Ascending)]))
+        storagePerform storage (ArticleList True (ListView 0 maxBound [] [(OrderArticleDate, Ascending)]))
             `shouldReturn`
             Right (sortOn articlePublicationStatus articleList)
-        authorMap <- readIORef authorTable
-        doStorage storage (ArticleList True (ListView 0 maxBound [] [(OrderArticleAuthorName, Ascending)]))
+        articleAuthorNameList <- parallelFor articleList $ \article -> do
+            case articleAuthor article of
+                "" -> return Nothing
+                _ -> do
+                    author <- Map.lookup' authorTable (articleAuthor article)
+                    return $ Just $ authorName author
+        let articleListByAuthorName = sortOnList articleList articleAuthorNameList
+        storagePerform storage (ArticleList True (ListView 0 maxBound [] [(OrderArticleAuthorName, Ascending)]))
             `shouldReturn`
-            Right (sortOn (articleAuthorName authorMap) articleList)
-        doStorage storage (ArticleList True (ListView 0 maxBound [] [(OrderArticleCategoryName, Ascending)]))
+            Right articleListByAuthorName
+        articleCategoryNameList <- parallelFor articleList $ \article -> do
+            case articleCategory article of
+                "" -> return Nothing
+                _ -> do
+                    (_, name, _) <- Tree.lookup' categoryTree (articleCategory article)
+                    return $ Just name
+        let articleListByCategoryName = sortOnList articleList articleCategoryNameList
+        storagePerform storage (ArticleList True (ListView 0 maxBound [] [(OrderArticleCategoryName, Ascending)]))
             `shouldReturn`
-            Right (sortOn (articleCategoryName categoryTree) articleList)
+            Right articleListByCategoryName
     return ()
   where
     publishedBefore ta article = articlePublicationStatus article >= PublishAt ta
     publishedAfter ta article = articlePublicationStatus article <= PublishAt ta
     publishedWithin ta tb article = publishedAfter ta article && publishedBefore tb article
-    articleAuthorName authorMap article = authorName <$> Map.lookup (articleAuthor article) authorMap
-    articleCategoryName categoryTree article = case Tree.lookup (articleCategory article) categoryTree of
-        Just (catName, _) -> Just catName
-        Nothing -> Nothing
+    sortOnList as bs = map fst $ sortOn snd $ zip as bs
 
+validateArticles
+    :: HasCallStack
+    => Storage
+    -> Map.Map (Reference Article) Article
+    -> IO ()
 validateArticles storage articleTable = do
-    articleList <- Map.elems <$> readIORef articleTable
-    doStorage storage (ArticleList True (ListView 0 maxBound [] []))
+    articleList <- sortOn articleId <$> Map.elems articleTable
+    storagePerform storage (ArticleList True (ListView 0 maxBound [] []))
         `shouldReturn`
         Right articleList
-    doStorage storage (ArticleList False (ListView 0 maxBound [] []))
+    storagePerform storage (ArticleList False (ListView 0 maxBound [] []))
         `shouldReturn`
         Right (filter (\article -> articlePublicationStatus article >= PublishAt timeGenBase) articleList)
 
 generateTags
     :: Storage -> Int
-    -> IO (IORef (Map.Map (Reference Tag) Tag))
+    -> IO (Map.Map (Reference Tag) Tag)
 generateTags storage sampleSize = do
-    tagTable <- newIORef Map.empty
+    tagTable <- Map.new
     parallelFor_ [1 .. sampleSize] $ \_ -> do
         name <- generate $ randomText
-        tag <- assertRight =<< doStorage storage (TagCreate name)
+        tag <- assertRight =<< storagePerform storage (TagCreate name)
         tagName tag `shouldBe` name
-        atomicModifyIORef_ tagTable $ Map.insert (tagId tag) tag
-    validateTags storage tagTable
+        Map.insert tagTable (tagId tag) tag
     return tagTable
 
 minceTags
     :: Storage -> Int
-    -> IORef (Map.Map (Reference Tag) Tag)
+    -> Map.Map (Reference Tag) Tag
     -> IO ()
 minceTags storage sampleSize tagTable = do
+    validateTags storage tagTable
     do
-        tagList <- Map.elems <$> readIORef tagTable
+        tagList <- Map.elems tagTable
         toAlter <- generate $ chooseFrom (sampleSize `div` 5) tagList
         parallelFor_ toAlter $ \tag -> do
             name <- generate $ randomText
-            assertRight =<< doStorage storage (TagSetName (tagId tag) name)
-            atomicModifyIORef_ tagTable $ Map.insert (tagId tag) $
+            assertRight =<< storagePerform storage (TagSetName (tagId tag) name)
+            Map.insert tagTable (tagId tag) $
                 tag {tagName = name}
         validateTags storage tagTable
     do
-        tagList <- Map.elems <$> readIORef tagTable
+        tagList <- Map.elems tagTable
         toDelete <- generate $ chooseFrom (sampleSize `div` 5) tagList
         parallelFor_ toDelete $ \tag -> do
-            assertRight =<< doStorage storage (TagDelete (tagId tag))
-            atomicModifyIORef_ tagTable $ Map.delete (tagId tag)
+            assertRight =<< storagePerform storage (TagDelete (tagId tag))
+            Map.delete tagTable (tagId tag)
         validateTags storage tagTable
     do
-        tagMap <- readIORef tagTable
-        badRefs <- generate $
-            replicateM 20 $
-                randomReference `suchThat` (\ref -> not (Map.member ref tagMap))
+        badRefs <- sampleBadRefs $ Map.member tagTable
         parallelFor_ badRefs $ \ref -> do
-            doStorage storage (TagSetName ref "foo") `shouldReturn` Left NotFoundError
-            doStorage storage (TagDelete ref) `shouldReturn` Left NotFoundError
-            doStorage storage (TagList (ListView 0 1 [FilterTagId ref] []))
+            storagePerform storage (TagSetName ref "foo") `shouldReturn` Left NotFoundError
+            storagePerform storage (TagDelete ref) `shouldReturn` Left NotFoundError
+            storagePerform storage (TagList (ListView 0 1 [FilterTagId ref] []))
                 `shouldReturn`
                 Right []
     do
-        tagList <- Map.elems <$> readIORef tagTable
+        tagList <- Map.elems tagTable
         parallelFor_ tagList $ \tag -> do
-            doStorage storage (TagList (ListView 0 1 [FilterTagId (tagId tag)] []))
+            storagePerform storage (TagList (ListView 0 1 [FilterTagId (tagId tag)] []))
                 `shouldReturn`
                 Right [tag]
-        doStorage storage (TagList (ListView 0 maxBound [] [(OrderTagName, Ascending)]))
+        storagePerform storage (TagList (ListView 0 maxBound [] [(OrderTagName, Ascending)]))
             `shouldReturn`
-            Right (sortOn tagName tagList)
+            Right (sortOn (\tag -> (tagName tag, tagId tag)) tagList)
     return ()
 
 validateTags
-    :: Storage
-    -> IORef (Map.Map (Reference Tag) Tag)
+    :: HasCallStack
+    => Storage
+    -> Map.Map (Reference Tag) Tag
     -> IO ()
 validateTags storage tagTable = do
-    tagList <- Map.elems <$> readIORef tagTable
-    doStorage storage (TagList (ListView 0 maxBound [] []))
+    tagList <- sortOn tagId <$> Map.elems tagTable
+    storagePerform storage (TagList (ListView 0 maxBound [] []))
         `shouldReturn`
         Right tagList
 
 generateArticleTagRels
     :: Storage -> Int
-    -> IORef (Map.Map (Reference Article) Article)
-    -> IORef (Map.Map (Reference Tag) Tag)
-    -> IO (IORef (Bimap.Bimap (Reference Article) (Reference Tag)))
+    -> Map.Map (Reference Article) Article
+    -> Map.Map (Reference Tag) Tag
+    -> IO (Relmap.Relmap (Reference Article) (Reference Tag))
 generateArticleTagRels storage sampleSize articleTable tagTable = do
-    articleRefs <- Map.keys <$> readIORef articleTable
-    tagRefs <- Map.keys <$> readIORef tagTable
-    connSet <- newIORef $ Bimap.fromKeys articleRefs tagRefs
-    parallelFor_ articleRefs $ \articleRef -> do
-        parallelFor_ tagRefs $ \tagRef -> do
-            byChance 1 3
-                (do
-                    assertRight =<< doStorage storage (ArticleSetTag articleRef tagRef True)
-                    atomicModifyIORef_ connSet $ Bimap.insert (articleRef, tagRef))
-                (return ())
-    validateArticleTagRels storage articleTable tagTable connSet
+    connSet <- Relmap.new
+    sampleSubsetProduct sampleSize articleTable tagTable $ \articleRef tagRef -> do
+        assertRight =<< storagePerform storage (ArticleSetTag articleRef tagRef True)
+        Relmap.insert connSet articleRef tagRef
     return connSet
 
 minceArticleTagRels
     :: Storage -> Int
-    -> IORef (Map.Map (Reference Article) Article)
-    -> IORef (Map.Map (Reference Tag) Tag)
-    -> IORef (Bimap.Bimap (Reference Article) (Reference Tag))
+    -> Map.Map (Reference Article) Article
+    -> Map.Map (Reference Tag) Tag
+    -> Relmap.Relmap (Reference Article) (Reference Tag)
     -> IO ()
 minceArticleTagRels storage sampleSize articleTable tagTable connSet = do
-    articleRefs <- Map.keys <$> readIORef articleTable
-    tagRefs <- Map.keys <$> readIORef tagTable
+    validateArticleTagRels storage articleTable tagTable connSet
     do
-        parallelFor_ articleRefs $ \articleRef -> do
-            parallelFor_ tagRefs $ \tagRef -> do
-                conn <- generate $ randomBool
-                assertRight =<< doStorage storage (ArticleSetTag articleRef tagRef conn)
-                atomicModifyIORef_ connSet $ if conn
-                    then Bimap.insert (articleRef, tagRef)
-                    else Bimap.delete (articleRef, tagRef)
+        sampleSubsetProduct sampleSize articleTable tagTable $ \articleRef tagRef -> do
+            conn <- generate $ randomBool
+            assertRight =<< storagePerform storage (ArticleSetTag articleRef tagRef conn)
+            if conn
+                then Relmap.insert connSet articleRef tagRef
+                else Relmap.delete connSet articleRef tagRef
         validateArticleTagRels storage articleTable tagTable connSet
     do
+        articleTagRels <- Multimap.toList (Relmap.left connSet)
+        parallelFor_ articleTagRels $ \(articleRef, tagRef) -> do
+            conn <- generate $ randomBool
+            assertRight =<< storagePerform storage (ArticleSetTag articleRef tagRef conn)
+            if conn
+                then Relmap.insert connSet articleRef tagRef
+                else Relmap.delete connSet articleRef tagRef
+        validateArticleTagRels storage articleTable tagTable connSet
+    do
+        articleRefs <- Map.keys articleTable
         articlesToDelete <- generate $ chooseFrom (sampleSize `div` 5) articleRefs
         parallelFor_ articlesToDelete $ \articleRef -> do
-            assertRight =<< doStorage storage (ArticleDelete articleRef)
-            atomicModifyIORef_ articleTable $ Map.delete articleRef
-            atomicModifyIORef_ connSet $ Bimap.removeLeft articleRef
+            assertRight =<< storagePerform storage (ArticleDelete articleRef)
+            Map.delete articleTable articleRef
+            Relmap.removeLeft connSet articleRef
         validateArticleTagRels storage articleTable tagTable connSet
     do
+        tagRefs <- Map.keys tagTable
         tagsToDelete <- generate $ chooseFrom (sampleSize `div` 5) tagRefs
         parallelFor_ tagsToDelete $ \tagRef -> do
-            assertRight =<< doStorage storage (TagDelete tagRef)
-            atomicModifyIORef_ tagTable $ Map.delete tagRef
-            atomicModifyIORef_ connSet $ Bimap.removeRight tagRef
+            assertRight =<< storagePerform storage (TagDelete tagRef)
+            Map.delete tagTable tagRef
+            Relmap.removeRight connSet tagRef
         validateArticleTagRels storage articleTable tagTable connSet
     do
-        conns <- readIORef connSet
-        articleMap <- readIORef articleTable
+        tagRefs <- Map.keys tagTable
         parallelFor_ [1..sampleSize] $ \_ -> do
-            sample <- generate $ do
+            tags <- generate $ do
                 n <- randomWithin 1 (sampleSize `div` 5)
-                chooseFrom n (Map.toList $ Bimap.right conns)
-            let tags = map fst sample
-            let articleUnionSet = Set.unions $ map snd sample
-            doStorage storage (ArticleList True (ListView 0 maxBound [FilterArticleTagIds tags] []))
+                chooseFrom n tagRefs
+            articleGroups <- forM tags $ Multimap.lookupAll (Relmap.right connSet)
+            let articleRefsUnion = foldl1' union articleGroups
+            articlesUnion <- parallelFor (sort articleRefsUnion) $ Map.lookup' articleTable
+            storagePerform storage (ArticleList True (ListView 0 maxBound (tagSumFilter tags) []))
                 `shouldReturn`
-                Right (map (articleMap Map.!) $ Set.elems articleUnionSet)
-            let articleIntersectionSet = foldl1' Set.intersection $ map snd sample
-            doStorage storage (ArticleList True (ListView 0 maxBound [FilterArticleTagIds [tag] | tag <- tags] []))
+                Right articlesUnion
+            let articleRefsIntersection = foldl1' intersect articleGroups
+            articlesIntersection <- parallelFor (sort articleRefsIntersection) $ Map.lookup' articleTable
+            storagePerform storage (ArticleList True (ListView 0 maxBound (tagProductFilter tags) []))
                 `shouldReturn`
-                Right (map (articleMap Map.!) $ Set.elems articleIntersectionSet)
+                Right articlesIntersection
     return ()
+  where
+    tagSumFilter tags = [FilterArticleTagIds tags]
+    tagProductFilter tags = map (\tag -> FilterArticleTagIds [tag]) tags
 
 validateArticleTagRels
-    :: Storage
-    -> IORef (Map.Map (Reference Article) Article)
-    -> IORef (Map.Map (Reference Tag) Tag)
-    -> IORef (Bimap.Bimap (Reference Article) (Reference Tag))
+    :: HasCallStack
+    => Storage
+    -> Map.Map (Reference Article) Article
+    -> Map.Map (Reference Tag) Tag
+    -> Relmap.Relmap (Reference Article) (Reference Tag)
     -> IO ()
 validateArticleTagRels storage articleTable tagTable connSet = do
-    articleMap <- readIORef articleTable
-    tagMap <- readIORef tagTable
-    conns <- readIORef connSet
-    parallelFor_ (Map.toList (Bimap.right conns)) $ \(tagRef, articleSet) -> do
-        doStorage storage (ArticleList True (ListView 0 maxBound [FilterArticleTagIds [tagRef]] []))
+    articleTagGroups <- Multimap.toGroupsWith (Relmap.left connSet) articleTable
+    parallelFor_ articleTagGroups $ \(articleRef, articleTags) -> do
+        tagList <- parallelFor (sort articleTags) $ Map.lookup' tagTable
+        storagePerform storage (TagList (ListView 0 maxBound [FilterTagArticleId articleRef] []))
             `shouldReturn`
-            Right (map (articleMap Map.!) $ Set.elems articleSet)
-    parallelFor_ (Map.toList (Bimap.left conns)) $ \(articleRef, tagSet) -> do
-        doStorage storage (TagList (ListView 0 maxBound [FilterTagArticleId articleRef] []))
+            Right tagList
+    tagArticleGroups <- Multimap.toGroupsWith (Relmap.right connSet) tagTable
+    parallelFor_ tagArticleGroups $ \(tagRef, tagArticles) -> do
+        articleList <- parallelFor (sort tagArticles) $ Map.lookup' articleTable
+        storagePerform storage (ArticleList True (ListView 0 maxBound [FilterArticleTagIds [tagRef]] []))
             `shouldReturn`
-            Right (map (tagMap Map.!) $ Set.elems tagSet)
+            Right articleList
 
 generateComments
     :: Storage -> Int
-    -> IORef (Map.Map (Reference User) User)
-    -> IORef (Map.Map (Reference Article) Article)
-    -> IO (IORef (Map.Map (Reference Comment) Comment))
+    -> Map.Map (Reference User) User
+    -> Map.Map (Reference Article) Article
+    -> IO (Map.Map (Reference Comment) Comment)
 generateComments storage sampleSize userTable articleTable = do
-    userRefs <- Map.keys <$> readIORef userTable
-    articleRefs <- Map.keys <$> readIORef articleTable
-    commentTable <- newIORef $ Map.empty
-    parallelFor_ userRefs $ \userRef -> do
-        parallelFor_ articleRefs $ \articleRef -> do
-            byChance 1 3
-                (do
-                    text <- generate $ randomText
-                    comment <- assertRight =<< doStorage storage (CommentCreate articleRef userRef text)
-                    commentArticle comment `shouldBe` articleRef
-                    commentUser comment `shouldBe` userRef
-                    commentText comment `shouldBe` text
-                    commentEditDate comment `shouldBe` Nothing
-                    atomicModifyIORef_ commentTable $ Map.insert (commentId comment) comment)
-                (return ())
-    validateComments storage commentTable
+    commentTable <- Map.new
+    sampleSubsetProduct sampleSize userTable articleTable $ \userRef articleRef -> do
+        text <- generate $ randomText
+        comment <- assertRight =<< storagePerform storage (CommentCreate articleRef userRef text)
+        commentArticle comment `shouldBe` articleRef
+        commentUser comment `shouldBe` userRef
+        commentText comment `shouldBe` text
+        commentEditDate comment `shouldBe` Nothing
+        Map.insert commentTable (commentId comment) comment
     return commentTable
 
 minceComments
     :: Storage -> Int
-    -> IORef (Map.Map (Reference User) User)
-    -> IORef (Map.Map (Reference Article) Article)
-    -> IORef (Map.Map (Reference Comment) Comment)
+    -> Map.Map (Reference User) User
+    -> Map.Map (Reference Article) Article
+    -> Map.Map (Reference Comment) Comment
     -> IO ()
 minceComments storage sampleSize userTable articleTable commentTable = do
+    validateComments storage commentTable
     do
-        commentList <- Map.elems <$> readIORef commentTable
-        parallelFor_ commentList $ \comment -> do
-            byChance 1 3
-                (do
-                    text <- generate $ randomText
-                    assertRight =<< doStorage storage (CommentSetText (commentId comment) text)
-                    Right [comment2] <- doStorage storage (CommentList (ListView 0 1 [FilterCommentId (commentId comment)] []))
-                    commentId comment2 `shouldBe` commentId comment
-                    commentArticle comment2 `shouldBe` commentArticle comment
-                    commentUser comment2 `shouldBe` commentUser comment
-                    commentText comment2 `shouldBe` text
-                    commentDate comment2 `shouldBe` commentDate comment
-                    commentEditDate comment2 `shouldSatisfy` isJust
-                    commentEditDate comment2 `shouldSatisfy` \(Just editDate) -> editDate >= commentDate comment
-                    atomicModifyIORef_ commentTable $ Map.insert (commentId comment) comment2)
-                (return ())
+        commentList <- Map.elems commentTable
+        toAlter <- generate $ chooseFrom (sampleSize `div` 5) commentList
+        parallelFor_ toAlter $ \comment -> do
+            text <- generate $ randomText
+            assertRight =<< storagePerform storage (CommentSetText (commentId comment) text)
+            Right [comment2] <- storagePerform storage (CommentList (ListView 0 1 [FilterCommentId (commentId comment)] []))
+            commentId comment2 `shouldBe` commentId comment
+            commentArticle comment2 `shouldBe` commentArticle comment
+            commentUser comment2 `shouldBe` commentUser comment
+            commentText comment2 `shouldBe` text
+            commentDate comment2 `shouldBe` commentDate comment
+            commentEditDate comment2 `shouldSatisfy` isJust
+            commentEditDate comment2 `shouldSatisfy` \(Just editDate) -> editDate >= commentDate comment
+            Map.insert commentTable (commentId comment) comment2
         validateComments storage commentTable
     do
-        commentList <- Map.elems <$> readIORef commentTable
+        commentList <- Map.elems commentTable
         toDelete <- generate $ chooseFrom (sampleSize `div` 5) commentList
         parallelFor_ toDelete $ \comment -> do
-            assertRight =<< doStorage storage (CommentDelete (commentId comment))
-            atomicModifyIORef_ commentTable $ Map.delete (commentId comment)
+            assertRight =<< storagePerform storage (CommentDelete (commentId comment))
+            Map.delete commentTable (commentId comment)
         validateComments storage commentTable
     do
-        userRefs <- Map.keys <$> readIORef userTable
+        userRefs <- Map.keys userTable
         usersToDelete <- generate $ chooseFrom (sampleSize `div` 5) userRefs
         parallelFor_ usersToDelete $ \userRef -> do
-            assertRight =<< doStorage storage (UserDelete userRef)
-            atomicModifyIORef_ userTable $ Map.delete userRef
-            atomicModifyIORef_ commentTable $ Map.map $ \comment -> do
-                if commentUser comment == userRef
-                    then comment {commentUser = Reference ""}
-                    else comment
+            assertRight =<< storagePerform storage (UserDelete userRef)
+            Map.delete userTable userRef
+        commentList <- Map.elems commentTable
+        parallelFor_ commentList $ \comment -> do
+            if commentUser comment `elem` usersToDelete
+                then Map.insert commentTable (commentId comment) $ comment {commentUser = ""}
+                else return ()
         validateComments storage commentTable
     do
-        articleRefs <- Map.keys <$> readIORef articleTable
+        articleRefs <- Map.keys articleTable
         articlesToDelete <- generate $ chooseFrom (sampleSize `div` 5) articleRefs
         parallelFor_ articlesToDelete $ \articleRef -> do
-            assertRight =<< doStorage storage (ArticleDelete articleRef)
-            atomicModifyIORef_ articleTable $ Map.delete articleRef
-            atomicModifyIORef_ commentTable $ Map.filter $ \comment ->
-                commentArticle comment /= articleRef
+            assertRight =<< storagePerform storage (ArticleDelete articleRef)
+            Map.delete articleTable articleRef
+        commentList <- Map.elems commentTable
+        parallelFor_ commentList $ \comment -> do
+            if commentArticle comment `elem` articlesToDelete
+                then Map.delete commentTable (commentId comment)
+                else return ()
         validateComments storage commentTable
     do
-        commentMap <- readIORef commentTable
-        badRefs <- generate $
-            replicateM 20 $
-                randomReference `suchThat` (\ref -> not (Map.member ref commentMap))
+        badRefs <- sampleBadRefs $ Map.member commentTable
         parallelFor_ badRefs $ \ref -> do
-            doStorage storage (CommentSetText ref "foo") `shouldReturn` Left NotFoundError
-            doStorage storage (CommentDelete ref) `shouldReturn` Left NotFoundError
-            doStorage storage (CommentList (ListView 0 1 [FilterCommentId ref] []))
+            storagePerform storage (CommentSetText ref "foo") `shouldReturn` Left NotFoundError
+            storagePerform storage (CommentDelete ref) `shouldReturn` Left NotFoundError
+            storagePerform storage (CommentList (ListView 0 1 [FilterCommentId ref] []))
                 `shouldReturn`
                 Right []
     do
-        userRefs <- Map.keys <$> readIORef userTable
-        articleRefs <- Map.keys <$> readIORef articleTable
-        commentList <- Map.elems <$> readIORef commentTable
+        userRefs <- Map.keys userTable
+        articleRefs <- Map.keys articleTable
+        commentList <- sortOn commentId <$> Map.elems commentTable
         parallelFor_ commentList $ \comment -> do
-            doStorage storage (CommentList (ListView 0 1 [FilterCommentId (commentId comment)] []))
+            storagePerform storage (CommentList (ListView 0 1 [FilterCommentId (commentId comment)] []))
                 `shouldReturn`
                 Right [comment]
-        parallelFor_ (Reference "" : userRefs) $ \userRef -> do
-            doStorage storage (CommentList (ListView 0 maxBound [FilterCommentUserId userRef] []))
+        parallelFor_ ("" : userRefs) $ \userRef -> do
+            storagePerform storage (CommentList (ListView 0 maxBound [FilterCommentUserId userRef] []))
                 `shouldReturn`
                 Right (filter (isOfUser userRef) commentList)
-            doStorage storage (CommentList (ListView 0 maxBound [FilterCommentUserId userRef] [(OrderCommentDate, Ascending)]))
+            storagePerform storage (CommentList (ListView 0 maxBound [FilterCommentUserId userRef] [(OrderCommentDate, Ascending)]))
                 `shouldReturn`
                 Right (sortOn (Down . commentDate) $ filter (isOfUser userRef) commentList)
         parallelFor_ articleRefs $ \articleRef -> do
-            doStorage storage (CommentList (ListView 0 maxBound [FilterCommentArticleId articleRef] []))
+            storagePerform storage (CommentList (ListView 0 maxBound [FilterCommentArticleId articleRef] []))
                 `shouldReturn`
                 Right (filter (isOfArticle articleRef) commentList)
-            doStorage storage (CommentList (ListView 0 maxBound [FilterCommentArticleId articleRef] [(OrderCommentDate, Ascending)]))
+            storagePerform storage (CommentList (ListView 0 maxBound [FilterCommentArticleId articleRef] [(OrderCommentDate, Ascending)]))
                 `shouldReturn`
                 Right (sortOn (Down . commentDate) $ filter (isOfArticle articleRef) commentList)
     return ()
@@ -1159,11 +1162,171 @@ minceComments storage sampleSize userTable articleTable commentTable = do
     isOfArticle articleRef comment = commentArticle comment == articleRef
 
 validateComments
-    :: Storage
-    -> IORef (Map.Map (Reference Comment) Comment)
+    :: HasCallStack
+    => Storage
+    -> Map.Map (Reference Comment) Comment
     -> IO ()
 validateComments storage commentTable = do
-    commentList <- Map.elems <$> readIORef commentTable
-    doStorage storage (CommentList (ListView 0 maxBound [] []))
+    commentList <- sortOn commentId <$> Map.elems commentTable
+    storagePerform storage (CommentList (ListView 0 maxBound [] []))
         `shouldReturn`
         Right commentList
+
+generateFiles
+    :: Storage -> Int
+    -> Map.Map (Reference User) User
+    -> Map.Map (Reference Article) Article
+    -> IO (Map.Map (Reference FileInfo) (FileInfo, LBS.ByteString))
+generateFiles storage sampleSize userTable articleTable = do
+    fileTable <- Map.new
+    sampleSubsetProduct sampleSize userTable articleTable $ \userRef articleRef -> do
+        name <- generate randomText
+        mimeType <- generate randomText
+        chunks <- do
+            chunkCount <- generate $ randomWithin 1 sampleSize
+            replicateM chunkCount $ do
+                len <- generate $ randomWithin 1 sampleSize
+                generate $ randomByteString len
+        finfo <- assertRight =<< storageUpload storage name mimeType articleRef userRef (uploader chunks)
+        fileName finfo `shouldBe` name
+        fileMimeType finfo `shouldBe` mimeType
+        fileArticle finfo `shouldBe` articleRef
+        fileUser finfo `shouldBe` userRef
+        Map.insert fileTable (fileId finfo) $
+            (finfo, LBS.fromChunks chunks)
+    return fileTable
+  where
+    uploader [] finfo = return $ UploadFinish finfo
+    uploader (x : xs) finfo = return $ UploadChunk x $ uploader xs finfo
+
+minceFiles
+    :: Storage -> Int
+    -> Map.Map (Reference User) User
+    -> Map.Map (Reference Article) Article
+    -> Map.Map (Reference FileInfo) (FileInfo, LBS.ByteString)
+    -> IO ()
+minceFiles storage sampleSize userTable articleTable fileTable = do
+    do
+        userRef <- generate . chooseOne =<< Map.keys userTable
+        articleRef <- generate . chooseOne =<< Map.keys articleTable
+        uret <- storageUpload storage "foo" "bar" articleRef userRef $ \_ -> do
+            return $ UploadChunk "baz" $ do
+                return $ UploadAbort "quux"
+        uret `shouldBe` Right "quux"
+        validateFiles storage fileTable
+    do
+        fileList <- Map.elems fileTable
+        toAlter <- generate $ chooseFrom (sampleSize `div` 5) fileList
+        parallelFor_ toAlter $ \(finfo, content) -> do
+            name <- generate randomText
+            assertRight =<< storagePerform storage (FileSetName (fileId finfo) name)
+            Map.insert fileTable (fileId finfo) $
+                (finfo {fileName = name}, content)
+        validateFiles storage fileTable
+    do
+        fileList <- Map.elems fileTable
+        toAlter <- generate $ chooseFrom (sampleSize `div` 5) fileList
+        parallelFor_ toAlter $ \(finfo, content) -> do
+            index <- generate $ do
+                b <- randomBool
+                if b
+                    then random
+                    else return 0
+            assertRight =<< storagePerform storage (FileSetIndex (fileId finfo) index)
+            Map.insert fileTable (fileId finfo) $
+                (finfo {fileIndex = index}, content)
+    do
+        fileList <- Map.elems fileTable
+        toDelete <- generate $ chooseFrom (sampleSize `div` 5) fileList
+        parallelFor_ toDelete $ \(finfo, _) -> do
+            assertRight =<< storagePerform storage (FileDelete (fileId finfo))
+            Map.delete fileTable (fileId finfo)
+        validateFiles storage fileTable
+    do
+        userRefs <- Map.keys userTable
+        usersToDelete <- generate $ chooseFrom (sampleSize `div` 5) userRefs
+        parallelFor_ usersToDelete $ \userRef -> do
+            assertRight =<< storagePerform storage (UserDelete userRef)
+            Map.delete userTable userRef
+        fileList <- Map.elems fileTable
+        parallelFor_ fileList $ \(finfo, content) -> do
+            if fileUser finfo `elem` usersToDelete
+                then Map.insert fileTable (fileId finfo) $
+                    (finfo {fileUser = ""}, content)
+                else return ()
+        validateFiles storage fileTable
+    do
+        articleRefs <- Map.keys articleTable
+        articlesToDelete <- generate $ chooseFrom (sampleSize `div` 5) articleRefs
+        parallelFor_ articlesToDelete $ \articleRef -> do
+            assertRight =<< storagePerform storage (ArticleDelete articleRef)
+            Map.delete articleTable articleRef
+        fileList <- Map.elems fileTable
+        parallelFor_ fileList $ \(finfo, _) -> do
+            if fileArticle finfo `elem` articlesToDelete
+                then Map.delete fileTable (fileId finfo)
+                else return ()
+        validateFiles storage fileTable
+    do
+        badRefs <- sampleBadRefs $ Map.member fileTable
+        parallelFor_ badRefs $ \ref -> do
+            storagePerform storage (FileSetName ref "foo") `shouldReturn` Left NotFoundError
+            storagePerform storage (FileSetIndex ref 15) `shouldReturn` Left NotFoundError
+            storagePerform storage (FileDelete ref) `shouldReturn` Left NotFoundError
+            storagePerform storage (FileList (ListView 0 1 [FilterFileId ref] []))
+                `shouldReturn`
+                Right []
+            downloadFile storage ref `shouldReturn` Left NotFoundError
+    do
+        userRefs <- Map.keys userTable
+        articleRefs <- Map.keys articleTable
+        fileList <- sortOn (fileId . fst) <$> Map.elems fileTable
+        parallelFor_ fileList $ \(finfo, content) -> do
+            storagePerform storage (FileList (ListView 0 1 [FilterFileId (fileId finfo)] []))
+                `shouldReturn`
+                Right [finfo]
+            downloadFile storage (fileId finfo) `shouldReturn` Right content
+        parallelFor_ ("" : userRefs) $ \userRef -> do
+            let userFiles = filter (\finfo -> fileUser finfo == userRef) $ map fst fileList
+            storagePerform storage (FileList (ListView 0 maxBound [FilterFileUserId userRef] []))
+                `shouldReturn`
+                Right userFiles
+            storagePerform storage (FileList (ListView 0 maxBound [FilterFileUserId userRef] [(OrderFileUploadDate, Ascending)]))
+                `shouldReturn`
+                Right (sortOn (Down . fileUploadDate) userFiles)
+        parallelFor_ articleRefs $ \articleRef -> do
+            let articleFiles = filter (\finfo -> fileArticle finfo == articleRef) $ map fst fileList
+            storagePerform storage (FileList (ListView 0 maxBound [FilterFileArticleId articleRef] []))
+                `shouldReturn`
+                Right articleFiles
+            storagePerform storage (FileList (ListView 0 maxBound [FilterFileArticleId articleRef] [(OrderFileIndex, Ascending)]))
+                `shouldReturn`
+                Right (sortOn fileIndex articleFiles)
+        storagePerform storage (FileList (ListView 0 maxBound [] [(OrderFileName, Ascending)]))
+            `shouldReturn`
+            Right (sortOn fileName $ map fst fileList)
+    return ()
+
+validateFiles
+    :: HasCallStack
+    => Storage
+    -> Map.Map (Reference FileInfo) (FileInfo, LBS.ByteString)
+    -> IO ()
+validateFiles storage fileTable = do
+    fileList <- Map.elems fileTable
+    let finfoList = sortOn fileId $ map fst fileList
+    storagePerform storage (FileList (ListView 0 maxBound [] []))
+        `shouldReturn`
+        Right finfoList
+
+downloadFile :: Storage -> Reference FileInfo -> IO (Either StorageError LBS.ByteString)
+downloadFile storage fileRef = do
+    storageDownload storage fileRef onError onOpen onChunk onClose
+  where
+    onError err = return $ Left err
+    onOpen fsize = return (fsize, mempty)
+    onChunk (fsize, builder) chunk = return (fsize, builder <> Builder.byteString chunk)
+    onClose (fsize, builder) = do
+        let content = Builder.toLazyByteString builder
+        fsize `shouldBe` LBS.length content
+        return $ Right content

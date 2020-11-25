@@ -1,6 +1,7 @@
 {-# LANGUAGE EmptyCase #-}
 {-# LANGUAGE EmptyDataDeriving #-}
 {-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE StandaloneDeriving #-}
@@ -19,6 +20,8 @@ module Storage
     , Article(..)
     , Tag(..)
     , Comment(..)
+    , FileInfo(..)
+    , Upload(..)
     , InitFailure(..)
     , Storage(..)
     , withSqlStorage
@@ -44,6 +47,7 @@ import Data.List
 import Data.Maybe
 import Data.Proxy
 import Data.Semigroup
+import Data.String
 import Data.Time.Clock
 import Data.Word
 import GHC.Generics (Generic)
@@ -59,14 +63,14 @@ import Storage.Schema
 import Tuple
 import qualified Sql.Database as Db
 
-data Reference a = Reference !BS.ByteString
-    deriving (Eq, Ord)
+newtype Reference a = Reference BS.ByteString
+    deriving (Eq, Ord, IsString)
 
 instance Show (Reference a) where
     showsPrec _ (Reference x) = showBlob "ref" x
 
-data Version a = Version !BS.ByteString
-    deriving (Eq, Ord)
+newtype Version a = Version BS.ByteString
+    deriving (Eq, Ord, IsString)
 
 instance Show (Version a) where
     showsPrec _ (Version x) = showBlob "ver" x
@@ -145,8 +149,38 @@ data Comment = Comment
     }
     deriving (Show, Eq, Ord)
 
+data FileInfo = FileInfo
+    { fileId :: !(Reference FileInfo)
+    , fileName :: !Text.Text
+    , fileMimeType :: !Text.Text
+    , fileUploadDate :: !UTCTime
+    , fileArticle :: !(Reference Article)
+    , fileIndex :: !Int64
+    , fileUser :: !(Reference User)
+    }
+    deriving (Show, Eq, Ord)
+
+data Upload r
+    = UploadAbort !r
+    | UploadFinish !r
+    | UploadChunk !BS.ByteString (IO (Upload r))
+
 data Storage = Storage
-    { doStorage :: forall a. Action a -> IO (Either StorageError a)
+    { storagePerform :: forall a. Action a -> IO (Either StorageError a)
+    , storageUpload :: forall r.
+           Text.Text
+        -> Text.Text
+        -> Reference Article
+        -> Reference User
+        -> (FileInfo -> IO (Upload r))
+        -> IO (Either StorageError r)
+    , storageDownload :: forall r b.
+           Reference FileInfo
+        -> (StorageError -> IO r)
+        -> (Int64 -> IO b)
+        -> (b -> BS.ByteString -> IO b)
+        -> (b -> IO r)
+        -> IO r
     }
 
 data SqlStorage = SqlStorage
@@ -161,13 +195,15 @@ withSqlStorage logger db onFail onSuccess = do
         pgen <- newIORef =<< CRand.drgNew
         let storage = SqlStorage logger db pgen
         onSuccess $ Storage
-            { doStorage = \action -> do
+            { storagePerform = \action -> do
                 logDebug logger $ "SqlStorage: Request: " <<| action
-                doSqlStorage action storage $ \result -> do
+                sqlStoragePerform action storage $ \result -> do
                     {- use CPS to bring (Show r) into scope -}
                     logSend logger (resultLogLevel result) $
                         "SqlStorage: Request finished: " <<| action << " -> " <<| result
                     return result
+            , storageUpload = sqlStorageUpload storage
+            , storageDownload = sqlStorageDownload storage
             }
   where
     resultLogLevel (Left InternalError) = LevelWarn
@@ -216,6 +252,11 @@ data Action a where
     CommentSetText :: Reference Comment -> Text.Text -> Action ()
     CommentDelete :: Reference Comment -> Action ()
     CommentList :: ListView Comment -> Action [Comment]
+
+    FileSetName :: Reference FileInfo -> Text.Text -> Action ()
+    FileSetIndex :: Reference FileInfo -> Int64 -> Action ()
+    FileDelete :: Reference FileInfo -> Action ()
+    FileList :: ListView FileInfo -> Action [FileInfo]
 deriving instance Show (Action a)
 deriving instance Eq (Action a)
 
@@ -312,6 +353,19 @@ data instance ViewOrder Comment
     = OrderCommentDate
     deriving (Show, Eq)
 
+data instance ViewFilter FileInfo
+    = FilterFileId (Reference FileInfo)
+    | FilterFileArticleId (Reference Article)
+    | FilterFileUserId (Reference User)
+    deriving (Show, Eq)
+
+data instance ViewOrder FileInfo
+    = OrderFileName
+    | OrderFileMimeType
+    | OrderFileUploadDate
+    | OrderFileIndex
+    deriving (Show, Eq)
+
 data StorageError
     = NotFoundError
     | VersionError
@@ -319,36 +373,35 @@ data StorageError
     | InternalError
     deriving (Show, Eq, Ord)
 
-doSqlStorage :: Action a -> SqlStorage -> (Show a => Either StorageError a -> IO r) -> IO r
-doSqlStorage (UserCreate name surname) = runTransactionRelaxed $ do
+sqlStoragePerform :: Action a -> SqlStorage -> (Show a => Either StorageError a -> IO r) -> IO r
+sqlStoragePerform (UserCreate name surname) = runTransaction Db.ReadCommited $ do
     ref <- Reference <$> generateBytes 16
     joinDate <- currentTime
     doQuery
         (Insert "sn_users"
             (fReference "user_id" :/ fText "user_name" :/ fText "user_surname" :/ fTime "user_join_date" :/ fBool "user_is_admin" :/ E)
-            (Value ref :/ Value name :/ Value surname :/ Value joinDate :/ Value False :/ E)
-            E)
+            (Value ref :/ Value name :/ Value surname :/ Value joinDate :/ Value False :/ E))
         (parseInsert $ User ref name surname joinDate False)
-doSqlStorage (UserSetName userRef name surname) = runTransactionRelaxed $ do
+sqlStoragePerform (UserSetName userRef name surname) = runTransaction Db.ReadCommited $ do
     doQuery
         (Update "sn_users"
             (fText "user_name" :/ fText "user_surname" :/ E)
             (Value name :/ Value surname :/ E)
             [WhereIs userRef "user_id"])
         parseCount
-doSqlStorage (UserSetIsAdmin userRef isAdmin) = runTransactionRelaxed $ do
+sqlStoragePerform (UserSetIsAdmin userRef isAdmin) = runTransaction Db.ReadCommited $ do
     doQuery
         (Update "sn_users"
             (fBool "user_is_admin" :/ E)
             (Value isAdmin :/ E)
             [WhereIs userRef "user_id"])
         parseCount
-doSqlStorage (UserDelete userRef) = runTransactionRelaxed $ do
+sqlStoragePerform (UserDelete userRef) = runTransaction Db.ReadCommited $ do
     doQuery
         (Delete "sn_users"
             [WhereIs userRef "user_id"])
         parseCount
-doSqlStorage (UserList view) = runTransactionRelaxed $ do
+sqlStoragePerform (UserList view) = runTransaction Db.ReadCommited $ do
     withView view $ \tables filter order range _ -> do
         doQuery
             (Select ("sn_users" : tables)
@@ -358,7 +411,7 @@ doSqlStorage (UserList view) = runTransactionRelaxed $ do
                 range)
             (parseList $ parseOne User)
 
-doSqlStorage (AccessKeyCreate userRef) = runTransactionRelaxed $ do
+sqlStoragePerform (AccessKeyCreate userRef) = runTransaction Db.ReadCommited $ do
     keyBack <- generateBytes 48
     keyFront <- Reference <$> generateBytes 16
     let key = AccessKey keyFront keyBack
@@ -366,15 +419,14 @@ doSqlStorage (AccessKeyCreate userRef) = runTransactionRelaxed $ do
     doQuery
         (Insert "sn_access_keys"
             (fReference "access_key_id" :/ fBlob "access_key_hash" :/ fReference "access_key_user_id" :/ E)
-            (Value keyFront :/ Value keyHash :/ Value userRef :/ E)
-            E)
+            (Value keyFront :/ Value keyHash :/ Value userRef :/ E))
         (parseInsert key)
-doSqlStorage (AccessKeyDelete userRef keyRef) = runTransactionRelaxed $ do
+sqlStoragePerform (AccessKeyDelete userRef keyRef) = runTransaction Db.ReadCommited $ do
     doQuery
         (Delete "sn_access_keys"
             [WhereIs userRef "access_key_user_id", WhereIs keyRef "access_key_id"])
         parseCount
-doSqlStorage (AccessKeyList userRef view) = runTransactionRelaxed $ do
+sqlStoragePerform (AccessKeyList userRef view) = runTransaction Db.ReadCommited $ do
     withView view $ \tables filter order range _ -> do
         doQuery
             (Select ("sn_access_keys" : tables)
@@ -384,29 +436,28 @@ doSqlStorage (AccessKeyList userRef view) = runTransactionRelaxed $ do
                 range)
             (parseList $ parseOne id)
 
-doSqlStorage (AuthorCreate name description) = runTransactionRelaxed $ do
+sqlStoragePerform (AuthorCreate name description) = runTransaction Db.ReadCommited $ do
     ref <- Reference <$> generateBytes 16
     doQuery
         (Insert "sn_authors"
             (fReference "author_id" :/ fText "author_name" :/ fText "author_description" :/ E)
-            (Value ref :/ Value name :/ Value description :/ E)
-            E)
+            (Value ref :/ Value name :/ Value description :/ E))
         (parseInsert $ Author ref name description)
-doSqlStorage (AuthorSetName authorRef name) = runTransactionRelaxed $ do
+sqlStoragePerform (AuthorSetName authorRef name) = runTransaction Db.ReadCommited $ do
     doQuery
         (Update "sn_authors"
             (fText "author_name" :/ E)
             (Value name :/ E)
             [WhereIs authorRef "author_id"])
         parseCount
-doSqlStorage (AuthorSetDescription authorRef description) = runTransactionRelaxed $ do
+sqlStoragePerform (AuthorSetDescription authorRef description) = runTransaction Db.ReadCommited $ do
     doQuery
         (Update "sn_authors"
             (fText "author_description" :/ E)
             (Value description :/ E)
             [WhereIs authorRef "author_id"])
         parseCount
-doSqlStorage (AuthorDelete authorRef) = runTransactionRelaxed $ do
+sqlStoragePerform (AuthorDelete authorRef) = runTransaction Db.ReadCommited $ do
     doQuery_
         (Delete "sn_articles"
             [WhereIs authorRef "article_author_id", WhereWith NonPublished "article_publication_date = ?"])
@@ -414,7 +465,7 @@ doSqlStorage (AuthorDelete authorRef) = runTransactionRelaxed $ do
         (Delete "sn_authors"
             [WhereIs authorRef "author_id"])
         parseCount
-doSqlStorage (AuthorList view) = runTransactionRelaxed $ do
+sqlStoragePerform (AuthorList view) = runTransaction Db.ReadCommited $ do
     withView view $ \tables filter order range _ -> do
         doQuery
             (Select ("sn_authors" : tables)
@@ -423,33 +474,31 @@ doSqlStorage (AuthorList view) = runTransactionRelaxed $ do
                 (order "author_id")
                 range)
             (parseList $ parseOne Author)
-doSqlStorage (AuthorSetOwnership authorRef userRef True) = runTransactionRelaxed $ do
+sqlStoragePerform (AuthorSetOwnership authorRef userRef True) = runTransaction Db.ReadCommited $ do
     doQuery_
         (Insert "sn_author2user"
             (fReference "a2u_user_id" :/ fReference "a2u_author_id" :/ E)
-            (Value userRef :/ Value authorRef :/ E)
-            E)
-doSqlStorage (AuthorSetOwnership authorRef userRef False) = runTransactionRelaxed $ do
+            (Value userRef :/ Value authorRef :/ E))
+sqlStoragePerform (AuthorSetOwnership authorRef userRef False) = runTransaction Db.ReadCommited $ do
     doQuery_
         (Delete "sn_author2user"
             [WhereIs userRef "a2u_user_id", WhereIs authorRef "a2u_author_id"])
 
-doSqlStorage (CategoryCreate name parentRef) = runTransactionRelaxed $ do
+sqlStoragePerform (CategoryCreate name parentRef) = runTransaction Db.ReadCommited $ do
     ref <- Reference <$> generateBytes 4
     doQuery
         (Insert "sn_categories"
             (fReference "category_id" :/ fText "category_name" :/ fReference "category_parent_id" :/ E)
-            (Value ref :/ Value name :/ Value parentRef :/ E)
-            E)
+            (Value ref :/ Value name :/ Value parentRef :/ E))
         (parseInsert $ Category ref name parentRef)
-doSqlStorage (CategorySetName categoryRef name) = runTransactionRelaxed $ do
+sqlStoragePerform (CategorySetName categoryRef name) = runTransaction Db.ReadCommited $ do
     doQuery
         (Update "sn_categories"
             (fText "category_name" :/ E)
             (Value name :/ E)
             [WhereIs categoryRef "category_id"])
         parseCount
-doSqlStorage (CategorySetParent categoryRef parentRef) = runTransactionSerial $ do
+sqlStoragePerform (CategorySetParent categoryRef parentRef) = runTransaction Db.Serializable $ do
     doQuery
         (Select
             [ RecursiveSource "ancestors"
@@ -478,7 +527,7 @@ doSqlStorage (CategorySetParent categoryRef parentRef) = runTransactionSerial $ 
             (Value parentRef :/ E)
             [WhereIs categoryRef "category_id"])
         parseCount
-doSqlStorage (CategoryDelete categoryRef) = runTransactionSerial $ do
+sqlStoragePerform (CategoryDelete categoryRef) = runTransaction Db.Serializable $ do
     parent <- doQuery
         (Select ["sn_categories"]
             (fReference "category_parent_id" :/ E)
@@ -499,7 +548,7 @@ doSqlStorage (CategoryDelete categoryRef) = runTransactionSerial $ do
     doQuery_
         (Delete "sn_categories"
             [WhereIs categoryRef "category_id"])
-doSqlStorage (CategoryList view) = runTransactionRelaxed $ do
+sqlStoragePerform (CategoryList view) = runTransaction Db.ReadCommited $ do
     withView view $ \tables filter order range _ -> do
         doQuery
             (Select ("sn_categories" : tables)
@@ -509,7 +558,7 @@ doSqlStorage (CategoryList view) = runTransactionRelaxed $ do
                 range)
             (parseList $ parseOne Category)
 
-doSqlStorage (ArticleCreate authorRef) = runTransactionRelaxed $ do
+sqlStoragePerform (ArticleCreate authorRef) = runTransaction Db.ReadCommited $ do
     articleRef <- Reference <$> generateBytes 16
     articleVersion <- Version <$> generateBytes 4
     doQuery
@@ -529,17 +578,16 @@ doSqlStorage (ArticleCreate authorRef) = runTransactionRelaxed $ do
             :/ Value ""
             :/ Value NonPublished
             :/ Value (Reference "")
-            :/ E)
-            E)
+            :/ E))
         (parseInsert $ Article articleRef articleVersion authorRef "" "" NonPublished (Reference ""))
-doSqlStorage (ArticleSetAuthor articleRef authorRef) = runTransactionRelaxed $ do
+sqlStoragePerform (ArticleSetAuthor articleRef authorRef) = runTransaction Db.ReadCommited $ do
     doQuery
         (Update "sn_articles"
             (fReference "article_author_id" :/ E)
             (Value authorRef :/ E)
             [WhereIs articleRef "article_id"])
         parseCount
-doSqlStorage (ArticleSetName articleRef oldVersion name) = runTransactionSerial $ do
+sqlStoragePerform (ArticleSetName articleRef oldVersion name) = runTransaction Db.Serializable $ do
     doQuery
         (Select ["sn_articles"]
             (fVersion "article_version" :/ E)
@@ -559,7 +607,7 @@ doSqlStorage (ArticleSetName articleRef oldVersion name) = runTransactionSerial 
             (Value newVersion :/ Value name :/ E)
             [WhereIs articleRef "article_id"])
     return newVersion
-doSqlStorage (ArticleSetText articleRef oldVersion text) = runTransactionSerial $ do
+sqlStoragePerform (ArticleSetText articleRef oldVersion text) = runTransaction Db.Serializable $ do
     doQuery
         (Select ["sn_articles"]
             (fVersion "article_version" :/ E)
@@ -579,26 +627,26 @@ doSqlStorage (ArticleSetText articleRef oldVersion text) = runTransactionSerial 
             (Value newVersion :/ Value text :/ E)
             [WhereIs articleRef "article_id"])
     return newVersion
-doSqlStorage (ArticleSetCategory articleRef categoryRef) = runTransactionRelaxed $ do
+sqlStoragePerform (ArticleSetCategory articleRef categoryRef) = runTransaction Db.ReadCommited $ do
     doQuery
         (Update "sn_articles"
             (fReference "article_category_id" :/ E)
             (Value categoryRef :/ E)
             [WhereIs articleRef "article_id"])
         parseCount
-doSqlStorage (ArticleSetPublicationStatus articleRef pubStatus) = runTransactionRelaxed $ do
+sqlStoragePerform (ArticleSetPublicationStatus articleRef pubStatus) = runTransaction Db.ReadCommited $ do
     doQuery
         (Update "sn_articles"
             (fPublicationStatus "article_publication_date" :/ E)
             (Value pubStatus :/ E)
             [WhereIs articleRef "article_id"])
         parseCount
-doSqlStorage (ArticleDelete articleRef) = runTransactionRelaxed $ do
+sqlStoragePerform (ArticleDelete articleRef) = runTransaction Db.ReadCommited $ do
     doQuery
         (Delete "sn_articles"
             [WhereIs articleRef "article_id"])
         parseCount
-doSqlStorage (ArticleList showDrafts view) = runTransactionRelaxed $ do
+sqlStoragePerform (ArticleList showDrafts view) = runTransaction Db.ReadCommited $ do
     withView view $ \tables filter order range time -> do
         doQuery
             (Select ("sn_articles" : tables)
@@ -614,38 +662,36 @@ doSqlStorage (ArticleList showDrafts view) = runTransactionRelaxed $ do
                 (order "article_id")
                 range)
             (parseList $ parseOne Article)
-doSqlStorage (ArticleSetTag articleRef tagRef True) = runTransactionRelaxed $ do
+sqlStoragePerform (ArticleSetTag articleRef tagRef True) = runTransaction Db.ReadCommited $ do
     doQuery_
         (Insert "sn_article2tag"
             (fReference "a2t_article_id" :/ fReference "a2t_tag_id" :/ E)
-            (Value articleRef :/ Value tagRef :/ E)
-            E)
-doSqlStorage (ArticleSetTag articleRef tagRef False) = runTransactionRelaxed $ do
+            (Value articleRef :/ Value tagRef :/ E))
+sqlStoragePerform (ArticleSetTag articleRef tagRef False) = runTransaction Db.ReadCommited $ do
     doQuery_
         (Delete "sn_article2tag"
             [WhereIs articleRef "a2t_article_id", WhereIs tagRef "a2t_tag_id"])
 
-doSqlStorage (TagCreate name) = runTransactionRelaxed $ do
+sqlStoragePerform (TagCreate name) = runTransaction Db.ReadCommited $ do
     tagRef <- Reference <$> generateBytes 4
     doQuery
         (Insert "sn_tags"
             (fReference "tag_id" :/ fText "tag_name" :/ E)
-            (Value tagRef :/ Value name :/ E)
-            E)
+            (Value tagRef :/ Value name :/ E))
         (parseInsert $ Tag tagRef name)
-doSqlStorage (TagSetName tagRef name) = runTransactionRelaxed $ do
+sqlStoragePerform (TagSetName tagRef name) = runTransaction Db.ReadCommited $ do
     doQuery
         (Update "sn_tags"
             (fText "tag_name" :/ E)
             (Value name :/ E)
             [WhereIs tagRef "tag_id"])
         parseCount
-doSqlStorage (TagDelete tagRef) = runTransactionRelaxed $ do
+sqlStoragePerform (TagDelete tagRef) = runTransaction Db.ReadCommited $ do
     doQuery
         (Delete "sn_tags"
             [WhereIs tagRef "tag_id"])
         parseCount
-doSqlStorage (TagList view) = runTransactionRelaxed $ do
+sqlStoragePerform (TagList view) = runTransaction Db.ReadCommited $ do
     withView view $ \tables filter order range time -> do
         doQuery
             (Select ("sn_tags" : tables)
@@ -655,7 +701,7 @@ doSqlStorage (TagList view) = runTransactionRelaxed $ do
                 range)
             (parseList $ parseOne Tag)
 
-doSqlStorage (CommentCreate articleRef userRef text) = runTransactionRelaxed $ do
+sqlStoragePerform (CommentCreate articleRef userRef text) = runTransaction Db.ReadCommited $ do
     commentRef <- Reference <$> generateBytes 16
     commentDate <- currentTime
     doQuery
@@ -671,10 +717,9 @@ doSqlStorage (CommentCreate articleRef userRef text) = runTransactionRelaxed $ d
             :/ Value userRef
             :/ Value text
             :/ Value commentDate
-            :/ E)
-            E)
+            :/ E))
         (parseInsert $ Comment commentRef articleRef userRef text commentDate Nothing)
-doSqlStorage (CommentSetText commentRef text) = runTransactionRelaxed $ do
+sqlStoragePerform (CommentSetText commentRef text) = runTransaction Db.ReadCommited $ do
     editDate <- currentTime
     doQuery
         (Update "sn_comments"
@@ -682,12 +727,12 @@ doSqlStorage (CommentSetText commentRef text) = runTransactionRelaxed $ do
             (Value text :/ Value editDate :/ E)
             [WhereIs commentRef "comment_id"])
         parseCount
-doSqlStorage (CommentDelete commentRef) = runTransactionRelaxed $ do
+sqlStoragePerform (CommentDelete commentRef) = runTransaction Db.ReadCommited $ do
     doQuery
         (Delete "sn_comments"
             [WhereIs commentRef "comment_id"])
         parseCount
-doSqlStorage (CommentList view) = runTransactionRelaxed $ do
+sqlStoragePerform (CommentList view) = runTransaction Db.ReadCommited $ do
     withView view $ \tables filter order range time -> do
         doQuery
             (Select ("sn_comments" : tables)
@@ -702,9 +747,162 @@ doSqlStorage (CommentList view) = runTransactionRelaxed $ do
                 (order "comment_id")
                 range)
             (parseList $ \case
-                    Just commentRef :/ Just articleRef :/ Just userRef :/ Just text :/ Just commentDate :/ maybeEditDate :/ E ->
-                        Just $ Comment commentRef articleRef userRef text commentDate maybeEditDate
-                    _ -> Nothing)
+                Just commentRef :/ Just articleRef :/ Just userRef :/ Just text :/ Just commentDate :/ maybeEditDate :/ E ->
+                    Just $ Comment commentRef articleRef userRef text commentDate maybeEditDate
+                _ -> Nothing)
+
+sqlStoragePerform (FileSetName fileRef name) = runTransaction Db.ReadCommited $ do
+    doQuery
+        (Update "sn_files"
+            (fText "file_name" :/ E)
+            (Value name :/ E)
+            [WhereIs fileRef "file_id"])
+        parseCount
+sqlStoragePerform (FileSetIndex fileRef index) = runTransaction Db.ReadCommited $ do
+    doQuery
+        (Update "sn_files"
+            (fInt "file_index" :/ E)
+            (Value index :/ E)
+            [WhereIs fileRef "file_id"])
+        parseCount
+sqlStoragePerform (FileDelete fileRef) = runTransaction Db.ReadCommited $ do
+    doQuery
+        (Delete "sn_files"
+            [WhereIs fileRef "file_id"])
+        parseCount
+sqlStoragePerform (FileList view) = runTransaction Db.ReadCommited $ do
+    withView view $ \tables filter order range time -> do
+        doQuery
+            (Select ("sn_files" : tables)
+                (  fReference "file_id"
+                :/ fText "file_name"
+                :/ fText "file_mimetype"
+                :/ fTime "file_upload_date"
+                :/ fReference "file_article_id"
+                :/ fInt "file_index"
+                :/ fReference "file_user_id"
+                :/ E)
+                filter
+                (order "file_id")
+                range)
+            (parseList $ parseOne FileInfo)
+
+sqlStorageUpload
+    :: SqlStorage
+    -> Text.Text
+    -> Text.Text
+    -> Reference Article
+    -> Reference User
+    -> (FileInfo -> IO (Upload r))
+    -> IO (Either StorageError r)
+sqlStorageUpload storage name mimeType articleRef userRef uploader = do
+    tret <- Db.execute (storageDb storage) Db.ReadCommited $ do
+        uploadTime <- currentTime
+        fileRef <- (Reference <$> generateBytes 16) `runReaderT` storage
+        maxIndexQret <- Db.query
+            (Select ["sn_files"]
+                (fInt "COALESCE(MAX(file_index), 0)" :/ E)
+                [WhereIs articleRef "file_article_id"]
+                []
+                (RowRange 0 1))
+        maxIndex <- case maxIndexQret of
+            [Just i :/ E] -> return i
+            _ -> Db.abort
+        {- since this transaction is relaxed, it's possible for multiple files to end up with the same (`article_id`, `index`) pair -}
+        {- this is fine -}
+        {- for identification, we use an independent `id` field, which is under a primary key constraint -}
+        {- for ordering, we always append an `id ASC` to the end of the "order by" clause, so it's still always deterministic -}
+        {- if the user isn't happy with whatever order the files turned out to be, they can always rearrange the indices later -}
+        let myIndex = maxIndex + 1
+        insertQret <- Db.query
+            (Insert "sn_files"
+                (  fReference "file_id"
+                :/ fText "file_name"
+                :/ fText "file_mimetype"
+                :/ fTime "file_upload_date"
+                :/ fReference "file_article_id"
+                :/ fInt "file_index"
+                :/ fReference "file_user_id"
+                :/ E)
+                (  Value fileRef
+                :/ Value name
+                :/ Value mimeType
+                :/ Value uploadTime
+                :/ Value articleRef
+                :/ Value myIndex
+                :/ Value userRef
+                :/ E))
+        unless insertQret $ Db.abort
+        driveUpload fileRef 0 $ uploader $ FileInfo fileRef name mimeType uploadTime articleRef myIndex userRef
+    case tret of
+        Right bret -> return bret
+        Left _ -> return $ Left InternalError
+  where
+    driveUpload fileRef chunkIndex action = do
+        aret <- liftIO action
+        case aret of
+            UploadAbort result -> do
+                Db.rollback $ Right result
+            UploadFinish result -> do
+                return $ Right result
+            UploadChunk chunkData next -> do
+                qret <- Db.query
+                    (Insert "sn_file_chunks"
+                        (fReference "chunk_file_id" :/ fInt "chunk_index" :/ fBlob "chunk_data" :/ E)
+                        (Value fileRef :/ Value chunkIndex :/ Value chunkData :/ E))
+                unless qret $ Db.abort
+                driveUpload fileRef (chunkIndex + 1) next
+
+sqlStorageDownload
+    :: SqlStorage
+    -> Reference FileInfo
+    -> (StorageError -> IO r)
+    -> (Int64 -> IO b)
+    -> (b -> BS.ByteString -> IO b)
+    -> (b -> IO r)
+    -> IO r
+sqlStorageDownload storage fileRef onError onOpen onChunk onClose = do
+    pmState <- newIORef Nothing
+    tret <- Db.execute (storageDb storage) Db.RepeatableRead $ do
+        filesizeQret <- Db.query
+            (Select
+                ["sn_file_chunks"]
+                (fInt "sum(length(chunk_data))" :/ E)
+                [WhereIs fileRef "chunk_file_id"]
+                []
+                (RowRange 0 1))
+        filesize <- case filesizeQret of
+            [Just filesize :/ E] -> return filesize
+            [Nothing :/ E] -> Db.rollback $ Left NotFoundError
+            _ -> Db.abort
+        liftIO $ do
+            state <- onOpen filesize
+            writeIORef pmState $ Just state
+        driveDownloader 0 pmState
+    mState <- readIORef pmState
+    case mState of
+        Just state -> onClose state
+        Nothing -> case tret of
+            Right (Left err) -> onError err
+            _ -> onError InternalError
+  where
+    driveDownloader index pmState = do
+        chunkQret <- Db.query
+            (Select
+                ["sn_file_chunks"]
+                (fBlob "chunk_data" :/ E)
+                [WhereIs fileRef "chunk_file_id"]
+                [Asc "chunk_index"]
+                (RowRange index 1))
+        case chunkQret of
+            [] -> return $ Right ()
+            [Just chunkData :/ E] -> do
+                liftIO $ do
+                    Just state1 <- readIORef pmState
+                    state2 <- onChunk state1 chunkData
+                    writeIORef pmState $ Just state2
+                driveDownloader (index + 1) pmState
+            _ -> Db.abort
 
 hashAccessKey :: AccessKey -> BS.ByteString
 hashAccessKey (AccessKey (Reference front) back) = do
@@ -713,43 +911,36 @@ hashAccessKey (AccessKey (Reference front) back) = do
     let ctx2 = CHash.hashUpdate ctx1 front
     BA.convert $ CHash.hashFinalize ctx2
 
-type Transaction = ReaderT SqlStorage (ExceptT StorageError (ExceptT Db.QueryError IO))
-{- internal: SqlStorage -> IO (Either Db.QueryError (Either StorageError r)) -}
+type Transaction a = ReaderT SqlStorage (Db.Transaction (Either StorageError a))
 
-generateBytes :: Int -> Transaction BS.ByteString
+generateBytes :: Int -> Transaction a BS.ByteString
 generateBytes len = ReaderT $ \SqlStorage {storageGen = tgen} -> do
     liftIO $ atomicModifyIORef' tgen $ \gen1 ->
         let (value, gen2) = CRand.randomBytesGenerate len gen1
         in (gen2, value)
 
-doQuery :: Query qr -> (qr -> Either StorageError r) -> Transaction r
-doQuery query mapf = ReaderT $ \SqlStorage {storageDb = db} -> do
-    ExceptT $ fmap mapf $ ExceptT $ Db.makeQuery db query
+doQuery :: Query qr -> (qr -> Either StorageError r) -> Transaction a r
+doQuery query parser = ReaderT $ \_ -> do
+    qr <- Db.query query
+    case parser qr of
+        Left ste -> Db.rollback $ Left ste
+        Right r -> return r
 
-doQuery_ :: Query qr -> Transaction ()
+doQuery_ :: Query qr -> Transaction a ()
 doQuery_ query = doQuery query (const $ Right ())
 
-runTransaction :: Show a => Db.TransactionLevel -> Transaction a -> SqlStorage -> (Show a => Either StorageError a -> IO r) -> IO r
-runTransaction level body storage cont = doTry 100
-  where
-    doTry 0 = cont $ Left InternalError
-    doTry n = do
-        tret <- Db.withTransaction (storageDb storage) level $ \db2 -> do
-            runExceptT $ runExceptT $ runReaderT body $ storage {storageDb = db2}
-        case tret of
-            Right bret -> cont bret
-            Left Db.QueryError -> cont $ Left InternalError
-            Left Db.SerializationError -> doTry (n-1)
+runTransaction :: Show a => Db.TransactionLevel -> Transaction a a -> SqlStorage -> (Show a => Either StorageError a -> IO r) -> IO r
+runTransaction level body storage cont = do
+    tret <- Db.executeRepeat (storageDb storage) 100 level $ do
+        br <- body `runReaderT` storage
+        return $ Right br
+    case tret of
+        Right bret -> cont bret
+        Left _ -> cont $ Left InternalError
 
-runTransactionRelaxed :: Show a => Transaction a -> SqlStorage -> (Show a => Either StorageError a -> IO r) -> IO r
-runTransactionRelaxed = runTransaction Db.ReadCommited
-
-runTransactionSerial :: Show a => Transaction a -> SqlStorage -> (Show a => Either StorageError a -> IO r) -> IO r
-runTransactionSerial = runTransaction Db.Serializable
-
-parseInsert :: a -> Maybe (HList Maybe '[]) -> Either StorageError a
-parseInsert x (Just E) = Right x
-parseInsert _ Nothing = Left InternalError
+parseInsert :: a -> Bool -> Either StorageError a
+parseInsert x True = Right x
+parseInsert _ False = Left InternalError
 
 parseCount :: Int64 -> Either StorageError ()
 parseCount 1 = Right ()
@@ -878,6 +1069,15 @@ instance ListableObject Comment where
     applyFilter (FilterCommentArticleId ref) = demandCondition (WhereIs ref "comment_article_id")
     applyFilter (FilterCommentUserId ref) = demandCondition (WhereIs ref "comment_user_id")
     applyOrder OrderCommentDate = demandOrder "comment_date" . inverseDirection
+
+instance ListableObject FileInfo where
+    applyFilter (FilterFileId ref) = demandCondition (WhereIs ref "file_id")
+    applyFilter (FilterFileArticleId ref) = demandCondition (WhereIs ref "file_article_id")
+    applyFilter (FilterFileUserId ref) = demandCondition (WhereIs ref "file_user_id")
+    applyOrder OrderFileName = demandOrder "file_name"
+    applyOrder OrderFileMimeType = demandOrder "file_mimetype"
+    applyOrder OrderFileUploadDate = demandOrder "file_upload_date" . inverseDirection
+    applyOrder OrderFileIndex = demandOrder "file_index"
 
 subcategoriesSource :: Reference Category -> RowSource
 subcategoriesSource ref = RecursiveSource "subcategories"

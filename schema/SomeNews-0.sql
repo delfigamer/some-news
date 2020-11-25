@@ -104,15 +104,27 @@ CREATE INDEX sn_comments_user_idx
 
 CREATE TABLE sn_files
     ( file_id BLOB PRIMARY KEY
-    , file_name TEXT NULL
+    , file_name TEXT NOT NULL
     , file_mimetype TEXT NOT NULL
+    , file_upload_date DATETIME NOT NULL
+    , file_article_id BLOB NOT NULL
+        REFERENCES sn_articles (article_id) ON UPDATE CASCADE ON DELETE CASCADE
+    , file_index INTEGER NOT NULL
+    , file_user_id BLOB
+        REFERENCES sn_users (user_id) ON UPDATE CASCADE ON DELETE SET NULL
     );
+CREATE INDEX sn_files_article_idx
+    ON sn_files (file_article_id, file_index);
+CREATE INDEX sn_files_user_idx
+    ON sn_files (file_user_id);
+CREATE INDEX sn_files_upload_date_idx
+    ON sn_files (file_upload_date);
 
 CREATE TABLE sn_file_chunks
     ( chunk_file_id BLOB NOT NULL
         REFERENCES sn_files (file_id) ON UPDATE CASCADE ON DELETE CASCADE
     , chunk_index INTEGER NOT NULL
-    , chunk_content BLOB NOT NULL
+    , chunk_data BLOB NOT NULL
     , PRIMARY KEY (chunk_file_id, chunk_index)
     );
 

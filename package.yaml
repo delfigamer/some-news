@@ -28,7 +28,11 @@ dependencies:
 - bytestring
 - containers
 - cryptonite
+- deferred-folds
+- hashable
 - hspec
+- http-types
+- list-t
 - memory
 - mtl
 - postgresql-simple
@@ -36,12 +40,15 @@ dependencies:
 - splitmix == 0.1.*
 - sqlite-simple
 - stm
+- stm-containers
 - template-haskell
 - text
 - time
 - transformers
 - unordered-containers
 - vector
+- wai
+- wai-extra
 - warp
 - yaml
 

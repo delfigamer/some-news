@@ -4,7 +4,7 @@ cabal-version: 1.12
 --
 -- see: https://github.com/sol/hpack
 --
--- hash: 730cdd249ecc7491dc4d006856a45deaf7ce0e91fa11c493e10fd5eaeabafde0
+-- hash: 4fb0c100b7c1d8f0e942193cad908299d4bc17879618f7944b8296f5c57b1934
 
 name:           SomeNews
 version:        0.1.0.0
@@ -27,9 +27,12 @@ source-repository head
 
 library
   exposed-modules:
+      Binary
       HEq1
       Hex
       JsonInterface
+      JsonInterface.Config
+      JsonInterface.Internal
       Lib
       Logger
       ResourcePool
@@ -42,6 +45,7 @@ library
       Storage
       Storage.Schema
       Tuple
+      WApp
   other-modules:
       Paths_SomeNews
   hs-source-dirs:
@@ -54,7 +58,11 @@ library
     , bytestring
     , containers
     , cryptonite
+    , deferred-folds
+    , hashable
     , hspec
+    , http-types
+    , list-t
     , memory
     , mtl
     , postgresql-simple
@@ -62,12 +70,15 @@ library
     , splitmix ==0.1.*
     , sqlite-simple
     , stm
+    , stm-containers
     , template-haskell
     , text
     , time
     , transformers
     , unordered-containers
     , vector
+    , wai
+    , wai-extra
     , warp
     , yaml
   default-language: Haskell2010
@@ -88,7 +99,11 @@ executable SomeNews-exe
     , bytestring
     , containers
     , cryptonite
+    , deferred-folds
+    , hashable
     , hspec
+    , http-types
+    , list-t
     , memory
     , mtl
     , postgresql-simple
@@ -96,12 +111,15 @@ executable SomeNews-exe
     , splitmix ==0.1.*
     , sqlite-simple
     , stm
+    , stm-containers
     , template-haskell
     , text
     , time
     , transformers
     , unordered-containers
     , vector
+    , wai
+    , wai-extra
     , warp
     , yaml
   default-language: Haskell2010
@@ -110,13 +128,17 @@ test-suite SomeNews-test
   type: exitcode-stdio-1.0
   main-is: Spec.hs
   other-modules:
-      Bimap
+      BinarySpec
       Gen
       HexSpec
       JsonInterfaceSpec
+      Parallel
       Storage.Fake
       StorageSpec
-      Tree
+      TData.Map
+      TData.Multimap
+      TData.Relmap
+      TData.Tree
       Paths_SomeNews
   hs-source-dirs:
       test
@@ -130,7 +152,11 @@ test-suite SomeNews-test
     , bytestring
     , containers
     , cryptonite
+    , deferred-folds
+    , hashable
     , hspec
+    , http-types
+    , list-t
     , memory
     , mtl
     , postgresql-simple
@@ -138,12 +164,15 @@ test-suite SomeNews-test
     , splitmix ==0.1.*
     , sqlite-simple
     , stm
+    , stm-containers
     , template-haskell
     , text
     , time
     , transformers
     , unordered-containers
     , vector
+    , wai
+    , wai-extra
     , warp
     , yaml
   default-language: Haskell2010

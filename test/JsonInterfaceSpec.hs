@@ -15,6 +15,7 @@ import Test.Hspec
 import qualified Data.ByteString as BS
 import qualified Data.HashMap.Strict as Map
 import qualified Data.Text as Text
+import qualified Data.Text.Encoding as Text
 import qualified Data.Text.Lazy as TextLazy
 import qualified Data.Time.Clock as TClock
 import qualified Data.Time.Format.ISO8601 as TFormat
@@ -24,6 +25,14 @@ import Logger
 import Storage
 import Storage.Fake
 import JsonInterface
+import qualified JsonInterface.Config as Config
+
+testConfig :: Config.Config
+testConfig = Config.Config
+    { Config.defaultPageLimit = 10
+    , Config.maxPageLimit = 100
+    , Config.maxAccessKeyCount = 3
+    }
 
 spec :: Spec
 spec = do
@@ -146,7 +155,7 @@ spec = do
             sampleUser
             []
             [ RequestExpectation
-                [ UserList (ListView 0 defaultPageLimit [] [])
+                [ UserList (ListView 0 10 [] [])
                     |>> Right
                         [ User (Reference "\x00\x01") "name1" "surname1" "2020-01-01T01:01:01Z" False
                         , User (Reference "\x00\x02") "name2" "surname2" "2020-01-02T03:04:05Z" True
@@ -196,7 +205,7 @@ spec = do
                             (Map.fromList [("akey", "0102:0304"), ("offset", offsetParam)])
                             (RequestExpectation
                                 [ userLookup |>> Right [user]
-                                , UserList (ListView offsetValue defaultPageLimit [] []) |>> Left InternalError
+                                , UserList (ListView offsetValue 10 [] []) |>> Left InternalError
                                 ]
                                 errInternal)
                 forM_
@@ -216,7 +225,7 @@ spec = do
                 forM_
                     [ ("1", 1)
                     , ("12", 12)
-                    , (fromString $ show maxPageLimit, maxPageLimit)
+                    , ("100", 100) -- maxPageLimit
                     ] $ \(limitParam, limitValue) -> do
                         testSimpleRequest "users/list_"
                             (Map.fromList [("akey", "0102:0304"), ("limit", limitParam)])
@@ -229,7 +238,7 @@ spec = do
                     [ ""
                     , "0"
                     , "-1"
-                    , fromString $ show $ maxPageLimit + 1
+                    , "101" -- maxPageLimit + 1
                     , "not a number"
                     , "4.5"
                     , "123456789012345678901234567890" -- not a 64-bit integer
@@ -255,7 +264,7 @@ spec = do
                             (Map.fromList [("akey", "0102:0304"), ("orderBy", orderParam)])
                             (RequestExpectation
                                 [ userLookup |>> Right [user]
-                                , UserList (ListView 0 defaultPageLimit [] orderValue) |>> Left InternalError
+                                , UserList (ListView 0 10 [] orderValue) |>> Left InternalError
                                 ]
                                 errInternal)
                 forM_
@@ -271,6 +280,26 @@ spec = do
                                 [ userLookup |>> Right [user]
                                 ]
                                 (errInvalidParameter "orderBy"))
+        it "(upload stub???)" $ do
+            withFakeStorage $ \context storage -> do
+                checkpoint context
+                    [ UploadAction
+                        "foo"
+                        "text/plain"
+                        "\x01\x02"
+                        "\x0a\x0b"
+                        |>> ExpectChunks
+                            (FileInfo "\x34\x56" "foo" "text/plain" "2020-01-02T03:04:05Z" "\x01\x02" 10 "\x0a\x0b")
+                            ["foo", "bar", "quux"]
+                            True
+                            Nothing
+                    ]
+                result <- storageUpload storage "foo" "text/plain" "\x01\x02" "\x0a\x0b" $ \finfo -> do
+                    return $ UploadChunk "foo" $ do
+                        return $ UploadChunk "bar" $ do
+                            return $ UploadChunk "quux" $ do
+                                return $ UploadFinish "xxx"
+                result `shouldBe` Right "xxx"
   where
     sampleUser = User (Reference "\x01\x23\xab\xcd") "foo" "bar" "2020-01-02T03:04:05.67Z" False
     okSampleUser = okValue $ object
@@ -296,19 +325,19 @@ errInvalidAccessKey = Response StatusForbidden $ JsonResponse $ object
         ]
     ]
 
-errInvalidParameter :: Text.Text -> Response
+errInvalidParameter :: BS.ByteString -> Response
 errInvalidParameter pname = Response StatusBadRequest $ JsonResponse $ object
     [ "error" .= object
         [ "class" .= String "Invalid parameter"
-        , "parameterName" .= pname
+        , "parameterName" .= Text.decodeUtf8 pname
         ]
     ]
 
-errMissingParameter :: Text.Text -> Response
+errMissingParameter :: BS.ByteString -> Response
 errMissingParameter pname = Response StatusBadRequest $ JsonResponse $ object
     [ "error" .= object
         [ "class" .= String "Missing parameter"
-        , "parameterName" .= pname
+        , "parameterName" .= Text.decodeUtf8 pname
         ]
     ]
 
@@ -342,13 +371,13 @@ okList elems = Response StatusOk $ JsonResponse $ object
     ]
 
 data ParameterSpec = ParameterSpec
-    Text.Text
+    BS.ByteString
     BS.ByteString
     [ParameterSpecModifier]
 
 data ParameterSpecModifier = ParameterSpecModifier
     Bool
-    (Map.HashMap Text.Text BS.ByteString -> Map.HashMap Text.Text BS.ByteString)
+    (Map.HashMap BS.ByteString BS.ByteString -> Map.HashMap BS.ByteString BS.ByteString)
     [RequestExpectation]
 
 data RequestExpectation = RequestExpectation [ActionExpectation] Response
@@ -356,7 +385,7 @@ data RequestExpectation = RequestExpectation [ActionExpectation] Response
 prependAction :: ActionExpectation -> RequestExpectation -> RequestExpectation
 prependAction ae (RequestExpectation aes re) = RequestExpectation (ae : aes) re
 
-requiredParameter :: Text.Text -> BS.ByteString -> ParameterSpec
+requiredParameter :: BS.ByteString -> BS.ByteString -> ParameterSpec
 requiredParameter pname pvalue = ParameterSpec pname pvalue
     [ ParameterSpecModifier
         False
@@ -367,7 +396,7 @@ requiredParameter pname pvalue = ParameterSpec pname pvalue
         ]
     ]
 
-requiredIdParameter :: Text.Text -> BS.ByteString -> ParameterSpec
+requiredIdParameter :: BS.ByteString -> BS.ByteString -> ParameterSpec
 requiredIdParameter pname pvalue = ParameterSpec pname pvalue
     [ ParameterSpecModifier
         False
@@ -385,7 +414,7 @@ requiredIdParameter pname pvalue = ParameterSpec pname pvalue
         ]
     ]
 
-requiredNonEmptyParameter :: Text.Text -> BS.ByteString -> ParameterSpec
+requiredNonEmptyParameter :: BS.ByteString -> BS.ByteString -> ParameterSpec
 requiredNonEmptyParameter pname pvalue = ParameterSpec pname pvalue
     [ ParameterSpecModifier
         False
@@ -488,15 +517,15 @@ specifyAdminRequest uri user paramSpec reqExps = do
 testSimpleRequest
     :: HasCallStack
     => Text.Text
-    -> Map.HashMap Text.Text BS.ByteString
+    -> Map.HashMap BS.ByteString BS.ByteString
     -> RequestExpectation
     -> IO ()
 testSimpleRequest uri params (RequestExpectation expectedActions expectedResponse) = do
     withTestLogger $ \logger -> do
         withFakeStorage $ \context storage -> do
             checkpoint context expectedActions
-            result <- withJsonInterface logger storage $ \jint -> do
-                simpleRequest jint $ SimpleRequest uri params
+            result <- withJsonInterface testConfig logger storage $ \jint -> do
+                simpleRequest jint (Text.splitOn "/" uri) params
             result `shouldBe` expectedResponse
 
 instance Show ResponseContent where
@@ -526,9 +555,3 @@ deriving instance Eq Response
 
 instance IsString TClock.UTCTime where
     fromString = fromJust . TFormat.iso8601ParseM
-
-excludeList :: [a] -> [(a, [a])]
-excludeList xs = go id xs
-  where
-    go _ [] = []
-    go left (x : xs) = (x, left xs) : go (left . (x :)) xs

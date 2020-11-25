@@ -7,6 +7,7 @@ module Gen
     , suchThat
     , randomPrintableChar
     , randomPrintableString
+    , chooseOne
     , chooseFrom
     , chooseAllFrom
     , chooseFromSuch
@@ -67,6 +68,12 @@ randomPrintableChar = do
 randomPrintableString :: Int -> Gen String
 randomPrintableString n = replicateM n randomPrintableChar
 
+chooseOne :: [a] -> Gen a
+chooseOne [] = error "Gen.chooseOne: empty list"
+chooseOne xs = do
+    i <- randomWithin 0 (length xs - 1)
+    return $ xs !! i
+
 chooseFrom :: Int -> [a] -> Gen [a]
 chooseFrom = chooseFromSuch (const True)
 
@@ -86,37 +93,38 @@ globalGen :: IORef R.StdGen
 globalGen = unsafePerformIO $ newIORef =<< R.newStdGen
 {-# NOINLINE globalGen #-}
 
-newtype GenSource a = GenSource (Gen (Maybe (a, GenSource a)))
+newtype GenSource a = GenSource
+    { withGenSource :: forall r. Gen r -> (a -> GenSource a -> Gen r) -> Gen r
+    }
 
 takeSource :: (a -> Bool) -> Int -> GenSource a -> Gen [a]
 takeSource _ 0 _ = return []
-takeSource filter i (GenSource f) = do
-    iter <- f
-    case iter of
-        Just (x, next) -> if filter x
+takeSource filter i source = do
+    withGenSource source
+        (return [])
+        (\x next -> if filter x
             then (x :) <$> takeSource filter (i-1) next
-            else takeSource filter i next
-        Nothing -> return []
+            else takeSource filter i next)
 
 takeAllSource :: (a -> Bool) -> GenSource a -> Gen [a]
-takeAllSource filter (GenSource f) = do
-    iter <- f
-    case iter of
-        Just (x, next) -> if filter x
+takeAllSource filter source = do
+    withGenSource source
+        (return [])
+        (\x next -> if filter x
             then (x:) <$> takeAllSource filter next
-            else takeAllSource filter next
-        Nothing -> return []
+            else takeAllSource filter next)
 
 permutationSource :: [a] -> GenSource a
 permutationSource list0 = do
     let len0 = length list0
-    GenSource $ sourceFunc len0 list0
+    generator len0 list0
   where
-    sourceFunc 0 _ = return Nothing
-    sourceFunc len list = do
-        i <- randomWithin 0 (len-1)
-        let (x, xs) = listMinus i list
-        return $ Just (x, GenSource $ sourceFunc (len-1) xs)
-    listMinus _ [] = error "empty list"
-    listMinus 0 (x:xs) = (x, xs)
-    listMinus i (x:xs) = (x:) <$> listMinus (i-1) xs
+    generator len list
+        | len <= 0 = GenSource $ \onNull _onCons -> onNull
+        | otherwise = GenSource $ \_onNull onCons -> do
+            i <- randomWithin 0 (len-1)
+            listMinus i list $ \x xs -> do
+                onCons x $ generator (len-1) xs
+    listMinus _ [] _ = error "empty list"
+    listMinus 0 (x : xs) cont = cont x xs
+    listMinus i (x : xs) cont = listMinus (i-1) xs $ \y ys -> cont y (x : ys)

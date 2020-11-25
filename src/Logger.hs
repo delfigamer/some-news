@@ -166,7 +166,9 @@ withHtmlLogger path body = do
                 { logSend = \level (Log line) -> do
                     withMVar mutex $ \() -> do
                         timestr <- currentTimestamp
-                        let inner = timestr <> ": " <> builderFromLevel level <> ": " <> line mempty
+                        let lineText = Builder.toLazyText $ line mempty
+                        let line2 = Builder.fromLazyText $ Text.concatMap escapeChar lineText
+                        let inner = timestr <> ": " <> builderFromLevel level <> ": " <> line2
                         let outer = case level of
                                 LevelDebug -> "<p class=\"debug\">" <> inner <> "</p>"
                                 LevelInfo -> "<p class=\"info\">" <> inner <> "</p>"
@@ -176,6 +178,11 @@ withHtmlLogger path body = do
                         TextIO.hPutStrLn fh $ Builder.toLazyText outer
                         IO.hFlush fh
                 })
+  where
+    escapeChar '<' = "&lt;"
+    escapeChar '>' = "&gt;"
+    escapeChar '&' = "&amp;"
+    escapeChar c = Text.singleton c
 
 currentTimestamp :: IO Builder.Builder
 currentTimestamp = do

@@ -90,15 +90,12 @@ renderQuery (Select sources fields cond order range) =
             [] -> mempty
             _ -> " ORDER BY " <> renderRowOrder order
         <> renderRowRange range
-renderQuery (Insert (TableName table) fields values rets) =
+renderQuery (Insert (TableName table) fields values) =
     "INSERT" <> detailString detailInsertLeft
         <> " INTO " <> fromString table
         <> " (" <> renderFieldList fields <> ")"
         <> " VALUES (" <> renderValueList values <> ")"
         <> detailString detailInsertRight
-        <> case rets of
-            E -> mempty
-            _ -> " RETURNING " <> renderFieldList rets
 renderQuery (Update (TableName table) (oneField :/ E) (oneValue :/ E) cond) =
     "UPDATE " <> fromString table
         <> " SET " <> renderField oneField

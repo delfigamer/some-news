@@ -62,7 +62,12 @@ upgradeSchema logger db = do
 withSchemaVersion :: Logger -> Db.Database -> IO r -> IO r -> (SchemaVersion -> IO r) -> IO r
 withSchemaVersion logger db onInvalid onEmpty onSchema = do
     logInfo logger $ "Storage: Current application schema: " <<| currentSchema
-    selret <- Db.makeQuery db $ Select ["sn_metadata"] (fSchemaVersion "mvalue" :/ E) [Where "mkey = 'schema_version'"] [] AllRows
+    selret <- Db.execute db Db.ReadCommited $ do
+        Db.query $ Select ["sn_metadata"]
+            (fSchemaVersion "mvalue" :/ E)
+            [Where "mkey = 'schema_version'"]
+            []
+            AllRows
     case selret of
         Right [Just version :/ E] -> do
             logInfo logger $ "Storage: Database schema: " <<| version
@@ -80,19 +85,18 @@ currentSchema = SomeNewsSchema 0 1
 upgradeEmptyToCurrent :: Logger -> Db.Database -> IO (Either InitFailure ())
 upgradeEmptyToCurrent logger db = do
     logInfo logger $ "Storage: Create a new database from scratch"
-    tret <- Db.withTransaction db Db.ReadCommited $ \db2 -> runExceptT $ do
-        ExceptT $ Db.makeQuery db2 $
+    tret <- Db.execute db Db.ReadCommited $ do
+        Db.query $
             CreateTable "sn_metadata"
                 [ ColumnDecl (FText "mkey") [CCPrimaryKey]
                 , ColumnDecl (FText "mvalue") []
                 ]
                 []
-        ExceptT $ Db.makeQuery db2 $
+        Db.query_ $
             Insert "sn_metadata"
                 (fString "mkey" :/ fSchemaVersion "mvalue" :/ E)
                 (Value "schema_version" :/ Value currentSchema :/ E)
-                E
-        ExceptT $ Db.makeQuery db2 $
+        Db.query $
             CreateTable "sn_users"
                 [ ColumnDecl (FBlob "user_id") [CCPrimaryKey]
                 , ColumnDecl (FText "user_name") [CCNotNull]
@@ -101,44 +105,44 @@ upgradeEmptyToCurrent logger db = do
                 , ColumnDecl (FBool "user_is_admin") [CCNotNull]
                 ]
                 []
-        ExceptT $ Db.makeQuery db2 $
+        Db.query $
             CreateTable "sn_access_keys"
                 [ ColumnDecl (FBlob "access_key_id") [CCPrimaryKey]
                 , ColumnDecl (FBlob "access_key_hash") [CCNotNull]
                 , ColumnDecl (FBlob "access_key_user_id") [CCNotNull, CCReferences "sn_users" "user_id" FKRCascade FKRCascade]
                 ]
                 []
-        ExceptT $ Db.makeQuery db2 $
+        Db.query $
             CreateIndex "sn_access_keys_user_id_idx" "sn_access_keys"
                 [Asc "access_key_user_id", Asc "access_key_id"]
-        ExceptT $ Db.makeQuery db2 $
+        Db.query $
             CreateTable "sn_authors"
                 [ ColumnDecl (FBlob "author_id") [CCPrimaryKey]
                 , ColumnDecl (FText "author_name") [CCNotNull]
                 , ColumnDecl (FText "author_description") [CCNotNull]
                 ]
                 []
-        ExceptT $ Db.makeQuery db2 $
+        Db.query $
             CreateTable "sn_author2user"
                 [ ColumnDecl (FBlob "a2u_author_id") [CCNotNull, CCReferences "sn_authors" "author_id" FKRCascade FKRCascade]
                 , ColumnDecl (FBlob "a2u_user_id") [CCNotNull, CCReferences "sn_users" "user_id" FKRCascade FKRCascade]
                 ]
                 [ TCPrimaryKey ["a2u_author_id", "a2u_user_id"]
                 ]
-        ExceptT $ Db.makeQuery db2 $
+        Db.query $
             CreateIndex "sn_author2user_rev_idx" "sn_author2user"
                 [Asc "a2u_user_id", Asc "a2u_author_id"]
-        ExceptT $ Db.makeQuery db2 $
+        Db.query $
             CreateTable "sn_categories"
                 [ ColumnDecl (FBlob "category_id") [CCPrimaryKey]
                 , ColumnDecl (FText "category_name") [CCNotNull]
                 , ColumnDecl (FBlob "category_parent_id") [CCReferences "sn_categories" "category_id" FKRCascade FKRNoAction]
                 ]
                 []
-        ExceptT $ Db.makeQuery db2 $
+        Db.query $
             CreateIndex "sn_categories_parent_idx" "sn_categories"
                 [Asc "category_parent_id", Asc "category_id"]
-        ExceptT $ Db.makeQuery db2 $
+        Db.query $
             CreateTable "sn_articles"
                 [ ColumnDecl (FBlob "article_id") [CCPrimaryKey]
                 , ColumnDecl (FBlob "article_version") [CCNotNull]
@@ -149,29 +153,29 @@ upgradeEmptyToCurrent logger db = do
                 , ColumnDecl (FBlob "article_category_id") [CCReferences "sn_categories" "category_id" FKRCascade FKRNoAction]
                 ]
                 []
-        ExceptT $ Db.makeQuery db2 $
+        Db.query $
             CreateIndex "sn_articles_main_idx" "sn_articles"
                 [Desc "article_publication_date"]
-        ExceptT $ Db.makeQuery db2 $
+        Db.query $
             CreateIndex "sn_articles_author_idx" "sn_articles"
                 [Asc "article_author_id", Asc "article_publication_date"]
-        ExceptT $ Db.makeQuery db2 $
+        Db.query $
             CreateTable "sn_tags"
                 [ ColumnDecl (FBlob "tag_id") [CCPrimaryKey]
                 , ColumnDecl (FText "tag_name") [CCNotNull]
                 ]
                 []
-        ExceptT $ Db.makeQuery db2 $
+        Db.query $
             CreateTable "sn_article2tag"
                 [ ColumnDecl (FBlob "a2t_article_id") [CCNotNull, CCReferences "sn_articles" "article_id" FKRCascade FKRCascade]
                 , ColumnDecl (FBlob "a2t_tag_id") [CCNotNull, CCReferences "sn_tags" "tag_id" FKRCascade FKRCascade]
                 ]
                 [ TCPrimaryKey ["a2t_article_id", "a2t_tag_id"]
                 ]
-        ExceptT $ Db.makeQuery db2 $
+        Db.query $
             CreateIndex "sn_article2tag_rev_idx" "sn_article2tag"
                 [Asc "a2t_tag_id", Asc "a2t_article_id"]
-        ExceptT $ Db.makeQuery db2 $
+        Db.query $
             CreateTable "sn_comments"
                 [ ColumnDecl (FBlob "comment_id") [CCPrimaryKey]
                 , ColumnDecl (FBlob "comment_article_id") [CCNotNull, CCReferences "sn_articles" "article_id" FKRCascade FKRCascade]
@@ -181,24 +185,37 @@ upgradeEmptyToCurrent logger db = do
                 , ColumnDecl (FTime "comment_edit_date") []
                 ]
                 []
-        ExceptT $ Db.makeQuery db2 $
+        Db.query $
             CreateIndex "sn_comments_article_idx" "sn_comments"
                 [Asc "comment_article_id", Asc "comment_date"]
-        ExceptT $ Db.makeQuery db2 $
+        Db.query $
             CreateIndex "sn_comments_user_idx" "sn_comments"
                 [Asc "comment_user_id", Asc "comment_date"]
-        ExceptT $ Db.makeQuery db2 $
+        Db.query $
             CreateTable "sn_files"
                 [ ColumnDecl (FBlob "file_id") [CCPrimaryKey]
-                , ColumnDecl (FText "file_name") []
+                , ColumnDecl (FText "file_name") [CCNotNull]
                 , ColumnDecl (FText "file_mimetype") [CCNotNull]
+                , ColumnDecl (FTime "file_upload_date") [CCNotNull]
+                , ColumnDecl (FBlob "file_article_id") [CCNotNull, CCReferences "sn_articles" "article_id" FKRCascade FKRCascade]
+                , ColumnDecl (FInt "file_index") [CCNotNull]
+                , ColumnDecl (FBlob "file_user_id") [CCReferences "sn_users" "user_id" FKRCascade FKRSetNull]
                 ]
                 []
-        ExceptT $ Db.makeQuery db2 $
+        Db.query $
+            CreateIndex "sn_files_article_idx" "sn_files"
+                [Asc "file_article_id", Asc "file_index"]
+        Db.query $
+            CreateIndex "sn_files_user_idx" "sn_files"
+                [Asc "file_user_id"]
+        Db.query $
+            CreateIndex "sn_files_upload_date_idx" "sn_files"
+                [Asc "file_upload_date"]
+        Db.query $
             CreateTable "sn_file_chunks"
                 [ ColumnDecl (FBlob "chunk_file_id") [CCNotNull, CCReferences "sn_files" "file_id" FKRCascade FKRCascade]
                 , ColumnDecl (FInt "chunk_index") [CCNotNull]
-                , ColumnDecl (FBlob "chunk_content") [CCNotNull]
+                , ColumnDecl (FBlob "chunk_data") [CCNotNull]
                 ]
                 [ TCPrimaryKey ["chunk_file_id", "chunk_index"]
                 ]

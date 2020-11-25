@@ -1,5 +1,6 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 
 module Sql.Database.Sqlite
@@ -37,7 +38,9 @@ withSqlite path logger body = do
         (do
             newName <- fmap (Text.pack . show) $ atomicModifyIORef' nameCounter $ \x -> (x+1, x)
             logInfo logger $ "Sqlite: " <<|| newName << ": open connection"
-            newConn <- initialize path
+            newConn <- open path
+            execute_ newConn "PRAGMA foreign_keys = ON"
+            execute_ newConn "PRAGMA journal_mode = WAL"
             return (newName, newConn))
         (\(name, conn) -> do
             logInfo logger $ "Sqlite: " <<|| name << ": close connection"
@@ -46,100 +49,88 @@ withSqlite path logger body = do
             logErr logger $ "Sqlite: " <<|| name << ": " <<|| displayException err)
         (\pool -> do
             body $ Db.Database
-                { Db.makeQuery  = \query ->
+                { Db.execute = \level body ->
                     withResource pool $ \(connName, conn) ->
-                        sqliteMakeQuery logger connName conn query
-                , Db.withTransaction = \level body ->
-                    withResource pool $ \(connName, conn) ->
-                        sqliteWithTransaction logger connName conn level body
+                        sqliteExecute logger connName conn level body
                 })
 
-initialize :: String -> IO Connection
-initialize path = do
-    conn <- open path
-    execute_ conn "PRAGMA foreign_keys = ON"
-    execute_ conn "PRAGMA journal_mode = WAL"
-    return conn
-
-sqliteMakeQuery
+sqliteExecute
     :: Logger -> Text.Text -> Connection
-    -> Q.Query result -> IO (Either Db.QueryError result)
-sqliteMakeQuery logger connName conn queryData = do
-    Q.withQueryRender sqliteRenderDetail queryData $ \queryValues queryText -> do
-        logDebug logger $ "Sqlite: " <<|| connName << ": " <<|| queryText << "; -- " <<|| Q.showPrimValues 0 queryValues ""
-        let sqlQuery = fromString queryText :: Query
-        case queryData of
-            Q.CreateTable {} -> sqlitePcall logger connName $ execute_ conn sqlQuery
-            Q.CreateIndex {} -> sqlitePcall logger connName $ execute_ conn sqlQuery
-            Q.DropTable {} -> sqlitePcall logger connName $ execute_ conn sqlQuery
-            Q.Select {} -> sqlitePcall logger connName $ query conn sqlQuery queryValues
-            Q.Insert _ _ _ E -> sqlitePcall logger connName $ do
-                execute conn sqlQuery queryValues
-                n <- changes conn
-                case n of
-                    0 -> return Nothing
-                    _ -> return (Just E)
-            Q.Insert table fields values rets -> sqlitePcall logger connName $ do
-                sqliteInsertReturning logger connName conn table fields values rets
-            Q.Update {} -> sqlitePcall logger connName $ do
-                execute conn sqlQuery queryValues
-                fromIntegral <$> changes conn
-            Q.Delete {} -> sqlitePcall logger connName $ do
-                execute conn sqlQuery queryValues
-                fromIntegral <$> changes conn
-
-sqliteInsertReturning
-    :: (All Q.IsValue rs, AllWith Q.Value Show vs)
-    => Logger -> Text.Text -> Connection
-    -> Q.TableName -> HList Q.Field vs -> HList Q.Value vs -> HList Q.Field rs -> IO (Maybe (HList Maybe rs))
-sqliteInsertReturning logger connName conn table fields values rets = do
-    let queryData1 = Q.Insert table fields values E
-    Q.withQueryRender sqliteRenderDetail queryData1 $ \queryValues1 queryText1 -> do
-        logDebug logger $ "Sqlite: " <<|| connName << ": " <<|| queryText1 << "; -- " <<|| Q.showPrimValues 0 queryValues1 ""
-        execute conn (fromString queryText1) queryValues1
-        n <-changes conn
-        case n of
-            0 -> return Nothing
-            _ -> do
-                lastRowId <- lastInsertRowId conn
-                let queryData2 = Q.Select [Q.TableSource table] rets [Q.WhereWith lastRowId "_rowid_ = ?"] [] Q.AllRows
-                Q.withQueryRender sqliteRenderDetail queryData2 $ \queryValues2 queryText2 -> do
-                    logDebug logger $ "Sqlite: " <<|| connName << ": " <<|| queryText2 << "; -- " <<|| Q.showPrimValues 0 queryValues2 ""
-                    rets <- query conn (fromString queryText2) queryValues2
-                    case rets of
-                        [result] -> return $ Just result
-                        _ -> return Nothing
-
-sqliteWithTransaction
-    :: Logger -> Text.Text -> Connection
-    -> Db.TransactionLevel -> (Db.Database -> IO (Either Db.QueryError r)) -> IO (Either Db.QueryError r)
-sqliteWithTransaction logger connName conn _ body = do
-    tresult <- sqlitePcall logger connName $ do
-        withCancelableTransaction $ do
-            body $ Db.Database
-                { Db.makeQuery = sqliteMakeQuery logger connName conn
-                , Db.withTransaction = error "Sql.Database.Sqlite: nested transaction"
-                }
-    case tresult of
-        Left transFailure -> return $ Left transFailure
-        Right (Left userException) -> throwIO (userException :: SomeException)
-        Right (Right eresult) -> return eresult
+    -> Db.TransactionLevel -> Db.Transaction r r -> IO (Either Db.QueryError r)
+sqliteExecute logger connName conn _ body = do
+    sqlitePcall logger connName
+        (withCancelableTransaction $ do
+            Db.runTransactionBody body
+                (sqliteHandleQuery logger connName conn)
+                (return (False, Left Db.QueryError))
+                (return (False, Left Db.SerializationError))
+                (\x -> return (False, Right x))
+                (\x -> return (True, Right x))
+                )
+        (return $ Left Db.QueryError)
+        (return $ Left Db.SerializationError)
+        (\case
+            Left ex -> throwIO (ex :: SomeException)
+            Right (_, r) -> return r)
   where
     withCancelableTransaction act = do
         mask $ \restore -> do
             doQuery "BEGIN TRANSACTION"
             aresult <- try $ restore act
             case aresult of
-                Right (Right _) -> doQuery "COMMIT TRANSACTION"
+                Right (True, _) -> doQuery "COMMIT TRANSACTION"
                 _ -> doQuery "ROLLBACK TRANSACTION"
             return aresult
     doQuery str = do
         logDebug logger $ "Sqlite: " <<|| connName << ": " <<|| str
         execute_ conn (fromString str)
 
+sqliteHandleQuery
+    :: Logger -> Text.Text -> Connection
+    -> Q.Query result -> IO r -> IO r -> (result -> IO r) -> IO r
+sqliteHandleQuery logger connName conn queryData kabort kretry knext = do
+    Q.withQueryRender sqliteRenderDetail queryData $ \queryValues queryText -> do
+        logDebug logger $ "Sqlite: " <<|| connName << ": " <<|| queryText << "; -- " <<|| Q.showPrimValues 0 queryValues ""
+        let sqlQuery = fromString queryText :: Query
+        case queryData of
+            Q.CreateTable {} -> sqlitePcall logger connName (execute_ conn sqlQuery) kabort kretry knext
+            Q.CreateIndex {} -> sqlitePcall logger connName (execute_ conn sqlQuery) kabort kretry knext
+            Q.DropTable {} -> sqlitePcall logger connName (execute_ conn sqlQuery) kabort kretry knext
+            Q.Select {} -> sqlitePcall logger connName (query conn sqlQuery queryValues) kabort kretry knext
+            Q.Insert {} -> sqlitePcall logger connName
+                (execute conn sqlQuery queryValues >> changes conn)
+                kabort kretry $ \case
+                    0 -> knext False
+                    1 -> knext True
+                    _ -> kabort
+            Q.Update {} -> sqlitePcall logger connName
+                (execute conn sqlQuery queryValues >> changes conn) kabort kretry (knext . fromIntegral)
+            Q.Delete {} -> sqlitePcall logger connName
+                (execute conn sqlQuery queryValues >> changes conn) kabort kretry (knext . fromIntegral)
+
+sqlitePcall :: Logger -> Text.Text -> IO a -> IO r -> IO r -> (a -> IO r) -> IO r
+sqlitePcall logger connName act kabort kretry knext = do
+    eret <- try act
+    case eret of
+        Right r -> knext r
+        Left ex -> do
+            let canRetry = case fromException ex of
+                    Nothing -> False
+                    Just SQLError {sqlError = se} -> case se of
+                        ErrorBusy -> True
+                        ErrorLocked -> True
+                        _ -> False
+            if canRetry
+                then do
+                    logDebug logger $ "Sqlite: " <<|| connName << ": Serialization failure: " <<|| displayException ex
+                    kretry
+                else do
+                    logWarn logger $ "Sqlite: " <<|| connName << ": Error: " <<|| displayException ex
+                    kabort
+
 sqliteRenderDetail :: Q.RenderDetail
 sqliteRenderDetail = Q.RenderDetail
-    { Q.detailFieldType = \field -> case field of
+    { Q.detailFieldType = \case
         Q.FInt _ -> " INTEGER"
         Q.FReal _ -> " REAL"
         Q.FBool _ -> " INTEGER"
@@ -150,25 +141,6 @@ sqliteRenderDetail = Q.RenderDetail
     , Q.detailInsertRight = ""
     , Q.detailNullEquality = " IS "
     }
-
-sqlitePcall :: Logger -> Text.Text -> IO a -> IO (Either Db.QueryError a)
-sqlitePcall logger connName act = do
-    eret <- try act
-    case eret of
-        Right r -> return $ Right r
-        Left ex -> do
-            let ecode = case fromException ex of
-                    Nothing -> Db.QueryError
-                    Just SQLError {sqlError = se} -> case se of
-                        ErrorBusy -> Db.SerializationError
-                        ErrorLocked -> Db.SerializationError
-                        _ -> Db.QueryError
-            case ecode of
-                Db.SerializationError -> logDebug logger $
-                    "Sqlite: " <<|| connName << ": Serialization failure: " <<|| displayException ex
-                Db.QueryError -> logWarn logger $
-                    "Sqlite: " <<|| connName << ": Error: " <<|| displayException ex
-            return $ Left ecode
 
 instance forall ts. (All Q.IsValue ts) => FromRow (HList Maybe ts) where
     fromRow = traverseHListGiven

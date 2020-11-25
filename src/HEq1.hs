@@ -65,4 +65,5 @@ heqTemplateConMatch bsource (GadtC [conName] fields _) = do
                     []
                 ])
         []
-heqTemplateConMatch _ _ = fail "unsupported constructor syntax"
+heqTemplateConMatch bsource (ForallC _ _ con) = heqTemplateConMatch bsource con
+heqTemplateConMatch _ con = fail $ "unsupported constructor syntax: " ++ show con

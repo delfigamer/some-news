@@ -32,6 +32,8 @@ import qualified Sql.Database as Db
 import qualified Sql.Query as Q
 import qualified Sql.Query.Render as Q
 
+type AbortRetryCont a = forall r. IO r -> IO r -> (a -> IO r) -> IO r
+
 withPostgres :: String -> Logger -> (Db.Database -> IO r) -> IO r
 withPostgres conf logger body = do
     let pgconfig = Text.encodeUtf8 $ Text.pack conf
@@ -49,54 +51,29 @@ withPostgres conf logger body = do
             logErr logger $ "Postgres: " <<|| name << ": " <<|| displayException err)
         (\pool -> do
             body $ Db.Database
-                { Db.makeQuery = \query ->
+                { Db.execute = \level body ->
                     withResource pool $ \(connName, conn) ->
-                        postgresMakeQuery logger connName conn query
-                , Db.withTransaction = \level body ->
-                    withResource pool $ \(connName, conn) ->
-                        postgresWithTransaction logger connName conn level body
+                        postgresExecute logger connName conn level body
                 })
 
-postgresMakeQuery
+postgresExecute
     :: Logger -> Text.Text -> Connection
-    -> Q.Query result -> IO (Either Db.QueryError result)
-postgresMakeQuery logger connName conn queryData = do
-    Q.withQueryRender postgresRenderDetail queryData $ \queryValues queryText -> do
-        logDebug logger $ "Postgres: " <<|| connName << ": " <<|| queryText << "; -- " <<|| Q.showPrimValues 0 queryValues ""
-        let sqlQuery = fromString queryText :: Query
-        case queryData of
-            Q.CreateTable {} -> postgresPcall_ logger connName $ execute_ conn sqlQuery
-            Q.CreateIndex {} -> postgresPcall_ logger connName $ execute_ conn sqlQuery
-            Q.DropTable {} -> postgresPcall_ logger connName $ execute_ conn sqlQuery
-            Q.Select {} -> postgresPcall logger connName $ query conn sqlQuery queryValues
-            Q.Insert _ _ _ E -> do
-                n <- postgresPcall logger connName $ execute conn sqlQuery queryValues
-                return $ fmap foldInsertE n
-            Q.Insert {} -> do
-                rets <- postgresPcall logger connName $ query conn sqlQuery queryValues
-                return $ fmap foldInsert rets
-            Q.Update {} -> postgresPcall logger connName $ execute conn sqlQuery queryValues
-            Q.Delete {} -> postgresPcall logger connName $ execute conn sqlQuery queryValues
-  where
-    foldInsertE 1 = Just E
-    foldInsertE _ = Nothing
-    foldInsert [r] = Just r
-    foldInsert _ = Nothing
-
-postgresWithTransaction
-    :: Logger -> Text.Text -> Connection
-    -> Db.TransactionLevel -> (Db.Database -> IO (Either Db.QueryError r)) -> IO (Either Db.QueryError r)
-postgresWithTransaction logger connName conn level body = do
-    tresult <- postgresPcall logger connName $ do
-        withCancelableTransaction $ do
-            body $ Db.Database
-                { Db.makeQuery = postgresMakeQuery logger connName conn
-                , Db.withTransaction = error "Sql.Database.Postgres: nested transaction"
-                }
-    case tresult of
-        Left transFailure -> return $ Left transFailure
-        Right (Left userException) -> throwIO (userException :: SomeException)
-        Right (Right eresult) -> return eresult
+    -> Db.TransactionLevel -> Db.Transaction r r -> IO (Either Db.QueryError r)
+postgresExecute logger connName conn level body = do
+    postgresPcall logger connName
+        (withCancelableTransaction $ do
+            Db.runTransactionBody body
+                (postgresHandleQuery logger connName conn)
+                (return (False, Left Db.QueryError))
+                (return (False, Left Db.SerializationError))
+                (\x -> return (False, Right x))
+                (\x -> return (True, Right x))
+                )
+        (return $ Left Db.QueryError)
+        (return $ Left Db.SerializationError)
+        (\case
+            Left ex -> throwIO (ex :: SomeException)
+            Right (_, r) -> return r)
   where
     withCancelableTransaction act = do
         mask $ \restore -> do
@@ -106,12 +83,54 @@ postgresWithTransaction logger connName conn level body = do
                 Db.Serializable -> doQuery "BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE"
             aresult <- try $ restore act
             case aresult of
-                Right (Right _) -> doQuery "COMMIT TRANSACTION"
+                Right (True, _) -> doQuery "COMMIT TRANSACTION"
                 _ -> doQuery "ROLLBACK TRANSACTION"
             return aresult
     doQuery str = do
         logDebug logger $ "Postgres: " <<|| connName << ": " <<|| str
         execute_ conn (fromString str)
+
+postgresHandleQuery
+    :: Logger -> Text.Text -> Connection
+    -> Q.Query result -> AbortRetryCont result
+postgresHandleQuery logger connName conn queryData kabort kretry knext = do
+    Q.withQueryRender postgresRenderDetail queryData $ \queryValues queryText -> do
+        logDebug logger $ "Postgres: " <<|| connName << ": " <<|| queryText << "; -- " <<|| Q.showPrimValues 0 queryValues ""
+        let sqlQuery = fromString queryText :: Query
+        case queryData of
+            Q.CreateTable {} -> postgresPcall_ logger connName (execute_ conn sqlQuery) kabort kretry knext
+            Q.CreateIndex {} -> postgresPcall_ logger connName (execute_ conn sqlQuery) kabort kretry knext
+            Q.DropTable {} -> postgresPcall_ logger connName (execute_ conn sqlQuery) kabort kretry knext
+            Q.Select {} -> postgresPcall logger connName (query conn sqlQuery queryValues) kabort kretry knext
+            Q.Insert {} -> postgresPcall logger connName (execute conn sqlQuery queryValues) kabort kretry $ \case
+                0 -> knext False
+                1 -> knext True
+                _ -> kabort
+            Q.Update {} -> postgresPcall logger connName (execute conn sqlQuery queryValues) kabort kretry knext
+            Q.Delete {} -> postgresPcall logger connName (execute conn sqlQuery queryValues) kabort kretry knext
+
+postgresPcall :: Logger -> Text.Text -> IO a -> AbortRetryCont a
+postgresPcall logger connName act kabort kretry knext = do
+    eret <- try act
+    case eret of
+        Right r -> knext r
+        Left ex -> do
+            let canRetry = case fromException ex of
+                    Nothing -> False
+                    Just SqlError {sqlState = state} -> if BS.isPrefixOf "40" state
+                        then True
+                        else False
+            if canRetry
+                then do
+                    logDebug logger $ "Postgres: " <<|| connName << ": Serialization failure: " <<|| displayException ex
+                    kretry
+                else do
+                    logWarn logger $ "Postgres: " <<|| connName << ": Error: " <<|| displayException ex
+                    kabort
+
+postgresPcall_ :: Logger.Logger -> Text.Text -> IO a -> AbortRetryCont ()
+postgresPcall_ logger connName act kabort kretry knext = do
+    postgresPcall logger connName act kabort kretry (\_ -> knext ())
 
 postgresRenderDetail :: Q.RenderDetail
 postgresRenderDetail = Q.RenderDetail
@@ -126,29 +145,6 @@ postgresRenderDetail = Q.RenderDetail
     , Q.detailInsertRight = " ON CONFLICT DO NOTHING"
     , Q.detailNullEquality = " IS NOT DISTINCT FROM "
     }
-
-postgresPcall :: Logger -> Text.Text -> IO a -> IO (Either Db.QueryError a)
-postgresPcall logger connName act = do
-    eret <- try act
-    case eret of
-        Right r -> return $ Right r
-        Left ex -> do
-            let ecode = case fromException ex of
-                    Nothing -> Db.QueryError
-                    Just SqlError {sqlState = state} -> if BS.isPrefixOf "40" state
-                        then Db.SerializationError
-                        else Db.QueryError
-            case ecode of
-                Db.SerializationError -> logDebug logger $
-                    "Postgres: " <<|| connName << ": Serialization failure: " <<|| displayException ex
-                Db.QueryError -> logWarn logger $
-                    "Postgres: " <<|| connName << ": Error: " <<|| displayException ex
-            return $ Left ecode
-
-postgresPcall_ :: Logger.Logger -> Text.Text -> IO a -> IO (Either Db.QueryError ())
-postgresPcall_ logger connName act = do
-    r <- postgresPcall logger connName act
-    return $ r >> Right ()
 
 instance forall ts. (All Q.IsValue ts) => FromRow (HList Maybe ts) where
     fromRow = traverseHListGiven

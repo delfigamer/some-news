@@ -218,7 +218,7 @@ data Query result where
     CreateIndex :: IndexName -> TableName -> [RowOrder] -> Query ()
     DropTable :: TableName -> Query ()
     Select :: All IsValue rs => [RowSource] -> HList Field rs -> [Condition] -> [RowOrder] -> RowRange -> Select rs
-    Insert :: (AllWith Value Show vs, All IsValue rs) => TableName -> HList Field vs -> HList Value vs -> HList Field rs -> Query (Maybe (HList Maybe rs))
+    Insert :: AllWith Value Show vs => TableName -> HList Field vs -> HList Value vs -> Query Bool
     Update :: AllWith Value Show vs => TableName -> HList Field vs -> HList Value vs -> [Condition] -> Query Int64
     Delete :: TableName -> [Condition] -> Query Int64
 
@@ -239,11 +239,10 @@ instance Show (Query ts) where
         . showString " " . showsPrec 11 cond
         . showString " " . showsPrec 11 order
         . showString " " . showsPrec 11 range
-    showsPrec d (Insert table fields values rets) = showParen (d > 10)
+    showsPrec d (Insert table fields values) = showParen (d > 10)
         $ showString "Insert " . showsPrec 11 table
         . showString " " . showPrimFields 11 (primFields fields)
         . showString " " . showsPrec 11 values
-        . showString " " . showPrimFields 11 (primFields rets)
     showsPrec d (Update table fields values cond) = showParen (d > 10)
         $ showString "Update " . showsPrec 11 table
         . showString " " . showPrimFields 11 (primFields fields)
