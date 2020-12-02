@@ -679,193 +679,197 @@ minceArticles
     -> IO ()
 minceArticles storage sampleSize userTable authorTable userAuthorConnSet categoryTree articleTable = do
     validateArticles storage articleTable
-    -- do
-        -- authorRefs <- Map.keys authorTable
-        -- articleList <- Map.elems articleTable
-        -- toAlter <- generate $ chooseFrom (sampleSize `div` 5) articleList
-        -- parallelFor_ toAlter $ \(article, text) -> do
-            -- authorRef <- generate $ chooseOne authorRefs
-            -- assertRight =<< storagePerform storage (ArticleSetAuthor (articleId article) authorRef)
-            -- Map.insert articleTable (articleId article) $
-                -- (article {articleAuthor = authorRef}, text)
-        -- validateArticles storage articleTable
-    -- do
-        -- articleList <- Map.elems articleTable
-        -- toAlter <- generate $ chooseFrom (sampleSize `div` 5) articleList
-        -- parallelFor_ toAlter $ \(article, text) -> do
-            -- name <- generate $ randomText
-            -- assertRight =<< storagePerform storage (ArticleSetName (articleId article) name)
-            -- Map.insert articleTable (articleId article) $
-                -- (article {articleName = name}, text)
-        -- validateArticles storage articleTable
-    -- do
-        -- articleList <- Map.elems articleTable
-        -- toAlter <- generate $ chooseFrom (sampleSize `div` 5) articleList
-        -- parallelFor_ toAlter $ \(article, _) -> do
-            -- text <- generate $ randomText
-            -- version2 <- assertRight =<< storagePerform storage
-                -- (ArticleSetText (articleId article) (articleVersion article) text)
-            -- Map.insert articleTable (articleId article) $
-                -- (article {articleVersion = version2}, text)
-        -- validateArticles storage articleTable
-    -- do
-        -- articleList <- Map.elems articleTable
-        -- toAlter <- generate $ chooseFrom (sampleSize `div` 5) articleList
-        -- parallelFor_ toAlter $ \(article, text) -> do
-            -- pubStatus <- byChance 3 5
-                -- (generate $ PublishAt <$> randomTime)
-                -- (return NonPublished)
-            -- assertRight =<< storagePerform storage (ArticleSetPublicationStatus (articleId article) pubStatus)
-            -- Map.insert articleTable (articleId article) $
-                -- (article {articlePublicationStatus = pubStatus}, text)
-        -- validateArticles storage articleTable
-    -- do
-        -- categoryRefs <- Tree.keys categoryTree
-        -- articleList <- Map.elems articleTable
-        -- toAlter <- generate $ chooseFrom (sampleSize `div` 5) articleList
-        -- parallelFor_ toAlter $ \(article, text) -> do
-            -- category <- byChance 3 5
-                -- (generate $ chooseOne categoryRefs)
-                -- (return "")
-            -- assertRight =<< storagePerform storage (ArticleSetCategory (articleId article) category)
-            -- Map.insert articleTable (articleId article) $
-                -- (article {articleCategory = category}, text)
-        -- validateArticles storage articleTable
-    -- do
-        -- articleList <- Map.elems articleTable
-        -- toDelete <- generate $ chooseFrom (sampleSize `div` 5) articleList
-        -- parallelFor_ toDelete $ \(article, _) -> do
-            -- assertRight =<< storagePerform storage (ArticleDelete (articleId article))
-            -- Map.delete articleTable (articleId article)
-        -- validateArticles storage articleTable
-    -- do
-        -- articleList <- Map.elems articleTable
-        -- parallelFor_ articleList $ \(article, _) -> do
-            -- badVersion <- generate $ randomVersion `suchThat` (/= articleVersion article)
-            -- storagePerform storage (ArticleSetText (articleId article) badVersion "bar") `shouldReturn` Left VersionError
-        -- badRefs <- sampleBadRefs $ Map.member articleTable
-        -- parallelFor_ badRefs $ \ref -> do
-            -- storagePerform storage (ArticleSetAuthor ref "") `shouldReturn` Left NotFoundError
-            -- storagePerform storage (ArticleSetName ref "foo") `shouldReturn` Left NotFoundError
-            -- storagePerform storage (ArticleSetText ref "" "bar") `shouldReturn` Left NotFoundError
-            -- storagePerform storage (ArticleSetCategory ref "") `shouldReturn` Left NotFoundError
-            -- storagePerform storage (ArticleSetPublicationStatus ref NonPublished) `shouldReturn` Left NotFoundError
-            -- storagePerform storage (ArticleDelete ref) `shouldReturn` Left NotFoundError
-            -- storagePerform storage (ArticleList True (ListView 0 1 [FilterArticleId ref] []))
-                -- `shouldReturn`
-                -- Right []
-    -- do
-        -- authorRefs <- Map.keys authorTable
-        -- authorsToDelete <- generate $ chooseFrom (sampleSize `div` 5) authorRefs
-        -- parallelFor_ authorsToDelete $ \authorRef -> do
-            -- assertRight =<< storagePerform storage (AuthorDelete authorRef)
-            -- Map.delete authorTable authorRef
-            -- Relmap.removeRight userAuthorConnSet authorRef
-        -- articleList <- Map.elems articleTable
-        -- parallelFor_ articleList $ \article -> do
-            -- if articleAuthor article `elem` authorsToDelete
-                -- then case articlePublicationStatus article of
-                    -- PublishAt _ -> Map.insert articleTable (articleId article) $
-                        -- article {articleAuthor = ""}
-                    -- NonPublished -> Map.delete articleTable (articleId article)
-                -- else return ()
-        -- validateArticles storage articleTable
-    -- do
-        -- categoryList <- map toCategory <$> Tree.toList categoryTree
-        -- categoriesToDelete <- generate $ chooseFrom (sampleSize `div` 5) categoryList
-        -- parallelFor_ categoriesToDelete $ \category -> do
-            -- assertRight =<< storagePerform storage (CategoryDelete (categoryId category))
-            -- Just parentRef <- Tree.exclude categoryTree (categoryId category)
-            -- Map.modify articleTable $ \article ->
-                -- if articleCategory article == categoryId category
-                    -- then Just article {articleCategory = parentRef}
-                    -- else Nothing
-        -- validateArticles storage articleTable
-    -- do
-        -- articleList <- sortOn articleId <$> Map.elems articleTable
-        -- parallelFor_ articleList $ \article -> do
-            -- storagePerform storage (ArticleList True (ListView 0 1 [FilterArticleId (articleId article)] []))
-                -- `shouldReturn`
-                -- Right [article]
-            -- storagePerform storage (ArticleList False (ListView 0 1 [FilterArticleId (articleId article)] []))
-                -- `shouldReturn`
-                -- Right [article | articlePublicationStatus article >= PublishAt timeGenBase]
-        -- authorRefs <- Map.keys authorTable
-        -- parallelFor_ ("" : authorRefs) $ \authorRef -> do
-            -- storagePerform storage (ArticleList True (ListView 0 maxBound [FilterArticleAuthorId authorRef] []))
-                -- `shouldReturn`
-                -- Right (filter (\article -> articleAuthor article == authorRef) articleList)
-        -- userAuthorGroups <- Multimap.toGroupsWith (Relmap.left userAuthorConnSet) userTable
-        -- parallelFor_ userAuthorGroups $ \(userRef, userAuthors) -> do
-            -- storagePerform storage (ArticleList True (ListView 0 maxBound [FilterArticleUserId userRef] []))
-                -- `shouldReturn`
-                -- Right (filter (\article -> articleAuthor article `elem` userAuthors) articleList)
-        -- authorUserGroups <- Multimap.toGroupsWith (Relmap.right userAuthorConnSet) authorTable
-        -- let orphanAuthors = "" : map fst (filter (null . snd) authorUserGroups)
-        -- storagePerform storage (ArticleList True (ListView 0 maxBound [FilterArticleUserId ""] []))
-            -- `shouldReturn`
-            -- Right (filter (\article -> articleAuthor article `elem` orphanAuthors) articleList)
-        -- categoryRefs <- Tree.keys categoryTree
-        -- parallelFor_ ("" : categoryRefs) $ \categoryRef -> do
-            -- storagePerform storage (ArticleList True (ListView 0 maxBound [FilterArticleCategoryId categoryRef] []))
-                -- `shouldReturn`
-                -- Right (filter (\article -> articleCategory article == categoryRef) articleList)
-            -- case categoryRef of
-                -- "" -> do
-                    -- storagePerform storage (ArticleList True (ListView 0 maxBound [FilterArticleTransitiveCategoryId categoryRef] []))
-                        -- `shouldReturn`
-                        -- Right (filter (\article -> articleCategory article == "") articleList)
-                -- _ -> do
-                    -- subcatRefs <- map (\(k, _, _) -> k) <$> Tree.subtreeList categoryTree categoryRef
-                    -- storagePerform storage (ArticleList True (ListView 0 maxBound [FilterArticleTransitiveCategoryId categoryRef] []))
-                        -- `shouldReturn`
-                        -- Right (filter (\article -> articleCategory article `elem` subcatRefs) articleList)
-        -- let timeA = addUTCTime (86400 * (-500)) timeGenBase
-        -- let timeB = addUTCTime (86400 * (365 * 10 + 500)) timeGenBase
-        -- storagePerform storage (ArticleList True (ListView 0 maxBound [FilterArticlePublishedBefore timeB] []))
-            -- `shouldReturn`
-            -- Right (filter (publishedBefore timeB) articleList)
-        -- storagePerform storage (ArticleList False (ListView 0 maxBound [FilterArticlePublishedBefore timeB] []))
-            -- `shouldReturn`
-            -- Right (filter (publishedBefore timeGenBase) articleList)
-        -- storagePerform storage (ArticleList True (ListView 0 maxBound [FilterArticlePublishedAfter timeA] []))
-            -- `shouldReturn`
-            -- Right (filter (publishedAfter timeA) articleList)
-        -- storagePerform storage (ArticleList False (ListView 0 maxBound [FilterArticlePublishedAfter timeA] []))
-            -- `shouldReturn`
-            -- Right (filter (publishedWithin timeA timeGenBase) articleList)
-        -- storagePerform storage (ArticleList True (ListView 0 maxBound [FilterArticlePublishedAfter timeA, FilterArticlePublishedBefore timeB] []))
-            -- `shouldReturn`
-            -- Right (filter (publishedWithin timeA timeB) articleList)
-        -- storagePerform storage (ArticleList False (ListView 0 maxBound [FilterArticlePublishedAfter timeA, FilterArticlePublishedBefore timeB] []))
-            -- `shouldReturn`
-            -- Right (filter (publishedWithin timeA timeGenBase) articleList)
-        -- storagePerform storage (ArticleList True (ListView 0 maxBound [] [(OrderArticleName, Ascending)]))
-            -- `shouldReturn`
-            -- Right (sortOn articleName articleList)
-        -- storagePerform storage (ArticleList True (ListView 0 maxBound [] [(OrderArticleDate, Ascending)]))
-            -- `shouldReturn`
-            -- Right (sortOn articlePublicationStatus articleList)
-        -- articleAuthorNameList <- parallelFor articleList $ \article -> do
-            -- case articleAuthor article of
-                -- "" -> return Nothing
-                -- _ -> do
-                    -- author <- Map.lookup' authorTable (articleAuthor article)
-                    -- return $ Just $ authorName author
-        -- let articleListByAuthorName = sortOnList articleList articleAuthorNameList
-        -- storagePerform storage (ArticleList True (ListView 0 maxBound [] [(OrderArticleAuthorName, Ascending)]))
-            -- `shouldReturn`
-            -- Right articleListByAuthorName
-        -- articleCategoryNameList <- parallelFor articleList $ \article -> do
-            -- case articleCategory article of
-                -- "" -> return Nothing
-                -- _ -> do
-                    -- (_, name, _) <- Tree.lookup' categoryTree (articleCategory article)
-                    -- return $ Just name
-        -- let articleListByCategoryName = sortOnList articleList articleCategoryNameList
-        -- storagePerform storage (ArticleList True (ListView 0 maxBound [] [(OrderArticleCategoryName, Ascending)]))
-            -- `shouldReturn`
-            -- Right articleListByCategoryName
+    do
+        authorRefs <- Map.keys authorTable
+        articleList <- Map.elems articleTable
+        toAlter <- generate $ chooseFrom (sampleSize `div` 5) articleList
+        parallelFor_ toAlter $ \(article, text) -> do
+            authorRef <- generate $ chooseOne authorRefs
+            assertRight =<< storagePerform storage (ArticleSetAuthor (articleId article) authorRef)
+            Map.insert articleTable (articleId article) $
+                (article {articleAuthor = authorRef}, text)
+        validateArticles storage articleTable
+    do
+        articleList <- Map.elems articleTable
+        toAlter <- generate $ chooseFrom (sampleSize `div` 5) articleList
+        parallelFor_ toAlter $ \(article, text) -> do
+            name <- generate $ randomText
+            assertRight =<< storagePerform storage (ArticleSetName (articleId article) name)
+            Map.insert articleTable (articleId article) $
+                (article {articleName = name}, text)
+        validateArticles storage articleTable
+    do
+        articleList <- Map.elems articleTable
+        toAlter <- generate $ chooseFrom (sampleSize `div` 5) articleList
+        parallelFor_ toAlter $ \(article, _) -> do
+            text <- generate $ randomText
+            version2 <- assertRight =<< storagePerform storage
+                (ArticleSetText (articleId article) (articleVersion article) text)
+            Map.insert articleTable (articleId article) $
+                (article {articleVersion = version2}, text)
+        validateArticles storage articleTable
+    do
+        articleList <- Map.elems articleTable
+        toAlter <- generate $ chooseFrom (sampleSize `div` 5) articleList
+        parallelFor_ toAlter $ \(article, text) -> do
+            pubStatus <- byChance 3 5
+                (generate $ PublishAt <$> randomTime)
+                (return NonPublished)
+            assertRight =<< storagePerform storage (ArticleSetPublicationStatus (articleId article) pubStatus)
+            Map.insert articleTable (articleId article) $
+                (article {articlePublicationStatus = pubStatus}, text)
+        validateArticles storage articleTable
+    do
+        categoryRefs <- Tree.keys categoryTree
+        articleList <- Map.elems articleTable
+        toAlter <- generate $ chooseFrom (sampleSize `div` 5) articleList
+        parallelFor_ toAlter $ \(article, text) -> do
+            category <- byChance 3 5
+                (generate $ chooseOne categoryRefs)
+                (return "")
+            assertRight =<< storagePerform storage (ArticleSetCategory (articleId article) category)
+            Map.insert articleTable (articleId article) $
+                (article {articleCategory = category}, text)
+        validateArticles storage articleTable
+    do
+        articleList <- Map.elems articleTable
+        toDelete <- generate $ chooseFrom (sampleSize `div` 5) articleList
+        parallelFor_ toDelete $ \(article, _) -> do
+            assertRight =<< storagePerform storage (ArticleDelete (articleId article))
+            Map.delete articleTable (articleId article)
+        validateArticles storage articleTable
+    do
+        articleList <- Map.elems articleTable
+        parallelFor_ articleList $ \(article, _) -> do
+            badVersion <- generate $ randomVersion `suchThat` (/= articleVersion article)
+            storagePerform storage (ArticleSetText (articleId article) badVersion "bar") `shouldReturn` Left VersionError
+        badRefs <- sampleBadRefs $ Map.member articleTable
+        parallelFor_ badRefs $ \ref -> do
+            storagePerform storage (ArticleSetAuthor ref "") `shouldReturn` Left NotFoundError
+            storagePerform storage (ArticleSetName ref "foo") `shouldReturn` Left NotFoundError
+            storagePerform storage (ArticleSetText ref "" "bar") `shouldReturn` Left NotFoundError
+            storagePerform storage (ArticleSetCategory ref "") `shouldReturn` Left NotFoundError
+            storagePerform storage (ArticleSetPublicationStatus ref NonPublished) `shouldReturn` Left NotFoundError
+            storagePerform storage (ArticleDelete ref) `shouldReturn` Left NotFoundError
+            storagePerform storage (ArticleList True (ListView 0 1 [FilterArticleId ref] []))
+                `shouldReturn`
+                Right []
+    do
+        authorRefs <- Map.keys authorTable
+        authorsToDelete <- generate $ chooseFrom (sampleSize `div` 5) authorRefs
+        parallelFor_ authorsToDelete $ \authorRef -> do
+            assertRight =<< storagePerform storage (AuthorDelete authorRef)
+            Map.delete authorTable authorRef
+            Relmap.removeRight userAuthorConnSet authorRef
+        articleList <- Map.elems articleTable
+        parallelFor_ articleList $ \(article, text) -> do
+            if articleAuthor article `elem` authorsToDelete
+                then case articlePublicationStatus article of
+                    PublishAt _ -> Map.insert articleTable (articleId article) $
+                        (article {articleAuthor = ""}, text)
+                    NonPublished -> Map.delete articleTable (articleId article)
+                else return ()
+        validateArticles storage articleTable
+    do
+        categoryList <- map toCategory <$> Tree.toList categoryTree
+        categoriesToDelete <- generate $ chooseFrom (sampleSize `div` 5) categoryList
+        parallelFor_ categoriesToDelete $ \category -> do
+            assertRight =<< storagePerform storage (CategoryDelete (categoryId category))
+            Just parentRef <- Tree.exclude categoryTree (categoryId category)
+            Map.modify articleTable $ \(article, text) ->
+                if articleCategory article == categoryId category
+                    then Just (article {articleCategory = parentRef}, text)
+                    else Nothing
+        validateArticles storage articleTable
+    do
+        articleList <- sortOn (articleId . fst) <$> Map.elems articleTable
+        let (articleInfoList, articleTextList) = unzip articleList
+        parallelFor_ articleList $ \(article, text) -> do
+            storagePerform storage (ArticleList True (ListView 0 1 [FilterArticleId (articleId article)] []))
+                `shouldReturn`
+                Right [article]
+            storagePerform storage (ArticleList False (ListView 0 1 [FilterArticleId (articleId article)] []))
+                `shouldReturn`
+                Right [article | articlePublicationStatus article >= PublishAt timeGenBase]
+            storagePerform storage (ArticleGetText (articleId article))
+                `shouldReturn`
+                Right text
+        authorRefs <- Map.keys authorTable
+        parallelFor_ ("" : authorRefs) $ \authorRef -> do
+            storagePerform storage (ArticleList True (ListView 0 maxBound [FilterArticleAuthorId authorRef] []))
+                `shouldReturn`
+                Right (filter (\article -> articleAuthor article == authorRef) articleInfoList)
+        userAuthorGroups <- Multimap.toGroupsWith (Relmap.left userAuthorConnSet) userTable
+        parallelFor_ userAuthorGroups $ \(userRef, userAuthors) -> do
+            storagePerform storage (ArticleList True (ListView 0 maxBound [FilterArticleUserId userRef] []))
+                `shouldReturn`
+                Right (filter (\article -> articleAuthor article `elem` userAuthors) articleInfoList)
+        authorUserGroups <- Multimap.toGroupsWith (Relmap.right userAuthorConnSet) authorTable
+        let orphanAuthors = "" : map fst (filter (null . snd) authorUserGroups)
+        storagePerform storage (ArticleList True (ListView 0 maxBound [FilterArticleUserId ""] []))
+            `shouldReturn`
+            Right (filter (\article -> articleAuthor article `elem` orphanAuthors) articleInfoList)
+        categoryRefs <- Tree.keys categoryTree
+        parallelFor_ ("" : categoryRefs) $ \categoryRef -> do
+            storagePerform storage (ArticleList True (ListView 0 maxBound [FilterArticleCategoryId categoryRef] []))
+                `shouldReturn`
+                Right (filter (\article -> articleCategory article == categoryRef) articleInfoList)
+            case categoryRef of
+                "" -> do
+                    storagePerform storage (ArticleList True (ListView 0 maxBound [FilterArticleTransitiveCategoryId categoryRef] []))
+                        `shouldReturn`
+                        Right (filter (\article -> articleCategory article == "") articleInfoList)
+                _ -> do
+                    subcatRefs <- map (\(k, _, _) -> k) <$> Tree.subtreeList categoryTree categoryRef
+                    storagePerform storage (ArticleList True (ListView 0 maxBound [FilterArticleTransitiveCategoryId categoryRef] []))
+                        `shouldReturn`
+                        Right (filter (\article -> articleCategory article `elem` subcatRefs) articleInfoList)
+        let timeA = addUTCTime (86400 * (-500)) timeGenBase
+        let timeB = addUTCTime (86400 * (365 * 10 + 500)) timeGenBase
+        storagePerform storage (ArticleList True (ListView 0 maxBound [FilterArticlePublishedBefore timeB] []))
+            `shouldReturn`
+            Right (filter (publishedBefore timeB) articleInfoList)
+        storagePerform storage (ArticleList False (ListView 0 maxBound [FilterArticlePublishedBefore timeB] []))
+            `shouldReturn`
+            Right (filter (publishedBefore timeGenBase) articleInfoList)
+        storagePerform storage (ArticleList True (ListView 0 maxBound [FilterArticlePublishedAfter timeA] []))
+            `shouldReturn`
+            Right (filter (publishedAfter timeA) articleInfoList)
+        storagePerform storage (ArticleList False (ListView 0 maxBound [FilterArticlePublishedAfter timeA] []))
+            `shouldReturn`
+            Right (filter (publishedWithin timeA timeGenBase) articleInfoList)
+        storagePerform storage (ArticleList True (ListView 0 maxBound [FilterArticlePublishedAfter timeA, FilterArticlePublishedBefore timeB] []))
+            `shouldReturn`
+            Right (filter (publishedWithin timeA timeB) articleInfoList)
+        storagePerform storage (ArticleList False (ListView 0 maxBound [FilterArticlePublishedAfter timeA, FilterArticlePublishedBefore timeB] []))
+            `shouldReturn`
+            Right (filter (publishedWithin timeA timeGenBase) articleInfoList)
+        storagePerform storage (ArticleList True (ListView 0 maxBound [] [(OrderArticleName, Ascending)]))
+            `shouldReturn`
+            Right (sortOn articleName articleInfoList)
+        storagePerform storage (ArticleList True (ListView 0 maxBound [] [(OrderArticleDate, Ascending)]))
+            `shouldReturn`
+            Right (sortOn articlePublicationStatus articleInfoList)
+        articleAuthorNameList <- parallelFor articleInfoList $ \article -> do
+            case articleAuthor article of
+                "" -> return Nothing
+                _ -> do
+                    author <- Map.lookup' authorTable (articleAuthor article)
+                    return $ Just $ authorName author
+        let articleListByAuthorName = sortOnList articleInfoList articleAuthorNameList
+        storagePerform storage (ArticleList True (ListView 0 maxBound [] [(OrderArticleAuthorName, Ascending)]))
+            `shouldReturn`
+            Right articleListByAuthorName
+        articleCategoryNameList <- parallelFor articleInfoList $ \article -> do
+            case articleCategory article of
+                "" -> return Nothing
+                _ -> do
+                    (_, name, _) <- Tree.lookup' categoryTree (articleCategory article)
+                    return $ Just name
+        let articleListByCategoryName = sortOnList articleInfoList articleCategoryNameList
+        storagePerform storage (ArticleList True (ListView 0 maxBound [] [(OrderArticleCategoryName, Ascending)]))
+            `shouldReturn`
+            Right articleListByCategoryName
     return ()
   where
     publishedBefore ta article = articlePublicationStatus article >= PublishAt ta
