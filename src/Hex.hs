@@ -1,7 +1,10 @@
 module Hex
     ( toHex
+    , hex
     , parseHex
     ) where
+
+import Data.String
 
 toHex :: (Enum e1, Enum e2) => [e1] -> [e2]
 toHex [] = []
@@ -11,6 +14,9 @@ toHex (c:cs) = hchar (x `div` 16) : hchar (x `mod` 16) : toHex cs
     hchar n
         | n < 10 = toEnum $ n + 48
         | otherwise = toEnum $ n + 87
+
+hex :: IsString a => String -> a
+hex = fromString . toHex
 
 parseHex
     :: (Enum e1, Enum e2)

@@ -4,7 +4,7 @@ cabal-version: 1.12
 --
 -- see: https://github.com/sol/hpack
 --
--- hash: 4fb0c100b7c1d8f0e942193cad908299d4bc17879618f7944b8296f5c57b1934
+-- hash: 6a27b9c56df2439a3786432fdb80a13abc227cb1d9e0d27501cf9ba6ae051d84
 
 name:           SomeNews
 version:        0.1.0.0
@@ -27,12 +27,14 @@ source-repository head
 
 library
   exposed-modules:
-      Binary
+      Cont
       HEq1
       Hex
       JsonInterface
+      JsonInterface.ActionTicket
       JsonInterface.Config
       JsonInterface.Internal
+      JsonInterface.Response
       Lib
       Logger
       ResourcePool
@@ -40,10 +42,13 @@ library
       Sql.Database.Config
       Sql.Database.Postgres
       Sql.Database.Sqlite
+      Sql.Database.Transaction
       Sql.Query
       Sql.Query.Render
       Storage
       Storage.Schema
+      TData.MinHeap
+      TData.TimedHashmap
       Tuple
       WApp
   other-modules:
@@ -54,6 +59,7 @@ library
   build-depends:
       aeson
     , ansi-terminal
+    , array
     , base
     , bytestring
     , containers
@@ -95,6 +101,7 @@ executable SomeNews-exe
       SomeNews
     , aeson
     , ansi-terminal
+    , array
     , base
     , bytestring
     , containers
@@ -128,7 +135,6 @@ test-suite SomeNews-test
   type: exitcode-stdio-1.0
   main-is: Spec.hs
   other-modules:
-      BinarySpec
       Gen
       HexSpec
       JsonInterfaceSpec
@@ -148,6 +154,7 @@ test-suite SomeNews-test
       SomeNews
     , aeson
     , ansi-terminal
+    , array
     , base
     , bytestring
     , containers

@@ -41,6 +41,7 @@ import Control.Monad
 import Control.Monad.Except
 import Control.Monad.Reader
 import Data.Bits
+import Data.Hashable
 import Data.IORef
 import Data.Int
 import Data.List
@@ -63,14 +64,18 @@ import Storage.Schema
 import Tuple
 import qualified Sql.Database as Db
 
-newtype Reference a = Reference BS.ByteString
-    deriving (Eq, Ord, IsString)
+newtype Reference a = Reference
+    { getReference :: BS.ByteString
+    }
+    deriving (Eq, Ord, IsString, Hashable)
 
 instance Show (Reference a) where
     showsPrec _ (Reference x) = showBlob "ref" x
 
-newtype Version a = Version BS.ByteString
-    deriving (Eq, Ord, IsString)
+newtype Version a = Version
+    { getVersion :: BS.ByteString
+    }
+    deriving (Eq, Ord, IsString, Hashable)
 
 instance Show (Version a) where
     showsPrec _ (Version x) = showBlob "ver" x
@@ -127,7 +132,6 @@ data Article = Article
     , articleVersion :: !(Version Article)
     , articleAuthor :: !(Reference Author)
     , articleName :: !Text.Text
-    , articleText :: !Text.Text
     , articlePublicationStatus :: !PublicationStatus
     , articleCategory :: !(Reference Category)
     }
@@ -167,6 +171,7 @@ data Upload r
 
 data Storage = Storage
     { storagePerform :: forall a. Action a -> IO (Either StorageError a)
+    , storageGenerateBytes :: Int -> IO BS.ByteString
     , storageUpload :: forall r.
            Text.Text
         -> Text.Text
@@ -177,9 +182,7 @@ data Storage = Storage
     , storageDownload :: forall r b.
            Reference FileInfo
         -> (StorageError -> IO r)
-        -> (Int64 -> IO b)
-        -> (b -> BS.ByteString -> IO b)
-        -> (b -> IO r)
+        -> (Int64 -> ((BS.ByteString -> IO ()) -> IO ()) -> IO r)
         -> IO r
     }
 
@@ -202,6 +205,8 @@ withSqlStorage logger db onFail onSuccess = do
                     logSend logger (resultLogLevel result) $
                         "SqlStorage: Request finished: " <<| action << " -> " <<| result
                     return result
+            , storageGenerateBytes = \count -> do
+                generateBytes count `runReaderT` storage
             , storageUpload = sqlStorageUpload storage
             , storageDownload = sqlStorageDownload storage
             }
@@ -234,8 +239,9 @@ data Action a where
     CategoryList :: ListView Category -> Action [Category]
 
     ArticleCreate :: Reference Author -> Action Article
+    ArticleGetText :: Reference Article -> Action Text.Text
     ArticleSetAuthor :: Reference Article -> Reference Author -> Action ()
-    ArticleSetName :: Reference Article -> Version Article -> Text.Text -> Action (Version Article)
+    ArticleSetName :: Reference Article -> Text.Text -> Action ()
     ArticleSetText :: Reference Article -> Version Article -> Text.Text -> Action (Version Article)
     ArticleSetCategory :: Reference Article -> Reference Category -> Action ()
     ArticleSetPublicationStatus :: Reference Article -> PublicationStatus -> Action ()
@@ -579,7 +585,15 @@ sqlStoragePerform (ArticleCreate authorRef) = runTransaction Db.ReadCommited $ d
             :/ Value NonPublished
             :/ Value (Reference "")
             :/ E))
-        (parseInsert $ Article articleRef articleVersion authorRef "" "" NonPublished (Reference ""))
+        (parseInsert $ Article articleRef articleVersion authorRef "" NonPublished (Reference ""))
+sqlStoragePerform (ArticleGetText articleRef) = runTransaction Db.ReadCommited $ do
+    doQuery
+        (Select ["sn_articles"]
+            (fText "article_text" :/ E)
+            [WhereIs articleRef "article_id"]
+            []
+            (RowRange 0 1))
+        (parseHead $ parseOne id)
 sqlStoragePerform (ArticleSetAuthor articleRef authorRef) = runTransaction Db.ReadCommited $ do
     doQuery
         (Update "sn_articles"
@@ -587,26 +601,13 @@ sqlStoragePerform (ArticleSetAuthor articleRef authorRef) = runTransaction Db.Re
             (Value authorRef :/ E)
             [WhereIs articleRef "article_id"])
         parseCount
-sqlStoragePerform (ArticleSetName articleRef oldVersion name) = runTransaction Db.Serializable $ do
+sqlStoragePerform (ArticleSetName articleRef name) = runTransaction Db.ReadCommited $ do
     doQuery
-        (Select ["sn_articles"]
-            (fVersion "article_version" :/ E)
-            [WhereIs articleRef "article_id"]
-            []
-            (RowRange 0 1))
-        (\case
-            [Just version :/ E]
-                | version == oldVersion -> Right ()
-                | otherwise -> Left VersionError
-            [] -> Left NotFoundError
-            _ -> Left InternalError)
-    newVersion <- Version <$> generateBytes 4
-    doQuery_
         (Update "sn_articles"
-            (fVersion "article_version" :/ fText "article_name" :/ E)
-            (Value newVersion :/ Value name :/ E)
+            (fText "article_name" :/ E)
+            (Value name :/ E)
             [WhereIs articleRef "article_id"])
-    return newVersion
+        parseCount
 sqlStoragePerform (ArticleSetText articleRef oldVersion text) = runTransaction Db.Serializable $ do
     doQuery
         (Select ["sn_articles"]
@@ -654,7 +655,6 @@ sqlStoragePerform (ArticleList showDrafts view) = runTransaction Db.ReadCommited
                 :/ fVersion "article_version"
                 :/ fReference "article_author_id"
                 :/ fText "article_name"
-                :/ fText "article_text"
                 :/ fPublicationStatus "article_publication_date"
                 :/ fReference "article_category_id"
                 :/ E)
@@ -857,12 +857,10 @@ sqlStorageDownload
     :: SqlStorage
     -> Reference FileInfo
     -> (StorageError -> IO r)
-    -> (Int64 -> IO b)
-    -> (b -> BS.ByteString -> IO b)
-    -> (b -> IO r)
+    -> (Int64 -> ((BS.ByteString -> IO ()) -> IO ()) -> IO r)
     -> IO r
-sqlStorageDownload storage fileRef onError onOpen onChunk onClose = do
-    pmState <- newIORef Nothing
+sqlStorageDownload storage fileRef onError onStream = do
+    pmResult <- newIORef Nothing
     tret <- Db.execute (storageDb storage) Db.RepeatableRead $ do
         filesizeQret <- Db.query
             (Select
@@ -875,18 +873,21 @@ sqlStorageDownload storage fileRef onError onOpen onChunk onClose = do
             [Just filesize :/ E] -> return filesize
             [Nothing :/ E] -> Db.rollback $ Left NotFoundError
             _ -> Db.abort
-        liftIO $ do
-            state <- onOpen filesize
-            writeIORef pmState $ Just state
-        driveDownloader 0 pmState
-    mState <- readIORef pmState
-    case mState of
-        Just state -> onClose state
+        sink <- Db.mshift $ \cont -> do
+            pOut <- newIORef $ error "invalid onStream callback"
+            result <- onStream filesize $ \sink -> do
+                cont sink >>= writeIORef pOut
+            writeIORef pmResult $ Just result
+            readIORef pOut
+        driveDownloader 0 sink
+    mResult <- readIORef pmResult
+    case mResult of
+        Just result -> return result
         Nothing -> case tret of
             Right (Left err) -> onError err
             _ -> onError InternalError
   where
-    driveDownloader index pmState = do
+    driveDownloader index sink = do
         chunkQret <- Db.query
             (Select
                 ["sn_file_chunks"]
@@ -897,11 +898,8 @@ sqlStorageDownload storage fileRef onError onOpen onChunk onClose = do
         case chunkQret of
             [] -> return $ Right ()
             [Just chunkData :/ E] -> do
-                liftIO $ do
-                    Just state1 <- readIORef pmState
-                    state2 <- onChunk state1 chunkData
-                    writeIORef pmState $ Just state2
-                driveDownloader (index + 1) pmState
+                liftIO $ sink chunkData
+                driveDownloader (index + 1) sink
             _ -> Db.abort
 
 hashAccessKey :: AccessKey -> BS.ByteString
@@ -913,8 +911,9 @@ hashAccessKey (AccessKey (Reference front) back) = do
 
 type Transaction a = ReaderT SqlStorage (Db.Transaction (Either StorageError a))
 
-generateBytes :: Int -> Transaction a BS.ByteString
-generateBytes len = ReaderT $ \SqlStorage {storageGen = tgen} -> do
+generateBytes :: (MonadReader SqlStorage m, MonadIO m) => Int -> m BS.ByteString
+generateBytes len = do
+    tgen <- storageGen <$> ask
     liftIO $ atomicModifyIORef' tgen $ \gen1 ->
         let (value, gen2) = CRand.randomBytesGenerate len gen1
         in (gen2, value)

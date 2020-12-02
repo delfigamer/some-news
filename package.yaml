@@ -24,6 +24,7 @@ default-extensions: DataKinds, GADTs, OverloadedStrings, RankNTypes, TypeOperato
 dependencies:
 - aeson
 - ansi-terminal
+- array
 - base
 - bytestring
 - containers
