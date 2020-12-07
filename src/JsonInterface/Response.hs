@@ -65,6 +65,7 @@ data ErrorMessage
     | ErrInvalidRequest
     | ErrInvalidRequestMsg Text.Text
     | ErrInvalidParameter Text.Text
+    | ErrLimitExceeded
     | ErrMissingParameter Text.Text
     | ErrNotFound
     | ErrUnknownRequest
@@ -81,6 +82,7 @@ errorMessageContent = \case
     ErrInvalidRequest -> ["class" .= String "Invalid request"]
     ErrInvalidRequestMsg msg -> ["class" .= String "Invalid request", "message" .= msg]
     ErrInvalidParameter key -> ["class" .= String "Invalid parameter", "parameterName" .= key]
+    ErrLimitExceeded -> ["class" .= String "Limit exceeded"]
     ErrMissingParameter key -> ["class" .= String "Missing parameter", "parameterName" .= key]
     ErrNotFound -> ["class" .= String "Not found"]
     ErrUnknownRequest -> ["class" .= String "Unknown request"]
@@ -97,6 +99,10 @@ data ResponseBody
     | ResponseBodyOk
     | ResponseBodyOkUser (Expanded User)
     | ResponseBodyOkUserList [Expanded User]
+    | ResponseBodyOkAccessKey AccessKey
+    | ResponseBodyOkAccessKeyList [Reference AccessKey]
+    | ResponseBodyOkAuthor (Expanded Author)
+    | ResponseBodyOkAuthorList [Expanded Author]
     | ResponseBodyUploadStatusList [Expanded UploadStatus]
     deriving (Show, Eq)
 
@@ -104,6 +110,10 @@ class OkResponseBody a where okResponseBody :: a -> ResponseBody
 instance OkResponseBody () where okResponseBody = const ResponseBodyOk
 instance OkResponseBody (Expanded User) where okResponseBody = ResponseBodyOkUser
 instance OkResponseBody [Expanded User] where okResponseBody = ResponseBodyOkUserList
+instance OkResponseBody AccessKey where okResponseBody = ResponseBodyOkAccessKey
+instance OkResponseBody [Reference AccessKey] where okResponseBody = ResponseBodyOkAccessKeyList
+instance OkResponseBody (Expanded Author) where okResponseBody = ResponseBodyOkAuthor
+instance OkResponseBody [Expanded Author] where okResponseBody = ResponseBodyOkAuthorList
 instance OkResponseBody [Expanded UploadStatus] where okResponseBody = ResponseBodyUploadStatusList
 
 okResponse :: OkResponseBody a => a -> Response
@@ -140,6 +150,7 @@ errorStatus = \case
     ErrInvalidRequest -> StatusBadRequest
     ErrInvalidRequestMsg _ -> StatusBadRequest
     ErrInvalidParameter _ -> StatusBadRequest
+    ErrLimitExceeded -> StatusForbidden
     ErrMissingParameter _ -> StatusBadRequest
     ErrNotFound -> StatusNotFound
     ErrUnknownRequest -> StatusNotFound
@@ -303,7 +314,7 @@ instance Expandable Article where
 
 instance Retrievable Article where
     doRetrieve cex@(ExpansionContext storage _ _) ref = do
-        qret <- storagePerform storage $ ArticleList True $ ListView 0 1 [FilterArticleId ref] []
+        qret <- storagePerform storage $ ArticleList $ ListView 0 1 [FilterArticleId ref] []
         case qret of
             Right [article] -> Just <$> expand' cex article
             _ -> return Nothing

@@ -772,7 +772,7 @@ minceArticles storage sampleSize userTable authorTable userAuthorConnSet categor
             storagePerform storage (ArticleSetCategory ref "") `shouldReturn` Left NotFoundError
             storagePerform storage (ArticleSetPublicationStatus ref NonPublished) `shouldReturn` Left NotFoundError
             storagePerform storage (ArticleDelete ref) `shouldReturn` Left NotFoundError
-            storagePerform storage (ArticleList True (ListView 0 1 [FilterArticleId ref] []))
+            storagePerform storage (ArticleList (ListView 0 1 [FilterArticleId ref] []))
                 `shouldReturn`
                 Right []
     do
@@ -806,10 +806,10 @@ minceArticles storage sampleSize userTable authorTable userAuthorConnSet categor
         articleList <- sortOn (articleId . fst) <$> Map.elems articleTable
         let (articleInfoList, articleTextList) = unzip articleList
         parallelFor_ articleList $ \(article, text) -> do
-            storagePerform storage (ArticleList True (ListView 0 1 [FilterArticleId (articleId article)] []))
+            storagePerform storage (ArticleList (ListView 0 1 [FilterArticleId (articleId article)] []))
                 `shouldReturn`
                 Right [article]
-            storagePerform storage (ArticleList False (ListView 0 1 [FilterArticleId (articleId article)] []))
+            storagePerform storage (ArticleList (ListView 0 1 [FilterArticlePublishedCurrently, FilterArticleId (articleId article)] []))
                 `shouldReturn`
                 Right [article | articlePublicationStatus article >= PublishAt timeGenBase]
             storagePerform storage (ArticleGetText (articleId article))
@@ -817,58 +817,59 @@ minceArticles storage sampleSize userTable authorTable userAuthorConnSet categor
                 Right text
         authorRefs <- Map.keys authorTable
         parallelFor_ ("" : authorRefs) $ \authorRef -> do
-            storagePerform storage (ArticleList True (ListView 0 maxBound [FilterArticleAuthorId authorRef] []))
+            storagePerform storage (ArticleList (ListView 0 maxBound [FilterArticleAuthorId authorRef] []))
                 `shouldReturn`
                 Right (filter (\article -> articleAuthor article == authorRef) articleInfoList)
         userAuthorGroups <- Multimap.toGroupsWith (Relmap.left userAuthorConnSet) userTable
         parallelFor_ userAuthorGroups $ \(userRef, userAuthors) -> do
-            storagePerform storage (ArticleList True (ListView 0 maxBound [FilterArticleUserId userRef] []))
+            storagePerform storage (ArticleList (ListView 0 maxBound [FilterArticleUserId userRef] []))
                 `shouldReturn`
                 Right (filter (\article -> articleAuthor article `elem` userAuthors) articleInfoList)
         authorUserGroups <- Multimap.toGroupsWith (Relmap.right userAuthorConnSet) authorTable
         let orphanAuthors = "" : map fst (filter (null . snd) authorUserGroups)
-        storagePerform storage (ArticleList True (ListView 0 maxBound [FilterArticleUserId ""] []))
+        storagePerform storage (ArticleList (ListView 0 maxBound [FilterArticleUserId ""] []))
             `shouldReturn`
             Right (filter (\article -> articleAuthor article `elem` orphanAuthors) articleInfoList)
         categoryRefs <- Tree.keys categoryTree
         parallelFor_ ("" : categoryRefs) $ \categoryRef -> do
-            storagePerform storage (ArticleList True (ListView 0 maxBound [FilterArticleCategoryId categoryRef] []))
+            storagePerform storage (ArticleList (ListView 0 maxBound [FilterArticleCategoryId categoryRef] []))
                 `shouldReturn`
                 Right (filter (\article -> articleCategory article == categoryRef) articleInfoList)
             case categoryRef of
                 "" -> do
-                    storagePerform storage (ArticleList True (ListView 0 maxBound [FilterArticleTransitiveCategoryId categoryRef] []))
+                    storagePerform storage (ArticleList (ListView 0 maxBound [FilterArticleTransitiveCategoryId categoryRef] []))
                         `shouldReturn`
                         Right (filter (\article -> articleCategory article == "") articleInfoList)
                 _ -> do
                     subcatRefs <- map (\(k, _, _) -> k) <$> Tree.subtreeList categoryTree categoryRef
-                    storagePerform storage (ArticleList True (ListView 0 maxBound [FilterArticleTransitiveCategoryId categoryRef] []))
+                    storagePerform storage (ArticleList (ListView 0 maxBound [FilterArticleTransitiveCategoryId categoryRef] []))
                         `shouldReturn`
                         Right (filter (\article -> articleCategory article `elem` subcatRefs) articleInfoList)
         let timeA = addUTCTime (86400 * (-500)) timeGenBase
         let timeB = addUTCTime (86400 * (365 * 10 + 500)) timeGenBase
-        storagePerform storage (ArticleList True (ListView 0 maxBound [FilterArticlePublishedBefore timeB] []))
+        storagePerform storage (ArticleList (ListView 0 maxBound [FilterArticlePublishedBefore timeB] []))
             `shouldReturn`
             Right (filter (publishedBefore timeB) articleInfoList)
-        storagePerform storage (ArticleList False (ListView 0 maxBound [FilterArticlePublishedBefore timeB] []))
+        storagePerform storage (ArticleList (ListView 0 maxBound [FilterArticlePublishedCurrently, FilterArticlePublishedBefore timeB] []))
             `shouldReturn`
             Right (filter (publishedBefore timeGenBase) articleInfoList)
-        storagePerform storage (ArticleList True (ListView 0 maxBound [FilterArticlePublishedAfter timeA] []))
+        storagePerform storage (ArticleList (ListView 0 maxBound [FilterArticlePublishedAfter timeA] []))
             `shouldReturn`
             Right (filter (publishedAfter timeA) articleInfoList)
-        storagePerform storage (ArticleList False (ListView 0 maxBound [FilterArticlePublishedAfter timeA] []))
+        storagePerform storage (ArticleList (ListView 0 maxBound [FilterArticlePublishedCurrently, FilterArticlePublishedAfter timeA] []))
             `shouldReturn`
             Right (filter (publishedWithin timeA timeGenBase) articleInfoList)
-        storagePerform storage (ArticleList True (ListView 0 maxBound [FilterArticlePublishedAfter timeA, FilterArticlePublishedBefore timeB] []))
+        storagePerform storage (ArticleList (ListView 0 maxBound [FilterArticlePublishedAfter timeA, FilterArticlePublishedBefore timeB] []))
             `shouldReturn`
             Right (filter (publishedWithin timeA timeB) articleInfoList)
-        storagePerform storage (ArticleList False (ListView 0 maxBound [FilterArticlePublishedAfter timeA, FilterArticlePublishedBefore timeB] []))
+        storagePerform storage (ArticleList (ListView 0 maxBound
+                [FilterArticlePublishedCurrently, FilterArticlePublishedAfter timeA, FilterArticlePublishedBefore timeB] []))
             `shouldReturn`
             Right (filter (publishedWithin timeA timeGenBase) articleInfoList)
-        storagePerform storage (ArticleList True (ListView 0 maxBound [] [(OrderArticleName, Ascending)]))
+        storagePerform storage (ArticleList (ListView 0 maxBound [] [(OrderArticleName, Ascending)]))
             `shouldReturn`
             Right (sortOn articleName articleInfoList)
-        storagePerform storage (ArticleList True (ListView 0 maxBound [] [(OrderArticleDate, Ascending)]))
+        storagePerform storage (ArticleList (ListView 0 maxBound [] [(OrderArticleDate, Ascending)]))
             `shouldReturn`
             Right (sortOn articlePublicationStatus articleInfoList)
         articleAuthorNameList <- parallelFor articleInfoList $ \article -> do
@@ -878,7 +879,7 @@ minceArticles storage sampleSize userTable authorTable userAuthorConnSet categor
                     author <- Map.lookup' authorTable (articleAuthor article)
                     return $ Just $ authorName author
         let articleListByAuthorName = sortOnList articleInfoList articleAuthorNameList
-        storagePerform storage (ArticleList True (ListView 0 maxBound [] [(OrderArticleAuthorName, Ascending)]))
+        storagePerform storage (ArticleList (ListView 0 maxBound [] [(OrderArticleAuthorName, Ascending)]))
             `shouldReturn`
             Right articleListByAuthorName
         articleCategoryNameList <- parallelFor articleInfoList $ \article -> do
@@ -888,7 +889,7 @@ minceArticles storage sampleSize userTable authorTable userAuthorConnSet categor
                     (_, name, _) <- Tree.lookup' categoryTree (articleCategory article)
                     return $ Just name
         let articleListByCategoryName = sortOnList articleInfoList articleCategoryNameList
-        storagePerform storage (ArticleList True (ListView 0 maxBound [] [(OrderArticleCategoryName, Ascending)]))
+        storagePerform storage (ArticleList (ListView 0 maxBound [] [(OrderArticleCategoryName, Ascending)]))
             `shouldReturn`
             Right articleListByCategoryName
     return ()
@@ -905,10 +906,10 @@ validateArticles
     -> IO ()
 validateArticles storage articleTable = do
     articleList <- sortOn (articleId . fst) <$> Map.elems articleTable
-    storagePerform storage (ArticleList True (ListView 0 maxBound [] []))
+    storagePerform storage (ArticleList (ListView 0 maxBound [] []))
         `shouldReturn`
         Right (map fst articleList)
-    storagePerform storage (ArticleList False (ListView 0 maxBound [] []))
+    storagePerform storage (ArticleList (ListView 0 maxBound [FilterArticlePublishedCurrently] []))
         `shouldReturn`
         Right (filter (\article -> articlePublicationStatus article >= PublishAt timeGenBase) $ map fst articleList)
     parallelFor_ articleList $ \(article, text) -> do
@@ -1041,13 +1042,13 @@ minceArticleTagRels storage sampleSize articleTable tagTable connSet = do
             let articleRefsUnion = foldl1' union articleGroups
             articlesUnion <- parallelFor (sort articleRefsUnion) $ \aref -> do
                 fst <$> Map.lookup' articleTable aref
-            storagePerform storage (ArticleList True (ListView 0 maxBound (tagSumFilter tags) []))
+            storagePerform storage (ArticleList (ListView 0 maxBound (tagSumFilter tags) []))
                 `shouldReturn`
                 Right articlesUnion
             let articleRefsIntersection = foldl1' intersect articleGroups
             articlesIntersection <- parallelFor (sort articleRefsIntersection) $ \aref -> do
                 fst <$> Map.lookup' articleTable aref
-            storagePerform storage (ArticleList True (ListView 0 maxBound (tagProductFilter tags) []))
+            storagePerform storage (ArticleList (ListView 0 maxBound (tagProductFilter tags) []))
                 `shouldReturn`
                 Right articlesIntersection
     return ()
@@ -1073,7 +1074,7 @@ validateArticleTagRels storage articleTable tagTable connSet = do
     parallelFor_ tagArticleGroups $ \(tagRef, tagArticles) -> do
         articleList <- parallelFor (sort tagArticles) $ \aref -> do
             fst <$> Map.lookup' articleTable aref
-        storagePerform storage (ArticleList True (ListView 0 maxBound [FilterArticleTagIds [tagRef]] []))
+        storagePerform storage (ArticleList (ListView 0 maxBound [FilterArticleTagIds [tagRef]] []))
             `shouldReturn`
             Right articleList
 

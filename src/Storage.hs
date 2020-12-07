@@ -288,7 +288,7 @@ data Action a where
     ArticleSetCategory :: Reference Article -> Reference Category -> Action ()
     ArticleSetPublicationStatus :: Reference Article -> PublicationStatus -> Action ()
     ArticleDelete :: Reference Article -> Action ()
-    ArticleList :: Bool -> ListView Article -> Action [Article]
+    ArticleList :: ListView Article -> Action [Article]
     ArticleSetTag :: Reference Article -> Reference Tag -> Bool -> Action ()
 
     TagCreate :: Text.Text -> Action Tag
@@ -370,6 +370,7 @@ data instance ViewFilter Article
     | FilterArticleUserId (Reference User)
     | FilterArticleCategoryId (Reference Category)
     | FilterArticleTransitiveCategoryId (Reference Category)
+    | FilterArticlePublishedCurrently
     | FilterArticlePublishedBefore UTCTime
     | FilterArticlePublishedAfter UTCTime
     | FilterArticleTagIds [Reference Tag]
@@ -726,7 +727,7 @@ sqlStoragePerform (ArticleDelete articleRef) = runTransaction Db.ReadCommited $ 
         (Delete "sn_articles"
             [WhereIs articleRef "article_id"])
         parseCount
-sqlStoragePerform (ArticleList showDrafts view) = runTransaction Db.ReadCommited $ do
+sqlStoragePerform (ArticleList view) = runTransaction Db.ReadCommited $ do
     withView view $ \tables filter order range time -> do
         doQuery
             (Select ("sn_articles" : tables)
@@ -737,7 +738,7 @@ sqlStoragePerform (ArticleList showDrafts view) = runTransaction Db.ReadCommited
                 :/ fPublicationStatus "article_publication_date"
                 :/ fReference "article_category_id"
                 :/ E)
-                ([WhereWith time "article_publication_date <= ?" | not showDrafts] ++ filter)
+                filter
                 (order "article_id")
                 range)
             (parseList $ parseOne Article)
@@ -1146,6 +1147,7 @@ instance ListableObject Article where
     applyFilter (FilterArticleCategoryId ref) = demandCondition (WhereIs ref "article_category_id")
     applyFilter (FilterArticleTransitiveCategoryId (Reference "")) = demandCondition (Where "article_category_id IS NULL")
     applyFilter (FilterArticleTransitiveCategoryId ref) = demandJoin (subcategoriesSource ref) [Where "article_category_id = subcategory_id"]
+    applyFilter FilterArticlePublishedCurrently = withCurrentTime $ \time -> demandCondition (WhereWith time "article_publication_date <= ?")
     applyFilter (FilterArticlePublishedBefore end) = demandCondition (WhereWith end "article_publication_date < ?")
     applyFilter (FilterArticlePublishedAfter begin) = demandCondition (WhereWith begin "article_publication_date >= ?")
     applyFilter (FilterArticleTagIds []) = mempty
@@ -1206,6 +1208,10 @@ instance Semigroup QueryDemand where
 
 instance Monoid QueryDemand where
     mempty = QueryDemand $ \_ cont -> cont mempty mempty mempty
+
+withCurrentTime :: (UTCTime -> QueryDemand) -> QueryDemand
+withCurrentTime inner = QueryDemand $ \time cont -> do
+    withQueryDemand (inner time) time cont
 
 demandJoin :: RowSource -> [Condition] -> QueryDemand
 demandJoin source cond = QueryDemand $ \_ cont -> do

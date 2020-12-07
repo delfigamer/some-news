@@ -88,6 +88,12 @@ requestDispatch ["users", "create"] = simpleRequest $ do
         exitError $ ErrInvalidParameter "newPassword"
     user <- performRequire $ UserCreate name surname newPassword
     exitOk =<< expand user
+requestDispatch ["users", "info"] = simpleRequest $ do
+    userRef <- getParam "user" referenceParser
+    ret <- performRequire $ UserList $ ListView 0 1 [FilterUserId userRef] []
+    case ret of
+        [user] -> exitOk =<< expand user
+        _ -> exitError ErrNotFound
 requestDispatch ["users", "me"] = simpleRequest $ do
     myUser <- requireUserAccess
     exitOk =<< expand myUser
@@ -98,18 +104,32 @@ requestDispatch ["users", "setName"] = simpleRequest $ do
     performRequire $ UserSetName (userId myUser) newName newSurname
     exitOk ()
 requestDispatch ["users", "setPassword"] = simpleRequest $ do
-    userRef <- getParam "user" referenceParser
-    oldPassword <- getParam "password" passwordParser
     newPassword <- getParam "newPassword" passwordParser
     minPasswordLength <- Config.minPasswordLength . contextConfig <$> askContext
     when (BS.length (getPassword newPassword) < minPasswordLength) $
         exitError $ ErrInvalidParameter "newPassword"
-    checkUserPassword userRef oldPassword
+    userRef <- requireUserPassword
     performRequire $ UserSetPassword userRef newPassword
     exitOk ()
 requestDispatch ["users", "delete"] = simpleRequest $ do
     myUser <- requireUserAccess
     performRequireConfirm $ UserDelete (userId myUser)
+    exitOk ()
+requestDispatch ["users", "createAccessKey"] = simpleRequest $ do
+    userRef <- requireUserPassword
+    akeyList <- performRequire $ AccessKeyList userRef $ ListView 0 maxBound [] []
+    maxAccessKeyCount <- Config.maxAccessKeyCount . contextConfig <$> askContext
+    when (length akeyList >= maxAccessKeyCount) $
+        exitError ErrLimitExceeded
+    akey <- performRequire $ AccessKeyCreate userRef
+    exitOk akey
+requestDispatch ["users", "listAccessKeys"] = simpleRequest $ do
+    userRef <- requireUserPassword
+    akeyList <- performRequire $ AccessKeyList userRef $ ListView 0 maxBound [] []
+    exitOk akeyList
+requestDispatch ["users", "clearAccessKeys"] = simpleRequest $ do
+    userRef <- requireUserPassword
+    performRequire $ AccessKeyClear userRef
     exitOk ()
 
 requestDispatch ["users", "setName_"] = simpleRequest $ do
@@ -132,26 +152,71 @@ requestDispatch ["users", "revokeAdmin_"] = simpleRequest $ do
         else performRequire $ UserSetIsAdmin ref False
     exitOk ()
 requestDispatch ["users", "delete_"] = simpleRequest $ do
-    requireAdminAccess
+    void requireAdminAccess
     ref <- getParam "user" referenceParser
     performRequireConfirm $ UserDelete ref
     exitOk ()
 requestDispatch ["users", "list_"] = simpleRequest $ do
-    requireAdminAccess
-    config <- contextConfig <$> askContext
-    offset <- getParam "offset" $
-        withDefault 0 $ intParser 0 maxBound
-    limit <- getParam "limit" $
-        withDefault (Config.defaultPageLimit config) $ intParser 1 (Config.maxPageLimit config)
-    order <- getParam "orderBy" $
-        sortOrderParser
-            [ ("name", OrderUserName)
-            , ("surname", OrderUserSurname)
-            , ("joinDate", OrderUserJoinDate)
-            , ("isAdmin", OrderUserIsAdmin)
-            ]
-    elems <- performRequire $ UserList $ ListView offset limit [] order
-    exitOk =<< mapM expand elems
+    void requireAdminAccess
+    mlAuthorRef <- getParam "author" $ listOptional referenceParser
+    lview <- getListView (map FilterUserAuthorId mlAuthorRef)
+        [ ("name", OrderUserName)
+        , ("surname", OrderUserSurname)
+        , ("joinDate", OrderUserJoinDate)
+        , ("isAdmin", OrderUserIsAdmin)
+        ]
+    elems <- performRequire $ UserList lview
+    exitOk =<< expandList elems
+
+requestDispatch ["authors", "info"] = simpleRequest $ do
+    authorRef <- getParam "author" referenceParser
+    ret <- performRequire $ AuthorList $ ListView 0 1 [FilterAuthorId authorRef] []
+    case ret of
+        [author] -> exitOk =<< expand author
+        _ -> exitError ErrNotFound
+requestDispatch ["authors", "create_"] = simpleRequest $ do
+    void requireAdminAccess
+    name <- getParam "name" textParser
+    description <- getParam "description" textParser
+    author <- performRequire $ AuthorCreate name description
+    exitOk =<< expand author
+requestDispatch ["authors", "setName_"] = simpleRequest $ do
+    void requireAdminAccess
+    authorRef <- getParam "author" referenceParser
+    name <- getParam "name" textParser
+    performRequire $ AuthorSetName authorRef name
+    exitOk ()
+requestDispatch ["authors", "setDescription_"] = simpleRequest $ do
+    void requireAdminAccess
+    authorRef <- getParam "author" referenceParser
+    description <- getParam "description" textParser
+    performRequire $ AuthorSetDescription authorRef description
+    exitOk ()
+requestDispatch ["authors", "delete_"] = simpleRequest $ do
+    void requireAdminAccess
+    authorRef <- getParam "author" referenceParser
+    performRequireConfirm $ AuthorDelete authorRef
+    exitOk ()
+requestDispatch ["authors", "list_"] = simpleRequest $ do
+    void requireAdminAccess
+    mlUserRef <- getParam "user" $ listOptional referenceParser
+    lview <- getListView (map FilterAuthorUserId mlUserRef)
+        [ ("name", OrderAuthorName)
+        ]
+    elems <- performRequire $ AuthorList lview
+    exitOk =<< expandList elems
+requestDispatch ["authors", "addOwner_"] = simpleRequest $ do
+    void requireAdminAccess
+    authorRef <- getParam "author" referenceParser
+    userRef <- getParam "user" referenceParser
+    performRequire $ AuthorSetOwnership authorRef userRef True
+    exitOk ()
+requestDispatch ["authors", "removeOwner_"] = simpleRequest $ do
+    void requireAdminAccess
+    authorRef <- getParam "author" referenceParser
+    userRef <- getParam "user" referenceParser
+    performRequire $ AuthorSetOwnership authorRef userRef False
+    exitOk ()
 
 requestDispatch ["files", "upload"] = simpleRequest $ do
     articleRef <- getParam "article" referenceParser

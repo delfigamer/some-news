@@ -16,18 +16,20 @@ module JsonInterface.Internal
     , exitRespond
     , runRequestHandler
     , execRequestHandler
-    , checkUserPassword
+    , requireUserPassword
     , requireUserAccess
     , requireAdminAccess
     , assertArticleAccess
     , getParam
     , withDefault
+    , listOptional
     , intParser
     , textParser
     , passwordParser
     , referenceParser
     , accessKeyParser
     , sortOrderParser
+    , getListView
     , createActionTicket
     , lookupActionTicket
     , withStorage
@@ -126,11 +128,13 @@ execRequestHandler
 execRequestHandler handler context accept = do
     runRequestHandler handler context accept (return . absurd)
 
-checkUserPassword :: MonadRequestHandler f m => Reference User -> Password -> m ()
-checkUserPassword userRef password = do
+requireUserPassword :: (MonadRequestHandler f m, MonadReader RequestData m) => m (Reference User)
+requireUserPassword = do
+    userRef <- getParam "user" referenceParser
+    password <- getParam "password" passwordParser
     check <- perform $ UserCheckPassword userRef password
     case check of
-        Right () -> return ()
+        Right () -> return userRef
         _ -> exitError ErrInvalidAccessKey
 
 requireUserAccess :: (MonadRequestHandler f m, MonadReader RequestData m) => m User
@@ -155,7 +159,7 @@ requireAdminAccess = do
 
 assertArticleAccess :: MonadRequestHandler f m => Reference User -> Reference Article -> m Article
 assertArticleAccess userRef articleRef = do
-    qret <- performRequire $ ArticleList True $ ListView 0 1 [FilterArticleId articleRef, FilterArticleUserId userRef] []
+    qret <- performRequire $ ArticleList $ ListView 0 1 [FilterArticleId articleRef, FilterArticleUserId userRef] []
     case qret of
         [article] -> return article
         _ -> exitError ErrArticleNotEditable
@@ -175,6 +179,11 @@ withDefault :: b -> (Maybe a -> Maybe b) -> Maybe a -> Maybe b
 withDefault def parser mbs = case mbs of
     Nothing -> Just def
     _ -> parser mbs
+
+listOptional :: (Maybe a -> Maybe b) -> Maybe a -> Maybe [b]
+listOptional parser mbs = case mbs of
+    Nothing -> Just []
+    _ -> (\x -> [x]) <$> parser mbs
 
 intParser :: Int64 -> Int64 -> Maybe BS.ByteString -> Maybe Int64
 intParser _ _ Nothing = Nothing
@@ -237,6 +246,20 @@ sortOrderParser colNames (Just bs) = parse bs
                 after <- parse buf3
                 Just $ (col, dir) : after
             _ -> Nothing
+
+getListView
+    :: (MonadRequestHandler f m, MonadReader RequestData m)
+    => [ViewFilter a]
+    -> [(BSChar.ByteString, ViewOrder a)]
+    -> m (ListView a)
+getListView filters orderCols = do
+    config <- contextConfig <$> askContext
+    offset <- getParam "offset" $
+        withDefault 0 $ intParser 0 maxBound
+    limit <- getParam "limit" $
+        withDefault (Config.defaultPageLimit config) $ intParser 1 (Config.maxPageLimit config)
+    order <- getParam "order" $ sortOrderParser orderCols
+    return $ ListView offset limit filters order
 
 createActionTicket :: MonadRequestHandler f m => ActionTicket -> m (Reference ActionTicket)
 createActionTicket ticket = do

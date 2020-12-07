@@ -11,7 +11,7 @@ data Config = Config
     { defaultPageLimit :: Int64
     , maxPageLimit :: Int64
     , minPasswordLength :: Int
-    , maxAccessKeyCount :: Int64
+    , maxAccessKeyCount :: Int
     , ticketLength :: Int
     , ticketLifetime :: NominalDiffTime
     , fileChunkSize :: Int64
