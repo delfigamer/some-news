@@ -18,6 +18,8 @@ CREATE TABLE sn_users
     , user_surname TEXT NOT NULL
     , user_join_date DATETIME NOT NULL
     , user_is_admin BOOLEAN NOT NULL
+    , user_password_salt BLOB NOT NULL
+    , user_password_hash BLOB NOT NULL
     );
 
 CREATE TABLE sn_access_keys

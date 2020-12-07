@@ -8,6 +8,7 @@ import Control.Exception
 import Control.Monad
 import Data.Aeson
 import Data.Aeson.Text
+import Data.IORef
 import Data.List
 import Data.Maybe
 import Data.String
@@ -27,31 +28,140 @@ import Storage.Fake
 import JsonInterface
 import qualified JsonInterface.Config as Config
 
+mkTime :: String -> TClock.UTCTime
+mkTime = fromJust . TFormat.iso8601ParseM
+
 testConfig :: Config.Config
 testConfig = Config.Config
     { Config.defaultPageLimit = 10
     , Config.maxPageLimit = 100
+    , Config.minPasswordLength = 4
     , Config.maxAccessKeyCount = 3
+    , Config.ticketLength = 4
+    , Config.ticketLifetime = 10
+    , Config.fileChunkSize = 10
+    , Config.maxFileSize = 50
     }
 
+expectResponse :: HasCallStack => Response -> Accept ()
+expectResponse expected = Accept
+    (\given -> given `shouldBe` expected)
+    (\_ _ _ -> expectationFailure "expected a simple response, got a stream")
+
+expectStream :: HasCallStack => Text.Text -> [BS.ByteString] -> Accept ()
+expectStream expectedType expectedChunks = Accept
+    (\given -> expectationFailure $ "expected a stream, got a " ++ show given)
+    (\givenSize givenType inner -> do
+        givenSize `shouldBe` expectedSize
+        givenType `shouldBe` expectedType
+        pbuf <- newIORef expectedChunks
+        inner $ \chunk -> do
+            buf <- readIORef pbuf
+            case buf of
+                [] -> expectationFailure $ "unexpected chunk" ++ show chunk
+                c : cs -> do
+                    chunk `shouldBe` c
+                    writeIORef pbuf cs
+        readIORef pbuf `shouldReturn` [])
+  where
+    expectedSize = foldl' (+) 0 $ map (fromIntegral . BS.length) expectedChunks
+
+rqdata :: [(BS.ByteString, BS.ByteString)] -> RequestData
+rqdata params = RequestData (Map.fromList params) "host"
+
+testSendFile
+    :: (BS.ByteString -> BS.ByteString -> BS.ByteString -> IO BS.ByteString -> IO ())
+    -> BS.ByteString -> BS.ByteString -> BS.ByteString -> [BS.ByteString] -> IO ()
+testSendFile sendFile paramName fileName fileType chunkList = do
+    pbuf <- newIORef chunkList
+    let reader = do
+            buf <- readIORef pbuf
+            case buf of
+                c : cs -> do
+                    writeIORef pbuf cs
+                    return c
+                [] -> do
+                    return ""
+    sendFile paramName fileName fileType reader
+    readIORef pbuf `shouldReturn` []
+
+data TestEnv = TestEnv FakeStorage JsonInterface
+
+withTestEnv :: (TestEnv -> IO r) -> IO r
+withTestEnv inner = do
+    withTestLogger $ \logger -> do
+        withFakeStorage $ \fake storage -> do
+            withJsonInterface testConfig logger storage $ \jint -> do
+                inner $ TestEnv fake jint
+
+data MethodEnv = MethodEnv FakeStorage (Accept () -> Request -> IO ())
+
+specifyMethod :: String -> (MethodEnv -> IO ()) -> SpecWith TestEnv
+specifyMethod uri inner = do
+    let uriParts = Text.splitOn "/" $ Text.pack $ takeWhile (/= ';') uri
+    specify uri $ \(TestEnv fake jint) -> do
+        inner $ MethodEnv fake (executeRequest jint uriParts)
+
 spec :: Spec
-spec = do
+spec = around withTestEnv $ do
     describe "JsonInterface" $ do
-        it "(unknown URI)" $ do
-            testSimpleRequest "not a valid URI"
-                mempty
-                (RequestExpectation [] errUnknownRequest)
-        it "(access key deserialization)" $ do
-            let validAkeys =
-                    [ ("01234567:89abcdef", "\x01\x23\x45\x67", "\x89\xab\xcd\xef")
-                    , ("fe:3210", "\xfe", "\x32\x10")
-                    ]
-            forM_ validAkeys $ \(akey, keyref, keytoken) -> do
-                testSimpleRequest "users/me"
-                    (Map.singleton "akey" akey)
-                    (RequestExpectation
-                        [UserList (ListView 0 1 [FilterUserAccessKey $ AccessKey (Reference keyref) keytoken] []) |>> Left InternalError]
-                        errInternal)
+        let userLookup = UserList (ListView 0 1 [FilterUserAccessKey $ AccessKey (Reference "\x01") "\x02"] [])
+        let tuser = User "uid" "foo" "bar" (mkTime "2020-01-02T03:04:05.06Z") False
+        let adminLookup = UserList (ListView 0 1 [FilterUserAccessKey $ AccessKey (Reference "\x01") "\x02", FilterUserIsAdmin True] [])
+        let tadmin = User "uida" "fooa" "bara" (mkTime "2020-01-01T02:02:02.33Z") True
+        let tauthor = Author "author" "authorname" "authordesc"
+        let tcategory1 = Category "cat1" "cat name 1" "cat2"
+        let tcategory2 = Category "cat2" "cat name 2" ""
+        let tarticle = Article "aid" "aver" "author" "aname" (PublishAt $ mkTime "2020-02-01T01:01:01Z") "cat1"
+        let ttag1 = Tag "tag1" "tag name 1"
+        let ttag2 = Tag "tag2" "tag name 2"
+        let tarticleEx = ExArticle "aid" "aver"
+                (Just $ ExAuthor tauthor)
+                "aname"
+                (PublishAt $ mkTime "2020-02-01T01:01:01Z")
+                (Just $ ExCategory "cat1" "cat name 1" $ Just $ ExCategory "cat2" "cat name 2" Nothing)
+                [ExTag ttag1, ExTag ttag2]
+        specifyMethod "unknown URI" $ \(MethodEnv fake exec) -> do
+            exec
+                (expectResponse $ Response StatusNotFound $ ResponseBodyError ErrUnknownRequest)
+                (SimpleRequest $ rqdata [])
+        specifyMethod "users/create" $ \(MethodEnv fake exec) -> do
+            {- name :: required non-empty text -}
+            {- surname :: required non-empty text -}
+            {- newPassword :: required bytestring (at least Config.minPasswordLength bytes) -}
+            {- normally, 'newPassword' would be a utf8-encoded string, but if a user wants to have it binary, so be it -}
+            exec
+                (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrMissingParameter "name")
+                (SimpleRequest $ rqdata [("surname", "bar"), ("password", "1234")])
+            exec
+                (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrInvalidParameter "name")
+                (SimpleRequest $ rqdata [("name", ""), ("surname", "bar"), ("password", "1234")])
+            exec
+                (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrMissingParameter "surname")
+                (SimpleRequest $ rqdata [("name", "foo"), ("password", "1234")])
+            exec
+                (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrInvalidParameter "surname")
+                (SimpleRequest $ rqdata [("name", "foo"), ("surname", ""), ("password", "1234")])
+            exec
+                (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrInvalidParameter "newPassword")
+                (SimpleRequest $ rqdata [("name", "foo"), ("surname", "bar"), ("newPassword", "123")])
+            checkpoint fake
+                [ UserCreate "foo" "bar" "1234" |>> Right tuser
+                ]
+            exec
+                (expectResponse $ Response StatusOk $ ResponseBodyOkUser $ ExUser tuser)
+                (SimpleRequest $ rqdata [("name", "foo"), ("surname", "bar"), ("newPassword", "1234")])
+            checkpoint fake
+                [ UserCreate "foo" "bar" "abc\255" |>> Right tuser
+                ]
+            exec
+                (expectResponse $ Response StatusOk $ ResponseBodyOkUser $ ExUser tuser)
+                (SimpleRequest $ rqdata [("name", "foo"), ("surname", "bar"), ("newPassword", "abc\255")])
+        specifyMethod "users/me; also user authorization" $ \(MethodEnv fake exec) -> do
+            {- akey :: required user access key -}
+            exec
+                (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrMissingParameter "akey")
+                (SimpleRequest $ rqdata [])
             let invalidAkeys =
                     [ ""
                     , "0123"
@@ -62,152 +172,309 @@ spec = do
                     , "FE:3210"
                     ]
             forM_ invalidAkeys $ \akey -> do
-                testSimpleRequest "users/me"
-                    (Map.singleton "akey" akey)
-                    (RequestExpectation [] (errInvalidParameter "akey"))
-        specifyPublicRequest "users/create"
-            [ requiredNonEmptyParameter "name" "foo"
-            , requiredNonEmptyParameter "surname" "bar"
-            ]
-            [ RequestExpectation
-                [UserCreate "foo" "bar" |>> Right sampleUser]
-                okSampleUser
-            ]
-        specifyUserRequest "users/me"
-            sampleUser
-            []
-            [ RequestExpectation
-                []
-                okSampleUser
-            ]
-        specifyUserRequest "users/setName"
-            sampleUser
-            [ requiredNonEmptyParameter "name" "foo2"
-            , requiredNonEmptyParameter "surname" "bar2"
-            ]
-            [ RequestExpectation
-                [UserSetName (userId sampleUser) "foo2" "bar2" |>> Right ()]
-                okTrue
-            ]
-        specifyUserRequest "users/delete"
-            (sampleUser {userId = Reference "\x12\x34"})
-            [ ParameterSpec "user" "1234" -- parameter 'user' must be equal to requester's id
-                [ ParameterSpecModifier
-                    True
-                    (Map.insert "user" "5678")
-                    [ RequestExpectation
-                        []
-                        (errInvalidParameter "user")
+                exec
+                    (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrInvalidParameter "akey")
+                    (SimpleRequest $ rqdata [("akey", akey)])
+            let validAkeys =
+                    [ ("01234567:89abcdef", "\x01\x23\x45\x67", "\x89\xab\xcd\xef")
+                    , ("fe:3210", "\xfe", "\x32\x10")
                     ]
+            forM_ validAkeys $ \(akey, keyref, keytoken) -> do
+                checkpoint fake
+                    [ UserList (ListView 0 1 [FilterUserAccessKey $ AccessKey (Reference keyref) keytoken] []) |>> Right []
+                    ]
+                exec
+                    (expectResponse $ Response StatusForbidden $ ResponseBodyError ErrInvalidAccessKey)
+                    (SimpleRequest $ rqdata [("akey", akey)])
+                checkpoint fake
+                    [ UserList (ListView 0 1 [FilterUserAccessKey $ AccessKey (Reference keyref) keytoken] []) |>> Right [tuser]
+                    ]
+                exec
+                    (expectResponse $ Response StatusOk $ ResponseBodyOkUser $ ExUser tuser)
+                    (SimpleRequest $ rqdata [("akey", akey)])
+        specifyMethod "users/setName" $ \(MethodEnv fake exec) -> do
+            {- akey :: required user access key -}
+            {- name :: required non-empty text -}
+            {- surname :: required non-empty text -}
+            exec
+                (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrMissingParameter "akey")
+                (SimpleRequest $ rqdata [("name", "foo"), ("surname", "bar")])
+            exec
+                (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrMissingParameter "surname")
+                (SimpleRequest $ rqdata [("akey", "01:23"), ("name", "foo")])
+            exec
+                (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrInvalidParameter "surname")
+                (SimpleRequest $ rqdata [("akey", "01:23"), ("name", "foo"), ("surname", "")])
+            exec
+                (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrMissingParameter "name")
+                (SimpleRequest $ rqdata [("akey", "01:23"), ("surname", "bar")])
+            exec
+                (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrInvalidParameter "name")
+                (SimpleRequest $ rqdata [("akey", "01:23"), ("name", ""), ("surname", "bar")])
+            checkpoint fake
+                [ UserList (ListView 0 1 [FilterUserAccessKey $ AccessKey (Reference "\x01\x02") "\x03\x04"] []) |>> Right []
                 ]
-            ]
-            [ RequestExpectation
-                [UserDelete (Reference "\x12\x34") |>> Right ()]
-                okTrue
-            ]
-        specifyAdminRequest "users/setName_"
-            sampleUser
-            [ requiredIdParameter "user" "1234"
-            , requiredNonEmptyParameter "name" "foo2"
-            , requiredNonEmptyParameter "surname" "bar2"
-            ]
-            [ RequestExpectation
-                [UserSetName (Reference "\x12\x34") "foo2" "bar2" |>> Right ()]
-                okTrue
-            , RequestExpectation
-                [UserSetName (Reference "\x12\x34") "foo2" "bar2" |>> Left NotFoundError]
-                errNotFound
-            ]
-        specifyAdminRequest "users/grantAdmin_"
-            sampleUser
-            [ requiredIdParameter "user" "1234"
-            ]
-            [ RequestExpectation
-                [UserSetIsAdmin (Reference "\x12\x34") True |>> Right ()]
-                okTrue
-            , RequestExpectation
-                [UserSetIsAdmin (Reference "\x12\x34") True |>> Left NotFoundError]
-                errNotFound
-            ]
-        specifyAdminRequest "users/dropAdmin_"
-            sampleUser
-            [ requiredIdParameter "user" "1234"
-            ]
-            [ RequestExpectation
-                [UserSetIsAdmin (Reference "\x12\x34") False |>> Right ()]
-                okTrue
-            , RequestExpectation
-                [UserSetIsAdmin (Reference "\x12\x34") False |>> Left NotFoundError]
-                errNotFound
-            ]
-        specifyAdminRequest "users/delete_"
-            sampleUser
-            [ requiredIdParameter "user" "1234"
-            ]
-            [ RequestExpectation
-                [UserDelete (Reference "\x12\x34") |>> Right ()]
-                okTrue
-            , RequestExpectation
-                [UserDelete (Reference "\x12\x34") |>> Left NotFoundError]
-                errNotFound
-            ]
-        specifyAdminRequest "users/list_"
-            sampleUser
-            []
-            [ RequestExpectation
-                [ UserList (ListView 0 10 [] [])
-                    |>> Right
-                        [ User (Reference "\x00\x01") "name1" "surname1" "2020-01-01T01:01:01Z" False
-                        , User (Reference "\x00\x02") "name2" "surname2" "2020-01-02T03:04:05Z" True
-                        , User (Reference "\x00\x03") "name3" "surname3" "2020-01-06T12:18:25Z" True
-                        ]
+            exec
+                (expectResponse $ Response StatusForbidden $ ResponseBodyError ErrInvalidAccessKey)
+                (SimpleRequest $ rqdata [("akey", "0102:0304"), ("name", "foo"), ("surname", "bar")])
+            checkpoint fake
+                [ UserList (ListView 0 1 [FilterUserAccessKey $ AccessKey (Reference "\x01\x02") "\x03\x04"] []) |>> Right [tuser]
+                , UserSetName "uid" "foo" "bar" |>> Right ()
                 ]
-                (okList
-                    [ object
-                        [ "class" .= String "User"
-                        , "id" .= String "0001"
-                        , "name" .= String "name1"
-                        , "surname" .= String "surname1"
-                        , "joinDate" .= String "2020-01-01T01:01:01Z"
-                        , "isAdmin" .= False
-                        ]
-                    , object
-                        [ "class" .= String "User"
-                        , "id" .= String "0002"
-                        , "name" .= String "name2"
-                        , "surname" .= String "surname2"
-                        , "joinDate" .= String "2020-01-02T03:04:05Z"
-                        , "isAdmin" .= True
-                        ]
-                    , object
-                        [ "class" .= String "User"
-                        , "id" .= String "0003"
-                        , "name" .= String "name3"
-                        , "surname" .= String "surname3"
-                        , "joinDate" .= String "2020-01-06T12:18:25Z"
-                        , "isAdmin" .= True
-                        ]
-                    ])
-            ]
-        it "users/list_ (option parsing)" $ do
-            let user = User (Reference "\x01\x23") "f" "g" "2020-01-01T01:01:01Z" True
-            let userLookup = UserList $ ListView
-                    0 1
-                    [FilterUserAccessKey $ AccessKey (Reference "\x01\x02") "\x03\x04", FilterUserIsAdmin True]
-                    []
+            exec
+                (expectResponse $ Response StatusOk ResponseBodyOk)
+                (SimpleRequest $ rqdata [("akey", "0102:0304"), ("name", "foo"), ("surname", "bar")])
+        specifyMethod "users/setPassword" $ \(MethodEnv fake exec) -> do
+            {- user :: required user id -}
+            {- password :: required current password -}
+            {- newPassword :: required bytestring (at least Config.minPasswordLength bytes) -}
+            exec
+                (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrMissingParameter "user")
+                (SimpleRequest $ rqdata [("password", "1234"), ("newPassword", "abcd")])
+            exec
+                (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrInvalidParameter "user")
+                (SimpleRequest $ rqdata [("user", "not a reference"), ("password", "1234"), ("newPassword", "abcd")])
+            exec
+                (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrMissingParameter "password")
+                (SimpleRequest $ rqdata [("user", hex "uid1"), ("newPassword", "abcd")])
+            exec
+                (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrMissingParameter "newPassword")
+                (SimpleRequest $ rqdata [("user", hex "uid1"), ("password", "1234")])
+            exec
+                (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrInvalidParameter "newPassword")
+                (SimpleRequest $ rqdata [("user", hex "uid1"), ("password", "1234"), ("newPassword", "a")])
+            checkpoint fake
+                [ UserCheckPassword "uid1" "1234" |>> Left NotFoundError
+                ]
+            exec
+                (expectResponse $ Response StatusForbidden $ ResponseBodyError ErrInvalidAccessKey)
+                (SimpleRequest $ rqdata [("user", hex "uid1"), ("password", "1234"), ("newPassword", "abcd")])
+            checkpoint fake
+                [ UserCheckPassword "uid1" "1234" |>> Right ()
+                , UserSetPassword "uid1" "abcd" |>> Right ()
+                ]
+            exec
+                (expectResponse $ Response StatusOk ResponseBodyOk)
+                (SimpleRequest $ rqdata [("user", hex "uid1"), ("password", "1234"), ("newPassword", "abcd")])
+        specifyMethod "users/delete; also confirmation tickets" $ \(MethodEnv fake exec) -> do
+            {- akey :: required user access key -}
+            {- confirm :: confirmation ticket -}
+            exec
+                (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrMissingParameter "akey")
+                (SimpleRequest $ rqdata [])
+            let tuser1 = User "uid1" "foo1" "bar1" (mkTime "2020-01-02T03:04:05.06Z") False
+            let tuser2 = User "uid2" "foo2" "bar2" (mkTime "2020-01-02T03:04:05.06Z") False
+            let badTickets =
+                    [ []
+                    , [("confirm", "")]
+                    , [("confirm", "-")]
+                    , [("confirm", "not a hex string")]
+                    , [("confirm", "01020304")]
+                    ]
+            forM_ badTickets $ \ticket -> do
+                checkpoint fake
+                    [ UserList (ListView 0 1 [FilterUserAccessKey $ AccessKey (Reference "\x01") "\x02"] []) |>> Right [tuser1]
+                    , StorageGenerateBytes 4 |>> "tikt"
+                    ]
+                exec
+                    (expectResponse $ Response StatusOk $ ResponseBodyConfirm "tikt")
+                    (SimpleRequest $ rqdata $ ticket ++ [("akey", "01:02")])
+            checkpoint fake
+                [ UserList (ListView 0 1 [FilterUserAccessKey $ AccessKey (Reference "\x03") "\x04"] []) |>> Right [tuser2]
+                , StorageGenerateBytes 4 |>> "2222"
+                ]
+            exec
+                (expectResponse $ Response StatusOk $ ResponseBodyConfirm "2222")
+                (SimpleRequest $ rqdata [("akey", "03:04"), ("confirm", hex "tikt")])
+            checkpoint fake
+                [ UserList (ListView 0 1 [FilterUserAccessKey $ AccessKey (Reference "\x01") "\x02"] []) |>> Right [tuser1]
+                , UserDelete "uid1" |>> Right ()
+                ]
+            exec
+                (expectResponse $ Response StatusOk ResponseBodyOk)
+                (SimpleRequest $ rqdata [("akey", "01:02"), ("confirm", hex "tikt")])
+            checkpoint fake
+                [ UserList (ListView 0 1 [FilterUserAccessKey $ AccessKey (Reference "\x03") "\x04"] []) |>> Right [tuser2]
+                , UserDelete "uid2" |>> Right ()
+                ]
+            exec
+                (expectResponse $ Response StatusOk ResponseBodyOk)
+                (SimpleRequest $ rqdata [("akey", "03:04"), ("confirm", hex "2222")])
+        specifyMethod "users/setName_; also admin authorization" $ \(MethodEnv fake exec) -> do
+            {- akey :: required admin access key -}
+            {- name :: required non-empty text -}
+            {- surname :: required non-empty text -}
+            exec
+                (expectResponse $ Response StatusNotFound $ ResponseBodyError ErrUnknownRequest)
+                (SimpleRequest $ rqdata [])
+            exec
+                (expectResponse $ Response StatusNotFound $ ResponseBodyError ErrUnknownRequest)
+                (SimpleRequest $ rqdata [("akey", "not an access key")])
+            checkpoint fake
+                [ adminLookup |>> Right []
+                ]
+            exec
+                (expectResponse $ Response StatusNotFound $ ResponseBodyError ErrUnknownRequest)
+                (SimpleRequest $ rqdata [("akey", "01:02")])
+            checkpoint fake
+                [ adminLookup |>> Right [tadmin]
+                ]
+            exec
+                (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrMissingParameter "user")
+                (SimpleRequest $ rqdata [("akey", "01:02"), ("name", "foo"), ("surname", "bar")])
+            checkpoint fake
+                [ adminLookup |>> Right [tadmin]
+                ]
+            exec
+                (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrInvalidParameter "user")
+                (SimpleRequest $ rqdata [("akey", "01:02"), ("name", "foo"), ("surname", "bar"), ("user", "not a hex string")])
+            checkpoint fake
+                [ adminLookup |>> Right [tadmin]
+                ]
+            exec
+                (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrInvalidParameter "name")
+                (SimpleRequest $ rqdata [("akey", "01:02"), ("name", ""), ("surname", "bar"), ("user", hex "uid")])
+            checkpoint fake
+                [ adminLookup |>> Right [tadmin]
+                ]
+            exec
+                (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrInvalidParameter "surname")
+                (SimpleRequest $ rqdata [("akey", "01:02"), ("name", "foo"), ("surname", ""), ("user", hex "uid")])
+            checkpoint fake
+                [ adminLookup |>> Right [tadmin]
+                , UserSetName "uid" "foo" "bar" |>> Left NotFoundError
+                ]
+            exec
+                (expectResponse $ Response StatusNotFound $ ResponseBodyError $ ErrNotFound)
+                (SimpleRequest $ rqdata [("akey", "01:02"), ("name", "foo"), ("surname", "bar"), ("user", hex "uid")])
+            checkpoint fake
+                [ adminLookup |>> Right [tadmin]
+                , UserSetName "uid" "foo" "bar" |>> Right ()
+                ]
+            exec
+                (expectResponse $ Response StatusOk ResponseBodyOk)
+                (SimpleRequest $ rqdata [("akey", "01:02"), ("name", "foo"), ("surname", "bar"), ("user", hex "uid")])
+        specifyMethod "users/grantAdmin_" $ \(MethodEnv fake exec) -> do
+            {- akey :: required admin access key -}
+            {- user :: required user id -}
+            checkpoint fake
+                [ adminLookup |>> Right [tadmin]
+                ]
+            exec
+                (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrMissingParameter "user")
+                (SimpleRequest $ rqdata [("akey", "01:02")])
+            checkpoint fake
+                [ adminLookup |>> Right [tadmin]
+                ]
+            exec
+                (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrInvalidParameter "user")
+                (SimpleRequest $ rqdata [("akey", "01:02"), ("user", "not an uid")])
+            checkpoint fake
+                [ adminLookup |>> Right [tadmin]
+                , UserSetIsAdmin "uid" True |>> Right ()
+                ]
+            exec
+                (expectResponse $ Response StatusOk ResponseBodyOk)
+                (SimpleRequest $ rqdata [("akey", "01:02"), ("user", hex "uid")])
+        specifyMethod "users/revokeAdmin_" $ \(MethodEnv fake exec) -> do
+            {- akey :: required admin access key -}
+            {- user :: required user id -}
+            {- confirm :: confirmation ticket (conditionally) -}
+            {- confirmation is required when an admin tries to revoke the rights from oneself, that is, when 'user' is the owner of 'akey' -}
+            checkpoint fake
+                [ adminLookup |>> Right [tadmin]
+                ]
+            exec
+                (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrMissingParameter "user")
+                (SimpleRequest $ rqdata [("akey", "01:02")])
+            checkpoint fake
+                [ adminLookup |>> Right [tadmin]
+                ]
+            exec
+                (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrInvalidParameter "user")
+                (SimpleRequest $ rqdata [("akey", "01:02"), ("user", "not an uid")])
+            checkpoint fake
+                [ adminLookup |>> Right [tadmin]
+                , UserSetIsAdmin "uid" False |>> Right ()
+                ]
+            exec
+                (expectResponse $ Response StatusOk ResponseBodyOk)
+                (SimpleRequest $ rqdata [("akey", "01:02"), ("user", hex "uid")])
+            checkpoint fake
+                [ adminLookup |>> Right [tadmin]
+                , StorageGenerateBytes 4 |>> "tikt"
+                ]
+            exec
+                (expectResponse $ Response StatusOk $ ResponseBodyConfirm "tikt")
+                (SimpleRequest $ rqdata [("akey", "01:02"), ("user", hex "uida")])
+            checkpoint fake
+                [ adminLookup |>> Right [tadmin]
+                , UserSetIsAdmin "uida" False |>> Right ()
+                ]
+            exec
+                (expectResponse $ Response StatusOk ResponseBodyOk)
+                (SimpleRequest $ rqdata [("akey", "01:02"), ("user", hex "uida"), ("confirm", hex "tikt")])
+        specifyMethod "users/delete_" $ \(MethodEnv fake exec) -> do
+            {- akey :: required admin access key -}
+            {- user :: required user id -}
+            {- confirm :: confirmation ticket -}
+            checkpoint fake
+                [ adminLookup |>> Right [tadmin]
+                ]
+            exec
+                (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrMissingParameter "user")
+                (SimpleRequest $ rqdata [("akey", "01:02")])
+            checkpoint fake
+                [ adminLookup |>> Right [tadmin]
+                , StorageGenerateBytes 4 |>> "tikt"
+                ]
+            exec
+                (expectResponse $ Response StatusOk $ ResponseBodyConfirm "tikt")
+                (SimpleRequest $ rqdata [("akey", "01:02"), ("user", hex "uida")])
+            checkpoint fake
+                [ adminLookup |>> Right [tadmin]
+                , UserDelete "uida" |>> Left NotFoundError
+                ]
+            exec
+                (expectResponse $ Response StatusNotFound $ ResponseBodyError ErrNotFound)
+                (SimpleRequest $ rqdata [("akey", "01:02"), ("user", hex "uida"), ("confirm", hex "tikt")])
+            checkpoint fake
+                [ adminLookup |>> Right [tadmin]
+                , UserDelete "uida" |>> Right ()
+                ]
+            exec
+                (expectResponse $ Response StatusOk ResponseBodyOk)
+                (SimpleRequest $ rqdata [("akey", "01:02"), ("user", hex "uida"), ("confirm", hex "tikt")])
+        specifyMethod "users/list_" $ \(MethodEnv fake exec) -> do
+            {- akey :: required admin access key -}
+            {- offset :: optional integer, 0 <= offset, default -> 0 -}
+            {- limit :: optional integer, 0 < limit <= Config.maxPageLimit, default -> Config.defaultPageLimit -}
+            {- order :: optional sorting order spec, columns: "name", "surname" (utf8 lexicographical order), "joinDate" (newest to oldest), "isAdmin" (admins first) -}
+            let users =
+                    [ User "uid1" "name1" "surname1" (mkTime "2020-01-01T01:01:01Z") False
+                    , User "uid2" "name2" "surname2" (mkTime "2020-01-02T03:04:05Z") True
+                    , User "uid3" "name3" "surname3" (mkTime "2020-01-06T12:18:25Z") True
+                    ]
+            checkpoint fake
+                [ adminLookup |>> Right [tadmin]
+                , UserList (ListView 0 10 [] []) |>> Right users
+                ]
+            exec
+                (expectResponse $ Response StatusOk $ ResponseBodyOkUserList $ map ExUser users)
+                (SimpleRequest $ rqdata [("akey", "01:02")])
             do
                 forM_
                     [ ("0", 0)
                     , ("123456", 123456)
                     , ("1234567890123456789", 1234567890123456789) -- 64-bit integer
                     ] $ \(offsetParam, offsetValue) -> do
-                        testSimpleRequest "users/list_"
-                            (Map.fromList [("akey", "0102:0304"), ("offset", offsetParam)])
-                            (RequestExpectation
-                                [ userLookup |>> Right [user]
-                                , UserList (ListView offsetValue 10 [] []) |>> Left InternalError
-                                ]
-                                errInternal)
+                        checkpoint fake
+                            [ adminLookup |>> Right [tadmin]
+                            , UserList (ListView offsetValue 10 [] []) |>> Left InternalError
+                            ]
+                        exec
+                            (expectResponse $ Response StatusInternalError $ ResponseBodyError ErrInternal)
+                            (SimpleRequest $ rqdata [("akey", "01:02"), ("offset", offsetParam)])
                 forM_
                     [ ""
                     , "-1"
@@ -215,25 +482,25 @@ spec = do
                     , "4.5"
                     , "123456789012345678901234567890" -- not a 64-bit integer
                     ] $ \offsetParam -> do
-                        testSimpleRequest "users/list_"
-                            (Map.fromList [("akey", "0102:0304"), ("offset", offsetParam)])
-                            (RequestExpectation
-                                [ userLookup |>> Right [user]
-                                ]
-                                (errInvalidParameter "offset"))
+                        checkpoint fake
+                            [ adminLookup |>> Right [tadmin]
+                            ]
+                        exec
+                            (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrInvalidParameter "offset")
+                            (SimpleRequest $ rqdata [("akey", "01:02"), ("offset", offsetParam)])
             do
                 forM_
                     [ ("1", 1)
                     , ("12", 12)
                     , ("100", 100) -- maxPageLimit
                     ] $ \(limitParam, limitValue) -> do
-                        testSimpleRequest "users/list_"
-                            (Map.fromList [("akey", "0102:0304"), ("limit", limitParam)])
-                            (RequestExpectation
-                                [ userLookup |>> Right [user]
-                                , UserList (ListView 0 limitValue [] []) |>> Left InternalError
-                                ]
-                                errInternal)
+                        checkpoint fake
+                            [ adminLookup |>> Right [tadmin]
+                            , UserList (ListView 0 limitValue [] []) |>> Left InternalError
+                            ]
+                        exec
+                            (expectResponse $ Response StatusInternalError $ ResponseBodyError ErrInternal)
+                            (SimpleRequest $ rqdata [("akey", "01:02"), ("limit", limitParam)])
                 forM_
                     [ ""
                     , "0"
@@ -243,12 +510,12 @@ spec = do
                     , "4.5"
                     , "123456789012345678901234567890" -- not a 64-bit integer
                     ] $ \limitParam -> do
-                        testSimpleRequest "users/list_"
-                            (Map.fromList [("akey", "0102:0304"), ("limit", limitParam)])
-                            (RequestExpectation
-                                [ userLookup |>> Right [user]
-                                ]
-                                (errInvalidParameter "limit"))
+                        checkpoint fake
+                            [ adminLookup |>> Right [tadmin]
+                            ]
+                        exec
+                            (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrInvalidParameter "limit")
+                            (SimpleRequest $ rqdata [("akey", "01:02"), ("limit", limitParam)])
             do
                 forM_
                     [ ("", [])
@@ -260,13 +527,13 @@ spec = do
                     , ("nameDesc", [(OrderUserName, Descending)])
                     , ("nameAsc+joinDateDesc", [(OrderUserName, Ascending), (OrderUserJoinDate, Descending)])
                     ] $ \(orderParam, orderValue) -> do
-                        testSimpleRequest "users/list_"
-                            (Map.fromList [("akey", "0102:0304"), ("orderBy", orderParam)])
-                            (RequestExpectation
-                                [ userLookup |>> Right [user]
-                                , UserList (ListView 0 10 [] orderValue) |>> Left InternalError
-                                ]
-                                errInternal)
+                        checkpoint fake
+                            [ adminLookup |>> Right [tadmin]
+                            , UserList (ListView 0 10 [] orderValue) |>> Left InternalError
+                            ]
+                        exec
+                            (expectResponse $ Response StatusInternalError $ ResponseBodyError ErrInternal)
+                            (SimpleRequest $ rqdata [("akey", "01:02"), ("orderBy", orderParam)])
                 forM_
                     [ "not an order"
                     , "+"
@@ -274,284 +541,118 @@ spec = do
                     , "nameDesc+"
                     , "nameAscsurnameAsc"
                     ] $ \orderParam -> do
-                        testSimpleRequest "users/list_"
-                            (Map.fromList [("akey", "0102:0304"), ("orderBy", orderParam)])
-                            (RequestExpectation
-                                [ userLookup |>> Right [user]
-                                ]
-                                (errInvalidParameter "orderBy"))
-        it "(upload stub???)" $ do
-            withFakeStorage $ \context storage -> do
-                checkpoint context
-                    [ UploadAction
-                        "foo"
-                        "text/plain"
-                        "\x01\x02"
-                        "\x0a\x0b"
-                        |>> ExpectChunks
-                            (FileInfo "\x34\x56" "foo" "text/plain" "2020-01-02T03:04:05Z" "\x01\x02" 10 "\x0a\x0b")
-                            ["foo", "bar", "quux"]
-                            True
-                            Nothing
-                    ]
-                result <- storageUpload storage "foo" "text/plain" "\x01\x02" "\x0a\x0b" $ \finfo -> do
-                    return $ UploadChunk "foo" $ do
-                        return $ UploadChunk "bar" $ do
-                            return $ UploadChunk "quux" $ do
-                                return $ UploadFinish "xxx"
-                result `shouldBe` Right "xxx"
-  where
-    sampleUser = User (Reference "\x01\x23\xab\xcd") "foo" "bar" "2020-01-02T03:04:05.67Z" False
-    okSampleUser = okValue $ object
-        [ "class" .= String "User"
-        , "id" .= String "0123abcd"
-        , "name" .= String "foo"
-        , "surname" .= String "bar"
-        , "joinDate" .= String "2020-01-02T03:04:05.67Z"
-        , "isAdmin" .= False
-        ]
-
-errInternal :: Response
-errInternal = Response StatusInternalError $ JsonResponse $ object
-    [ "error" .= object
-        [ "class" .= String "Internal error"
-        ]
-    ]
-
-errInvalidAccessKey :: Response
-errInvalidAccessKey = Response StatusForbidden $ JsonResponse $ object
-    [ "error" .= object
-        [ "class" .= String "Invalid access key"
-        ]
-    ]
-
-errInvalidParameter :: BS.ByteString -> Response
-errInvalidParameter pname = Response StatusBadRequest $ JsonResponse $ object
-    [ "error" .= object
-        [ "class" .= String "Invalid parameter"
-        , "parameterName" .= Text.decodeUtf8 pname
-        ]
-    ]
-
-errMissingParameter :: BS.ByteString -> Response
-errMissingParameter pname = Response StatusBadRequest $ JsonResponse $ object
-    [ "error" .= object
-        [ "class" .= String "Missing parameter"
-        , "parameterName" .= Text.decodeUtf8 pname
-        ]
-    ]
-
-errNotFound :: Response
-errNotFound = Response StatusNotFound $ JsonResponse $ object
-    [ "error" .= object
-        [ "class" .= String "Not found"
-        ]
-    ]
-
-errUnknownRequest :: Response
-errUnknownRequest = Response StatusNotFound $ JsonResponse $ object
-    [ "error" .= object
-        [ "class" .= String "Unknown request"
-        ]
-    ]
-
-okTrue :: Response
-okTrue = Response StatusOk $ JsonResponse $ object
-    [ "ok" .= True
-    ]
-
-okValue :: Value -> Response
-okValue value = Response StatusOk $ JsonResponse $ object
-    [ "ok" .= value
-    ]
-
-okList :: [Value] -> Response
-okList elems = Response StatusOk $ JsonResponse $ object
-    [ "ok" .= elems
-    ]
-
-data ParameterSpec = ParameterSpec
-    BS.ByteString
-    BS.ByteString
-    [ParameterSpecModifier]
-
-data ParameterSpecModifier = ParameterSpecModifier
-    Bool
-    (Map.HashMap BS.ByteString BS.ByteString -> Map.HashMap BS.ByteString BS.ByteString)
-    [RequestExpectation]
-
-data RequestExpectation = RequestExpectation [ActionExpectation] Response
-
-prependAction :: ActionExpectation -> RequestExpectation -> RequestExpectation
-prependAction ae (RequestExpectation aes re) = RequestExpectation (ae : aes) re
-
-requiredParameter :: BS.ByteString -> BS.ByteString -> ParameterSpec
-requiredParameter pname pvalue = ParameterSpec pname pvalue
-    [ ParameterSpecModifier
-        False
-        (Map.delete pname)
-        [ RequestExpectation
-            []
-            (errMissingParameter pname)
-        ]
-    ]
-
-requiredIdParameter :: BS.ByteString -> BS.ByteString -> ParameterSpec
-requiredIdParameter pname pvalue = ParameterSpec pname pvalue
-    [ ParameterSpecModifier
-        False
-        (Map.delete pname)
-        [ RequestExpectation
-            []
-            (errMissingParameter pname)
-        ]
-    , ParameterSpecModifier
-        False
-        (Map.insert pname "invalid identifier")
-        [ RequestExpectation
-            []
-            (errInvalidParameter pname)
-        ]
-    ]
-
-requiredNonEmptyParameter :: BS.ByteString -> BS.ByteString -> ParameterSpec
-requiredNonEmptyParameter pname pvalue = ParameterSpec pname pvalue
-    [ ParameterSpecModifier
-        False
-        (Map.delete pname)
-        [ RequestExpectation
-            []
-            (errMissingParameter pname)
-        ]
-    , ParameterSpecModifier
-        False
-        (Map.insert pname "")
-        [ RequestExpectation
-            []
-            (errInvalidParameter pname)
-        ]
-    ]
-
-specifyPublicRequest
-    :: HasCallStack
-    => Text.Text
-    -> [ParameterSpec]
-    -> [RequestExpectation]
-    -> Spec
-specifyPublicRequest uri paramSpec reqExps = do
-    specify (Text.unpack uri ++ " (public method)") $ do
-        let params = Map.fromList $ map (\(ParameterSpec pname pvalue _) -> (pname, pvalue)) paramSpec
-        forM_ paramSpec $ \(ParameterSpec _ _ mods) -> do
-            forM_ mods $ \(ParameterSpecModifier _ paramsMod reqExps2) -> do
-                forM_ reqExps2 $ \reqExp -> do
-                    testSimpleRequest uri (paramsMod params) reqExp
-        forM_ reqExps $ \reqExp -> do
-            testSimpleRequest uri params reqExp
-
-specifyUserRequest
-    :: HasCallStack
-    => Text.Text
-    -> User
-    -> [ParameterSpec]
-    -> [RequestExpectation]
-    -> Spec
-specifyUserRequest uri user paramSpec reqExps = do
-    specify (Text.unpack uri ++ " (user method)") $ do
-        let paramsBase = Map.fromList $ map (\(ParameterSpec pname pvalue _) -> (pname, pvalue)) paramSpec
-        let params = Map.insert "akey" "01234567:89abcdef" paramsBase
-        let userLookup = UserList $ ListView
-                0 1
-                [FilterUserAccessKey $ AccessKey (Reference "\x01\x23\x45\x67") "\x89\xab\xcd\xef"]
-                []
-        forM_ paramSpec $ \(ParameterSpec _ _ mods) -> do
-            forM_ mods $ \(ParameterSpecModifier accessRequired paramsMod reqExps2) -> do
-                forM_ reqExps2 $ \reqExp -> do
-                    case accessRequired of
-                        False -> testSimpleRequest uri (paramsMod params)
-                            reqExp
-                        True -> testSimpleRequest uri (paramsMod params)
-                            (prependAction (userLookup |>> Right [user]) reqExp)
-        testSimpleRequest uri paramsBase
-            (RequestExpectation
-                []
-                (errMissingParameter "akey"))
-        testSimpleRequest uri params
-            (RequestExpectation
-                [userLookup |>> Right []]
-                errInvalidAccessKey)
-        forM_ reqExps $ \reqExp -> do
-            testSimpleRequest uri params
-                (prependAction (userLookup |>> Right [user]) reqExp)
-
-specifyAdminRequest
-    :: HasCallStack
-    => Text.Text
-    -> User
-    -> [ParameterSpec]
-    -> [RequestExpectation]
-    -> Spec
-specifyAdminRequest uri user paramSpec reqExps = do
-    specify (Text.unpack uri ++ " (admin method)") $ do
-        let paramsBase = Map.fromList $ map (\(ParameterSpec pname pvalue _) -> (pname, pvalue)) paramSpec
-        let params = Map.insert "akey" "01234567:89abcdef" paramsBase
-        let userLookup = UserList $ ListView 0 1
-                [FilterUserAccessKey $ AccessKey (Reference "\x01\x23\x45\x67") "\x89\xab\xcd\xef", FilterUserIsAdmin True]
-                []
-        forM_ paramSpec $ \(ParameterSpec _ _ mods) -> do
-            forM_ mods $ \(ParameterSpecModifier _ paramsMod reqExps2) -> do
-                forM_ reqExps2 $ \reqExp -> do
-                    testSimpleRequest uri (paramsMod params)
-                        (prependAction (userLookup |>> Right [user]) reqExp)
-        testSimpleRequest uri paramsBase
-            (RequestExpectation
-                []
-                errUnknownRequest)
-        testSimpleRequest uri params
-            (RequestExpectation
-                [userLookup |>> Right []]
-                errUnknownRequest)
-        forM_ reqExps $ \reqExp -> do
-            testSimpleRequest uri params
-                (prependAction (userLookup |>> Right [user]) reqExp)
-
-testSimpleRequest
-    :: HasCallStack
-    => Text.Text
-    -> Map.HashMap BS.ByteString BS.ByteString
-    -> RequestExpectation
-    -> IO ()
-testSimpleRequest uri params (RequestExpectation expectedActions expectedResponse) = do
-    withTestLogger $ \logger -> do
-        withFakeStorage $ \context storage -> do
-            checkpoint context expectedActions
-            result <- withJsonInterface testConfig logger storage $ \jint -> do
-                simpleRequest jint (Text.splitOn "/" uri) params
-            result `shouldBe` expectedResponse
-
-instance Show ResponseContent where
-    showsPrec _ (JsonResponse j) =
-        showString "[JsonResponse| " . showJson (toJSON j) . showString " |]"
-      where
-        showJson (Object obj) = do
-            let fields = sortOn fst $ Map.toList obj
-            let parts = map (\(k,v) -> showJson (String k) . showString ":" . showJson v) fields
-            let inner = if null parts
-                    then id
-                    else foldr1 (\a b -> a . showString "," . b) parts
-            showString "{" . inner . showString "}"
-        showJson (Array arr) = do
-            let parts = Vector.map showJson arr
-            let inner = if Vector.null parts
-                    then id
-                    else Vector.foldr1 (\a b -> a . showString "," . b) parts
-            showString "[" . inner . showString "]"
-        showJson x = \after -> TextLazy.unpack (encodeToLazyText x) ++ after
-
-instance Eq ResponseContent where
-    JsonResponse j1 == JsonResponse j2 = toJSON j1 == toJSON j2
-
-deriving instance Show Response
-deriving instance Eq Response
-
-instance IsString TClock.UTCTime where
-    fromString = fromJust . TFormat.iso8601ParseM
+                        checkpoint fake
+                            [ adminLookup |>> Right [tadmin]
+                            ]
+                        exec
+                            (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrInvalidParameter "orderBy")
+                            (SimpleRequest $ rqdata [("akey", "01:02"), ("orderBy", orderParam)])
+        specifyMethod "files/upload" $ \(MethodEnv fake exec) -> do
+            {- akey :: required user access key -}
+            {- article :: required article id -}
+            {- user must possess the article -}
+            exec
+                (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrMissingParameter "article")
+                (SimpleRequest $ rqdata [("akey", "01:02")])
+            exec
+                (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrInvalidParameter "article")
+                (SimpleRequest $ rqdata [("akey", "01:02"), ("article", "not an id")])
+            checkpoint fake
+                [ userLookup |>> Right [tuser]
+                , ArticleList True (ListView 0 1 [FilterArticleId "aid", FilterArticleUserId "uid"] []) |>> Right []
+                ]
+            exec
+                (expectResponse $ Response StatusForbidden $ ResponseBodyError ErrArticleNotEditable)
+                (SimpleRequest $ rqdata [("akey", "01:02"), ("article", hex "aid")])
+            checkpoint fake
+                [ userLookup |>> Right [tuser]
+                , ArticleList True (ListView 0 1 [FilterArticleId "aid", FilterArticleUserId "uid"] []) |>> Right [tarticle]
+                , StorageGenerateBytes 4 |>> "uptk"
+                ]
+            exec
+                (expectResponse $ Response StatusOk $ ResponseBodyFollow $ "host/upload/" <> hex "uptk")
+                (SimpleRequest $ rqdata [("akey", "01:02"), ("article", hex "aid")])
+        specify "upload/..." $ \(TestEnv fake jint) -> do
+            checkpoint fake
+                [ userLookup |>> Right [tuser]
+                , ArticleList True (ListView 0 1 [FilterArticleId "aid", FilterArticleUserId "uid"] []) |>> Right [tarticle]
+                , StorageGenerateBytes 4 |>> "uptk"
+                ]
+            executeRequest jint ["files", "upload"]
+                (expectResponse $ Response StatusOk $ ResponseBodyFollow $ "host/upload/" <> hex "uptk")
+                (SimpleRequest $ rqdata [("akey", "01:02"), ("article", hex "aid")])
+            executeRequest jint ["upload", hex "uptk"]
+                (expectResponse $ Response StatusBadRequest $ ResponseBodyError ErrInvalidRequest)
+                (SimpleRequest $ rqdata [("akey", "01:02"), ("article", hex "aid")])
+            checkpoint fake
+                [ StorageUpload "file1.txt" "text/plain" "aid" "uid"
+                    |>> Right (UploadProcess
+                        (FileInfo "fid1" "file1.txt" "text/plain" (mkTime "2020-01-01T01:01:01Z") "aid" 0 "uid")
+                        ["1234567890", "1234567890", "1234567890", "1234567890", "1234567890"]
+                        (Right (True, Nothing)))
+                , StorageUpload "file2.txt" "text/plain" "aid" "uid"
+                    |>> Right (UploadProcess
+                        (FileInfo "fid2" "file2.txt" "text/plain" (mkTime "2020-01-01T01:01:02Z") "aid" 1 "uid")
+                        ["1234567890", "1234567"]
+                        (Right (True, Nothing)))
+                , StorageUpload "file6.txt" "text/plain" "aid" "uid"
+                    |>> Right (UploadProcess
+                        (FileInfo "fid6" "file6.txt" "text/plain" (mkTime "2020-01-01T01:01:06Z") "aid" 3 "uid")
+                        ["1234567890", "1234567890", "1234567890", "1234567890"]
+                        (Right (False, Nothing)))
+                , StorageUpload "file7.txt" "text/plain" "aid" "uid"
+                    |>> Right (UploadProcess
+                        (FileInfo "fid7" "file7.txt" "text/plain" (mkTime "2020-01-01T01:01:07Z") "aid" 3 "uid")
+                        ["1234567890"]
+                        (Left InternalError))
+                , ArticleList True (ListView 0 1 [FilterArticleId "aid"] []) |>> Right [tarticle]
+                , AuthorList (ListView 0 1 [FilterAuthorId "author"] []) |>> Right [tauthor]
+                , CategoryList (ListView 0 1 [FilterCategoryId "cat1"] []) |>> Right [tcategory1]
+                , CategoryList (ListView 0 1 [FilterCategoryId "cat2"] []) |>> Right [tcategory2]
+                , TagList (ListView 0 maxBound [FilterTagArticleId "aid"] [(OrderTagName, Ascending)]) |>> Right [ttag1, ttag2]
+                , UserList (ListView 0 1 [FilterUserId "uid"] []) |>> Right [tuser]
+                ]
+            executeRequest jint ["upload", hex "uptk"]
+                (expectResponse $ Response StatusOk $ ResponseBodyUploadStatusList
+                    [ ExUploadStatus "param1" $ Right $ ExFileInfo
+                        "fid1" "file1.txt" "text/plain" (mkTime "2020-01-01T01:01:01Z")
+                        (Just tarticleEx) 0 (Just $ ExUser tuser) ("host/get/" <> hex "fid1" <> "/file1.txt")
+                    , ExUploadStatus "param2" $ Right $ ExFileInfo
+                        "fid2" "file2.txt" "text/plain" (mkTime "2020-01-01T01:01:02Z")
+                        (Just tarticleEx) 1 (Just $ ExUser tuser) ("host/get/" <> hex "fid2" <> "/file2.txt")
+                    , ExUploadStatus "param3\xfffd" $ Left ErrInvalidRequest
+                    , ExUploadStatus "param4" $ Left $ ErrInvalidParameter "fileName"
+                    , ExUploadStatus "param5" $ Left $ ErrInvalidParameter "mimeType"
+                    , ExUploadStatus "param6" $ Left ErrFileTooLarge
+                    , ExUploadStatus "param7" $ Left ErrInternal
+                    ])
+                (UploadRequest $ \uploadFile -> do
+                    testSendFile uploadFile "param1" "file1.txt" "text/plain"
+                        ["12345678901234567890123456789012345678901234567890"]
+                    testSendFile uploadFile "param2" "file2.txt" "text/plain" -- chunk reshaping
+                        ["123456", "7890123", "4567"]
+                    testSendFile uploadFile "param3\255" "file3.txt" "text/plain" -- parameter name is not valid utf8
+                        ["1"]
+                    testSendFile uploadFile "param4" "\255file4.txt" "text/plain" -- filename is invalid
+                        ["1"]
+                    testSendFile uploadFile "param5" "file5.txt" "text/\255" -- mime type is invalid
+                        ["1"]
+                    testSendFile uploadFile "param6" "file6.txt" "text/plain" -- file is too large
+                        ["12345678901234567890123456789012345678901234", "567890123456", "7", "8", "9"] -- trailing chunks must be drained nevertheless
+                    testSendFile uploadFile "param7" "file7.txt" "text/plain" -- server-side error
+                        ["123456", "7890123", "456"]
+                    return $ rqdata [])
+        specify "get/..." $ \(TestEnv fake jint) -> do
+            checkpoint fake
+                [ StorageDownload "fid1" |>>
+                    Right (DownloadProcess "text/plain" ["1234567890", "1234567890", "123"])
+                ]
+            executeRequest jint ["get", hex "fid1", "filename that should be ignored"]
+                (expectStream "text/plain" ["1234567890", "1234567890", "123"])
+                (SimpleRequest $ rqdata [])
+            checkpoint fake
+                [ StorageDownload "fid2" |>> Left NotFoundError
+                ]
+            executeRequest jint ["get", hex "fid2", "filename that should be ignored"]
+                (expectResponse $ Response StatusNotFound $ ResponseBodyError ErrNotFound)
+                (SimpleRequest $ rqdata [])

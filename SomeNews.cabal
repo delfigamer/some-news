@@ -4,7 +4,7 @@ cabal-version: 1.12
 --
 -- see: https://github.com/sol/hpack
 --
--- hash: 6a27b9c56df2439a3786432fdb80a13abc227cb1d9e0d27501cf9ba6ae051d84
+-- hash: d31a42b36541597aab8fe630817064b4f1e4b313ba3c8c66bf2bd28a5f970206
 
 name:           SomeNews
 version:        0.1.0.0
@@ -48,6 +48,7 @@ library
       Storage
       Storage.Schema
       TData.MinHeap
+      TData.PolyMap
       TData.TimedHashmap
       Tuple
       WApp

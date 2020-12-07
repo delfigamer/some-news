@@ -16,6 +16,7 @@ module JsonInterface.Internal
     , exitRespond
     , runRequestHandler
     , execRequestHandler
+    , checkUserPassword
     , requireUserAccess
     , requireAdminAccess
     , assertArticleAccess
@@ -23,6 +24,7 @@ module JsonInterface.Internal
     , withDefault
     , intParser
     , textParser
+    , passwordParser
     , referenceParser
     , accessKeyParser
     , sortOrderParser
@@ -33,8 +35,7 @@ module JsonInterface.Internal
     , performRequire
     , performRequireConfirm
     , expand
-    , expandFileInfo
-    , expandUploadStatus
+    , expandList
     , storageError
     , exitOk
     , exitError
@@ -125,6 +126,13 @@ execRequestHandler
 execRequestHandler handler context accept = do
     runRequestHandler handler context accept (return . absurd)
 
+checkUserPassword :: MonadRequestHandler f m => Reference User -> Password -> m ()
+checkUserPassword userRef password = do
+    check <- perform $ UserCheckPassword userRef password
+    case check of
+        Right () -> return ()
+        _ -> exitError ErrInvalidAccessKey
+
 requireUserAccess :: (MonadRequestHandler f m, MonadReader RequestData m) => m User
 requireUserAccess = do
     akey <- getParam "akey" accessKeyParser
@@ -150,7 +158,7 @@ assertArticleAccess userRef articleRef = do
     qret <- performRequire $ ArticleList True $ ListView 0 1 [FilterArticleId articleRef, FilterArticleUserId userRef] []
     case qret of
         [article] -> return article
-        _ -> exitError ErrAccessDenied
+        _ -> exitError ErrArticleNotEditable
 
 getParam :: (MonadRequestHandler f m, MonadReader RequestData m) => BS.ByteString -> (Maybe BS.ByteString -> Maybe r) -> m r
 getParam key parser = do
@@ -183,6 +191,9 @@ textParser (Just "") = Nothing
 textParser (Just bs) = case Text.decodeUtf8' bs of
     Left _ -> Nothing
     Right text -> Just text
+
+passwordParser :: Maybe BS.ByteString -> Maybe Password
+passwordParser = fmap Password
 
 referenceParser :: Maybe BS.ByteString -> Maybe (Reference a)
 referenceParser Nothing = Nothing
@@ -261,14 +272,14 @@ performRequire action = perform action >>= \case
 
 performRequireConfirm :: (MonadRequestHandler f m, MonadReader RequestData m) => Action a -> m a
 performRequireConfirm action = do
-    confirmParam <- getParam "confirm" $ withDefault "" referenceParser
-    case confirmParam of
-        "" -> recreateTicket
-        _ -> do
+    mConfirmParam <- getParam "confirm" $ Just . referenceParser
+    case mConfirmParam of
+        Just confirmParam | confirmParam /= "" -> do
             mTicket2 <- lookupActionTicket confirmParam
             if mTicket2 == Just ticket
                 then return ()
                 else recreateTicket
+        _ -> recreateTicket
     performRequire action
   where
     recreateTicket = do
@@ -276,18 +287,19 @@ performRequireConfirm action = do
         exitRespond $ Response StatusOk $ ResponseBodyConfirm ref
     ticket = ActionTicket action
 
-expand :: (MonadRequestHandler f m, Expandable a) => a -> m (Expanded a)
-expand x = withStorage $ \storage -> expand' storage x
-
-expandFileInfo :: (MonadRequestHandler f m, MonadReader RequestData m) => FileInfo -> m (Expanded FileInfo)
-expandFileInfo x = do
+expand :: (MonadRequestHandler f m, MonadReader RequestData m, Expandable a) => a -> m (Expanded a)
+expand x = do
     approot <- rqdataApproot <$> ask
-    withStorage $ \storage -> expandFileInfo' storage approot x
+    withStorage $ \storage -> do
+        cex <- newExpansionContext storage approot
+        expand' cex x
 
-expandUploadStatus :: (MonadRequestHandler f m, MonadReader RequestData m) => UploadStatus -> m (Expanded UploadStatus)
-expandUploadStatus x = do
+expandList :: (MonadRequestHandler f m, MonadReader RequestData m, Expandable a) => [a] -> m [Expanded a]
+expandList xs = do
     approot <- rqdataApproot <$> ask
-    withStorage $ \storage -> expandUploadStatus' storage approot x
+    withStorage $ \storage -> do
+        cex <- newExpansionContext storage approot
+        mapM (expand' cex) xs
 
 storageError :: StorageError -> ErrorMessage
 storageError = \case

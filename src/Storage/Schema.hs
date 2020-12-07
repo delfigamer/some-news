@@ -103,6 +103,8 @@ upgradeEmptyToCurrent logger db = do
                 , ColumnDecl (FText "user_surname") [CCNotNull]
                 , ColumnDecl (FTime "user_join_date") [CCNotNull]
                 , ColumnDecl (FBool "user_is_admin") [CCNotNull]
+                , ColumnDecl (FBlob "user_password_salt") [CCNotNull]
+                , ColumnDecl (FBlob "user_password_hash") [CCNotNull]
                 ]
                 []
         Db.query $

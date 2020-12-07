@@ -10,6 +10,7 @@ import qualified Data.Text as Text
 data Config = Config
     { defaultPageLimit :: Int64
     , maxPageLimit :: Int64
+    , minPasswordLength :: Int
     , maxAccessKeyCount :: Int64
     , ticketLength :: Int
     , ticketLifetime :: NominalDiffTime
@@ -22,6 +23,7 @@ instance FromJSON Config where
         Config
             <$> v .:? "defaultPageLimit" .!= 20
             <*> v .:? "maxPageLimit" .!= 100
+            <*> v .:? "minPasswordLength" .!= 8
             <*> v .:? "maxAccessKeyCount" .!= 100
             <*> v .:? "ticketLength" .!= 32
             <*> v .:? "ticketLifetime" .!= 300

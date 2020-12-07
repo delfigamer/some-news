@@ -193,6 +193,20 @@ spec = do
                 fileTable <- generateFiles storage sampleSize userTable articleTable
                 minceFiles storage sampleSize userTable articleTable fileTable
 
+testStorageConfig :: StorageConfig
+testStorageConfig = StorageConfig
+    { storageConfigUserIdLength = 10
+    , storageConfigAccessKeyIdLength = 11
+    , storageConfigAccessKeyTokenLength = 12
+    , storageConfigAuthorIdLength = 13
+    , storageConfigCategoryIdLength = 14
+    , storageConfigArticleIdLength = 15
+    , storageConfigArticleVersionLength = 16
+    , storageConfigTagIdLength = 17
+    , storageConfigCommentIdLength = 18
+    , storageConfigFileIdLength = 19
+    }
+
 clearStorage :: String -> (Int -> Storage -> IO ()) -> SpecWith [TestConfig]
 clearStorage name body = do
     it name $ \testConfList -> do
@@ -202,18 +216,19 @@ clearStorage name body = do
                 Db.withDatabase (databaseConfig testConf) logger $ \db -> do
                     clearDatabase db
                     upgradeSchema logger db `shouldReturn` Right ()
-                    withSqlStorage logger db (expectationFailure . show) $ \storage -> do
+                    withSqlStorage testStorageConfig logger db (expectationFailure . show) $ \storage -> do
                         body (confSampleSize testConf) storage
 
 generateUsers
     :: Storage -> Int
-    -> IO (Map.Map (Reference User) User)
+    -> IO (Map.Map (Reference User) (User, BS.ByteString))
 generateUsers storage sampleSize = do
     userTable <- Map.new
     parallelFor_ [1 .. sampleSize] $ \_ -> do
         name <- generate $ randomText
         surname <- generate $ randomText
-        user <- assertRight =<< storagePerform storage (UserCreate name surname)
+        password <- generate $ randomWithin 0 100 >>= randomByteString
+        user <- assertRight =<< storagePerform storage (UserCreate name surname (Password password))
         userName user `shouldBe` name
         userSurname user `shouldBe` surname
         userIsAdmin user `shouldBe` False
@@ -221,49 +236,62 @@ generateUsers storage sampleSize = do
         when isAdmin $
             assertRight =<< storagePerform storage (UserSetIsAdmin (userId user) True)
         Map.insert userTable (userId user) $
-            user {userIsAdmin = isAdmin}
+            (user {userIsAdmin = isAdmin}, password)
     return userTable
 
 validateUsers
     :: HasCallStack
     => Storage
-    -> Map.Map (Reference User) User
+    -> Map.Map (Reference User) (User, BS.ByteString)
     -> IO ()
 validateUsers storage userTable = do
-    userList <- sortOn userId <$> Map.elems userTable
+    userList <- Map.elems userTable
     storagePerform storage (UserList (ListView 0 maxBound [] []))
         `shouldReturn`
-        Right userList
+        Right (sortOn userId $ map fst userList)
+    parallelFor_ userList $ \(user, password) -> do
+        storagePerform storage (UserCheckPassword (userId user) (Password password))
+            `shouldReturn`
+            Right ()
 
 minceUsers
     :: Storage -> Int
-    -> Map.Map (Reference User) User
+    -> Map.Map (Reference User) (User, BS.ByteString)
     -> IO ()
 minceUsers storage sampleSize userTable = do
     validateUsers storage userTable
     do
         userList <- Map.elems userTable
         toAlter <- generate $ chooseFrom (sampleSize `div` 5) userList
-        parallelFor_ toAlter $ \user -> do
+        parallelFor_ toAlter $ \(user, password) -> do
             name <- generate $ randomText
             surname <- generate $ randomText
             assertRight =<< storagePerform storage (UserSetName (userId user) name surname)
             Map.insert userTable (userId user) $
-                user {userName = name, userSurname = surname}
+                (user {userName = name, userSurname = surname}, password)
         validateUsers storage userTable
     do
         userList <- Map.elems userTable
         toAlter <- generate $ chooseFrom (sampleSize `div` 5) userList
-        parallelFor_ toAlter $ \user -> do
+        parallelFor_ toAlter $ \(user, password) -> do
             isAdmin <- generate $ randomBool
             assertRight =<< storagePerform storage (UserSetIsAdmin (userId user) isAdmin)
             Map.insert userTable (userId user) $
-                user {userIsAdmin = isAdmin}
+                (user {userIsAdmin = isAdmin}, password)
+        validateUsers storage userTable
+    do
+        userList <- Map.elems userTable
+        toAlter <- generate $ chooseFrom (sampleSize `div` 5) userList
+        parallelFor_ toAlter $ \(user, _) -> do
+            password <- generate $ randomWithin 0 100 >>= randomByteString
+            assertRight =<< storagePerform storage (UserSetPassword (userId user) (Password password))
+            Map.insert userTable (userId user) $
+                (user, password)
         validateUsers storage userTable
     do
         userList <- Map.elems userTable
         toDelete <- generate $ chooseFrom (sampleSize `div` 5) userList
-        parallelFor_ toDelete $ \user -> do
+        parallelFor_ toDelete $ \(user, _) -> do
             assertRight =<< storagePerform storage (UserDelete (userId user))
             Map.delete userTable (userId user)
         validateUsers storage userTable
@@ -272,16 +300,22 @@ minceUsers storage sampleSize userTable = do
         parallelFor_ badRefs $ \ref -> do
             storagePerform storage (UserSetName ref "foo" "bar") `shouldReturn` Left NotFoundError
             storagePerform storage (UserSetIsAdmin ref True) `shouldReturn` Left NotFoundError
+            storagePerform storage (UserSetPassword ref "foo") `shouldReturn` Left NotFoundError
             storagePerform storage (UserDelete ref) `shouldReturn` Left NotFoundError
             storagePerform storage (UserList (ListView 0 1 [FilterUserId ref] []))
                 `shouldReturn`
                 Right []
     do
-        userList <- sortOn userId <$> Map.elems userTable
-        parallelFor_ userList $ \user -> do
+        userPasswordList <- Map.elems userTable
+        let userList = sortOn userId $ map fst userPasswordList
+        parallelFor_ userPasswordList $ \(user, password) -> do
             storagePerform storage (UserList (ListView 0 1 [FilterUserId (userId user)] []))
                 `shouldReturn`
                 Right [user]
+            badPassword <- generate $ randomByteString 16 `suchThat` (/= password)
+            storagePerform storage (UserCheckPassword (userId user) (Password badPassword))
+                `shouldReturn`
+                Left NotFoundError
         storagePerform storage (UserList (ListView 0 maxBound [FilterUserIsAdmin True] []))
             `shouldReturn`
             Right (filter userIsAdmin userList)
@@ -307,7 +341,7 @@ minceUsers storage sampleSize userTable = do
 
 generateAccessKeys
     :: Storage -> Int
-    -> Map.Map (Reference User) User
+    -> Map.Map (Reference User) (User, BS.ByteString)
     -> IO (Multimap.Multimap (Reference User) AccessKey)
 generateAccessKeys storage sampleSize userTable = do
     akeyTable <- Multimap.new
@@ -320,39 +354,24 @@ generateAccessKeys storage sampleSize userTable = do
 
 minceAccessKeys
     :: Storage -> Int
-    -> Map.Map (Reference User) User
+    -> Map.Map (Reference User) (User, BS.ByteString)
     -> Multimap.Multimap (Reference User) AccessKey
     -> IO ()
 minceAccessKeys storage sampleSize userTable akeyTable = do
     validateAccessKeys storage userTable akeyTable
     userRefs <- Map.keys userTable
     do
-        allKeys <- Multimap.toList akeyTable
-        toDelete <- generate $ chooseFrom (sampleSize `div` 5) allKeys
-        parallelFor_ toDelete $ \(userRef, akey) -> do
-            assertRight =<< storagePerform storage (AccessKeyDelete userRef (accessKeyId akey))
-            Multimap.delete akeyTable userRef akey
-        validateAccessKeys storage userTable akeyTable
-    do
-        akeyGroups <- Multimap.toGroupsWith akeyTable userTable
-        let oneKeys = do
-                (userRef, userAkeys) <- akeyGroups
-                oneKey : _ <- return userAkeys
-                [(userRef, oneKey)]
-        let (users, keys) = unzip oneKeys
-        let badKeysFull = zip users (drop 1 keys)
-        badKeys <- generate $ chooseFrom (sampleSize `div` 5) badKeysFull
-        parallelFor_ badKeys $ \(userRef, akey) -> do
-            storagePerform storage (AccessKeyDelete userRef (accessKeyId akey))
-                `shouldReturn`
-                Left NotFoundError
+        usersToClean <- generate $ chooseFrom (sampleSize `div` 5) userRefs
+        parallelFor_ usersToClean $ \userRef -> do
+            assertRight =<< storagePerform storage (AccessKeyClear userRef)
+            Multimap.deleteAll akeyTable userRef
         validateAccessKeys storage userTable akeyTable
     return ()
 
 validateAccessKeys
     :: HasCallStack
     => Storage
-    -> Map.Map (Reference User) User
+    -> Map.Map (Reference User) (User, BS.ByteString)
     -> Multimap.Multimap (Reference User) AccessKey
     -> IO ()
 validateAccessKeys storage userTable akeyTable = do
@@ -361,7 +380,7 @@ validateAccessKeys storage userTable akeyTable = do
         storagePerform storage (AccessKeyList userRef (ListView 0 maxBound [] []))
             `shouldReturn`
             Right (sort $ map accessKeyId $ userAkeys)
-        user <- Map.lookup' userTable userRef
+        (user, _) <- Map.lookup' userTable userRef
         parallelFor_ userAkeys $ \akey -> do
             storagePerform storage (UserList (ListView 0 1 [FilterUserAccessKey akey] []))
                 `shouldReturn`
@@ -445,7 +464,7 @@ validateAuthors storage authorTable = do
 
 generateUserAuthorRels
     :: Storage -> Int
-    -> Map.Map (Reference User) User
+    -> Map.Map (Reference User) (User, BS.ByteString)
     -> Map.Map (Reference Author) Author
     -> IO (Relmap.Relmap (Reference User) (Reference Author))
 generateUserAuthorRels storage sampleSize userTable authorTable = do
@@ -457,7 +476,7 @@ generateUserAuthorRels storage sampleSize userTable authorTable = do
 
 minceUserAuthorRels
     :: Storage -> Int
-    -> Map.Map (Reference User) User
+    -> Map.Map (Reference User) (User, BS.ByteString)
     -> Map.Map (Reference Author) Author
     -> Relmap.Relmap (Reference User) (Reference Author)
     -> IO ()
@@ -501,7 +520,7 @@ minceUserAuthorRels storage sampleSize userTable authorTable connSet = do
 validateUserAuthorRels
     :: HasCallStack
     => Storage
-    -> Map.Map (Reference User) User
+    -> Map.Map (Reference User) (User, BS.ByteString)
     -> Map.Map (Reference Author) Author
     -> Relmap.Relmap (Reference User) (Reference Author)
     -> IO ()
@@ -514,7 +533,9 @@ validateUserAuthorRels storage userTable authorTable connSet = do
             Right authorList
     authorUserGroups <- Multimap.toGroupsWith (Relmap.right connSet) authorTable
     parallelFor_ authorUserGroups $ \(authorRef, authorUsers) -> do
-        userList <- parallelFor (sort authorUsers) $ Map.lookup' userTable
+        userList <- parallelFor (sort authorUsers) $ \userRef -> do
+            (user, _) <- Map.lookup' userTable userRef
+            return user
         storagePerform storage (UserList (ListView 0 maxBound [FilterUserAuthorId authorRef] []))
             `shouldReturn`
             Right userList
@@ -671,7 +692,7 @@ generateArticles storage sampleSize authorTable categoryTree = do
 
 minceArticles
     :: Storage -> Int
-    -> Map.Map (Reference User) User
+    -> Map.Map (Reference User) (User, BS.ByteString)
     -> Map.Map (Reference Author) Author
     -> Relmap.Relmap (Reference User) (Reference Author)
     -> Tree.Tree (Reference Category) Text.Text
@@ -1058,7 +1079,7 @@ validateArticleTagRels storage articleTable tagTable connSet = do
 
 generateComments
     :: Storage -> Int
-    -> Map.Map (Reference User) User
+    -> Map.Map (Reference User) (User, BS.ByteString)
     -> Map.Map (Reference Article) (Article, Text.Text)
     -> IO (Map.Map (Reference Comment) Comment)
 generateComments storage sampleSize userTable articleTable = do
@@ -1075,7 +1096,7 @@ generateComments storage sampleSize userTable articleTable = do
 
 minceComments
     :: Storage -> Int
-    -> Map.Map (Reference User) User
+    -> Map.Map (Reference User) (User, BS.ByteString)
     -> Map.Map (Reference Article) (Article, Text.Text)
     -> Map.Map (Reference Comment) Comment
     -> IO ()
@@ -1176,7 +1197,7 @@ validateComments storage commentTable = do
 
 generateFiles
     :: Storage -> Int
-    -> Map.Map (Reference User) User
+    -> Map.Map (Reference User) (User, BS.ByteString)
     -> Map.Map (Reference Article) (Article, Text.Text)
     -> IO (Map.Map (Reference FileInfo) (FileInfo, LBS.ByteString))
 generateFiles storage sampleSize userTable articleTable = do
@@ -1203,7 +1224,7 @@ generateFiles storage sampleSize userTable articleTable = do
 
 minceFiles
     :: Storage -> Int
-    -> Map.Map (Reference User) User
+    -> Map.Map (Reference User) (User, BS.ByteString)
     -> Map.Map (Reference Article) (Article, Text.Text)
     -> Map.Map (Reference FileInfo) (FileInfo, LBS.ByteString)
     -> IO ()
@@ -1287,7 +1308,7 @@ minceFiles storage sampleSize userTable articleTable fileTable = do
             storagePerform storage (FileList (ListView 0 1 [FilterFileId (fileId finfo)] []))
                 `shouldReturn`
                 Right [finfo]
-            downloadFile storage (fileId finfo) `shouldReturn` Right content
+            downloadFile storage (fileId finfo) `shouldReturn` Right (fileMimeType finfo, content)
         parallelFor_ ("" : userRefs) $ \userRef -> do
             let userFiles = filter (\finfo -> fileUser finfo == userRef) $ map fst fileList
             storagePerform storage (FileList (ListView 0 maxBound [FilterFileUserId userRef] []))
@@ -1321,14 +1342,14 @@ validateFiles storage fileTable = do
         `shouldReturn`
         Right finfoList
 
-downloadFile :: Storage -> Reference FileInfo -> IO (Either StorageError LBS.ByteString)
+downloadFile :: Storage -> Reference FileInfo -> IO (Either StorageError (Text.Text, LBS.ByteString))
 downloadFile storage fileRef = do
     storageDownload storage fileRef onError onStream
   where
     onError err = return $ Left err
-    onStream fsize inner = do
+    onStream fsize ftype inner = do
         buf <- newIORef mempty
         inner $ \chunk -> modifyIORef' buf (<> Builder.byteString chunk)
         content <- Builder.toLazyByteString <$> readIORef buf
         fsize `shouldBe` LBS.length content
-        return $ Right content
+        return $ Right (ftype, content)

@@ -13,6 +13,7 @@ module Storage
     ( Reference(..)
     , Version(..)
     , User(..)
+    , Password(..)
     , AccessKey(..)
     , Author(..)
     , Category(..)
@@ -23,6 +24,7 @@ module Storage
     , FileInfo(..)
     , Upload(..)
     , InitFailure(..)
+    , StorageConfig(..)
     , Storage(..)
     , withSqlStorage
     , currentSchema
@@ -89,6 +91,15 @@ data User = User
     }
     deriving (Show, Eq, Ord)
 
+newtype Password = Password
+    { getPassword :: BS.ByteString
+    }
+    deriving (Eq, Ord, IsString)
+
+instance Show Password where
+    showsPrec d _ = showParen (d > 10)
+        $ showString "Password <<token>>"
+
 data AccessKey = AccessKey
     { accessKeyId :: !(Reference AccessKey)
     , accessKeyToken :: !BS.ByteString
@@ -96,11 +107,10 @@ data AccessKey = AccessKey
     deriving (Eq, Ord)
 
 instance Show AccessKey where
-    showsPrec d ak@(AccessKey ref _) = showParen (d > 10)
+    showsPrec d (AccessKey ref _) = showParen (d > 10)
         $ showString "AccessKey "
         . showsPrec 11 ref
-        . showString " "
-        . showBlob "hash" (hashAccessKey ak)
+        . showString " <<token>>"
 
 data Author = Author
     { authorId :: !(Reference Author)
@@ -169,6 +179,33 @@ data Upload r
     | UploadFinish !r
     | UploadChunk !BS.ByteString (IO (Upload r))
 
+data StorageConfig = StorageConfig
+    { storageConfigUserIdLength :: Int
+    , storageConfigAccessKeyIdLength :: Int
+    , storageConfigAccessKeyTokenLength :: Int
+    , storageConfigAuthorIdLength :: Int
+    , storageConfigCategoryIdLength :: Int
+    , storageConfigArticleIdLength :: Int
+    , storageConfigArticleVersionLength :: Int
+    , storageConfigTagIdLength :: Int
+    , storageConfigCommentIdLength :: Int
+    , storageConfigFileIdLength :: Int
+    }
+
+defaultStorageConfig :: StorageConfig
+defaultStorageConfig = StorageConfig
+    { storageConfigUserIdLength = 16
+    , storageConfigAccessKeyIdLength = 16
+    , storageConfigAccessKeyTokenLength = 48
+    , storageConfigAuthorIdLength = 16
+    , storageConfigCategoryIdLength = 4
+    , storageConfigArticleIdLength = 16
+    , storageConfigArticleVersionLength = 16
+    , storageConfigTagIdLength = 4
+    , storageConfigCommentIdLength = 16
+    , storageConfigFileIdLength = 16
+    }
+
 data Storage = Storage
     { storagePerform :: forall a. Action a -> IO (Either StorageError a)
     , storageGenerateBytes :: Int -> IO BS.ByteString
@@ -182,21 +219,22 @@ data Storage = Storage
     , storageDownload :: forall r b.
            Reference FileInfo
         -> (StorageError -> IO r)
-        -> (Int64 -> ((BS.ByteString -> IO ()) -> IO ()) -> IO r)
+        -> (Int64 -> Text.Text -> ((BS.ByteString -> IO ()) -> IO ()) -> IO r)
         -> IO r
     }
 
 data SqlStorage = SqlStorage
-    { storageLogger :: Logger
+    { storageConfig :: StorageConfig
+    , storageLogger :: Logger
     , storageDb :: Db.Database
     , storageGen :: IORef CRand.ChaChaDRG
     }
 
-withSqlStorage :: Logger -> Db.Database -> (InitFailure -> IO r) -> (Storage -> IO r) -> IO r
-withSqlStorage logger db onFail onSuccess = do
+withSqlStorage :: StorageConfig -> Logger -> Db.Database -> (InitFailure -> IO r) -> (Storage -> IO r) -> IO r
+withSqlStorage config logger db onFail onSuccess = do
     matchCurrentSchema logger db onFail $ do
         pgen <- newIORef =<< CRand.drgNew
-        let storage = SqlStorage logger db pgen
+        let storage = SqlStorage config logger db pgen
         onSuccess $ Storage
             { storagePerform = \action -> do
                 logDebug logger $ "SqlStorage: Request: " <<| action
@@ -206,7 +244,9 @@ withSqlStorage logger db onFail onSuccess = do
                         "SqlStorage: Request finished: " <<| action << " -> " <<| result
                     return result
             , storageGenerateBytes = \count -> do
-                generateBytes count `runReaderT` storage
+                atomicModifyIORef' pgen $ \gen1 ->
+                    let (value, gen2) = CRand.randomBytesGenerate count gen1
+                    in (gen2, value)
             , storageUpload = sqlStorageUpload storage
             , storageDownload = sqlStorageDownload storage
             }
@@ -215,14 +255,16 @@ withSqlStorage logger db onFail onSuccess = do
     resultLogLevel _ = LevelDebug
 
 data Action a where
-    UserCreate :: Text.Text -> Text.Text -> Action User
+    UserCreate :: Text.Text -> Text.Text -> Password -> Action User
+    UserCheckPassword :: Reference User -> Password -> Action ()
     UserSetName :: Reference User -> Text.Text -> Text.Text -> Action ()
     UserSetIsAdmin :: Reference User -> Bool -> Action ()
+    UserSetPassword :: Reference User -> Password -> Action ()
     UserDelete :: Reference User -> Action ()
     UserList :: ListView User -> Action [User]
 
     AccessKeyCreate :: Reference User -> Action AccessKey
-    AccessKeyDelete :: Reference User -> Reference AccessKey -> Action ()
+    AccessKeyClear :: Reference User -> Action ()
     AccessKeyList :: Reference User -> ListView AccessKey -> Action [Reference AccessKey]
 
     AuthorCreate :: Text.Text -> Text.Text -> Action Author
@@ -380,14 +422,44 @@ data StorageError
     deriving (Show, Eq, Ord)
 
 sqlStoragePerform :: Action a -> SqlStorage -> (Show a => Either StorageError a -> IO r) -> IO r
-sqlStoragePerform (UserCreate name surname) = runTransaction Db.ReadCommited $ do
-    ref <- Reference <$> generateBytes 16
+sqlStoragePerform (UserCreate name surname password) = runTransaction Db.ReadCommited $ do
+    ref <- Reference <$> generateBytes storageConfigUserIdLength
     joinDate <- currentTime
+    salt <- generateBytes (const 16)
     doQuery
         (Insert "sn_users"
-            (fReference "user_id" :/ fText "user_name" :/ fText "user_surname" :/ fTime "user_join_date" :/ fBool "user_is_admin" :/ E)
-            (Value ref :/ Value name :/ Value surname :/ Value joinDate :/ Value False :/ E))
+            (  fReference "user_id"
+            :/ fText "user_name"
+            :/ fText "user_surname"
+            :/ fTime "user_join_date"
+            :/ fBool "user_is_admin"
+            :/ fBlob "user_password_salt"
+            :/ fBlob "user_password_hash"
+            :/ E)
+            (  Value ref
+            :/ Value name
+            :/ Value surname
+            :/ Value joinDate
+            :/ Value False
+            :/ Value salt
+            :/ Value (hashPassword salt password)
+            :/ E))
         (parseInsert $ User ref name surname joinDate False)
+sqlStoragePerform (UserCheckPassword userRef password) = runTransaction Db.ReadCommited $ do
+    (salt, hash1) <- doQuery
+        (Select ["sn_users"]
+            (fBlob "user_password_salt" :/ fBlob "user_password_hash" :/ E)
+            [WhereIs userRef "user_id"]
+            []
+            (RowRange 0 1))
+        (\case
+            [Just salt :/ Just hash :/ E] -> Right (salt, hash)
+            [] -> Left NotFoundError
+            _ -> Left InternalError)
+    let hash2 = hashPassword salt password
+    if hash1 == hash2
+        then return ()
+        else lift $ Db.rollback $ Left NotFoundError
 sqlStoragePerform (UserSetName userRef name surname) = runTransaction Db.ReadCommited $ do
     doQuery
         (Update "sn_users"
@@ -400,6 +472,14 @@ sqlStoragePerform (UserSetIsAdmin userRef isAdmin) = runTransaction Db.ReadCommi
         (Update "sn_users"
             (fBool "user_is_admin" :/ E)
             (Value isAdmin :/ E)
+            [WhereIs userRef "user_id"])
+        parseCount
+sqlStoragePerform (UserSetPassword userRef password) = runTransaction Db.ReadCommited $ do
+    salt <- generateBytes (const 16)
+    doQuery
+        (Update "sn_users"
+            (fBlob "user_password_salt" :/ fBlob "user_password_hash" :/ E)
+            (Value salt :/ Value (hashPassword salt password) :/ E)
             [WhereIs userRef "user_id"])
         parseCount
 sqlStoragePerform (UserDelete userRef) = runTransaction Db.ReadCommited $ do
@@ -418,8 +498,8 @@ sqlStoragePerform (UserList view) = runTransaction Db.ReadCommited $ do
             (parseList $ parseOne User)
 
 sqlStoragePerform (AccessKeyCreate userRef) = runTransaction Db.ReadCommited $ do
-    keyBack <- generateBytes 48
-    keyFront <- Reference <$> generateBytes 16
+    keyBack <- generateBytes storageConfigAccessKeyTokenLength
+    keyFront <- Reference <$> generateBytes storageConfigAccessKeyIdLength
     let key = AccessKey keyFront keyBack
     let keyHash = hashAccessKey key
     doQuery
@@ -427,11 +507,10 @@ sqlStoragePerform (AccessKeyCreate userRef) = runTransaction Db.ReadCommited $ d
             (fReference "access_key_id" :/ fBlob "access_key_hash" :/ fReference "access_key_user_id" :/ E)
             (Value keyFront :/ Value keyHash :/ Value userRef :/ E))
         (parseInsert key)
-sqlStoragePerform (AccessKeyDelete userRef keyRef) = runTransaction Db.ReadCommited $ do
-    doQuery
+sqlStoragePerform (AccessKeyClear userRef) = runTransaction Db.ReadCommited $ do
+    doQuery_
         (Delete "sn_access_keys"
-            [WhereIs userRef "access_key_user_id", WhereIs keyRef "access_key_id"])
-        parseCount
+            [WhereIs userRef "access_key_user_id"])
 sqlStoragePerform (AccessKeyList userRef view) = runTransaction Db.ReadCommited $ do
     withView view $ \tables filter order range _ -> do
         doQuery
@@ -443,7 +522,7 @@ sqlStoragePerform (AccessKeyList userRef view) = runTransaction Db.ReadCommited 
             (parseList $ parseOne id)
 
 sqlStoragePerform (AuthorCreate name description) = runTransaction Db.ReadCommited $ do
-    ref <- Reference <$> generateBytes 16
+    ref <- Reference <$> generateBytes storageConfigAuthorIdLength
     doQuery
         (Insert "sn_authors"
             (fReference "author_id" :/ fText "author_name" :/ fText "author_description" :/ E)
@@ -491,7 +570,7 @@ sqlStoragePerform (AuthorSetOwnership authorRef userRef False) = runTransaction 
             [WhereIs userRef "a2u_user_id", WhereIs authorRef "a2u_author_id"])
 
 sqlStoragePerform (CategoryCreate name parentRef) = runTransaction Db.ReadCommited $ do
-    ref <- Reference <$> generateBytes 4
+    ref <- Reference <$> generateBytes storageConfigCategoryIdLength
     doQuery
         (Insert "sn_categories"
             (fReference "category_id" :/ fText "category_name" :/ fReference "category_parent_id" :/ E)
@@ -565,8 +644,8 @@ sqlStoragePerform (CategoryList view) = runTransaction Db.ReadCommited $ do
             (parseList $ parseOne Category)
 
 sqlStoragePerform (ArticleCreate authorRef) = runTransaction Db.ReadCommited $ do
-    articleRef <- Reference <$> generateBytes 16
-    articleVersion <- Version <$> generateBytes 4
+    articleRef <- Reference <$> generateBytes storageConfigArticleIdLength
+    articleVersion <- Version <$> generateBytes storageConfigArticleVersionLength
     doQuery
         (Insert "sn_articles"
             (  fReference "article_id"
@@ -621,7 +700,7 @@ sqlStoragePerform (ArticleSetText articleRef oldVersion text) = runTransaction D
                 | otherwise -> Left VersionError
             [] -> Left NotFoundError
             _ -> Left InternalError)
-    newVersion <- Version <$> generateBytes 4
+    newVersion <- Version <$> generateBytes storageConfigArticleVersionLength
     doQuery_
         (Update "sn_articles"
             (fVersion "article_version" :/ fText "article_text" :/ E)
@@ -673,7 +752,7 @@ sqlStoragePerform (ArticleSetTag articleRef tagRef False) = runTransaction Db.Re
             [WhereIs articleRef "a2t_article_id", WhereIs tagRef "a2t_tag_id"])
 
 sqlStoragePerform (TagCreate name) = runTransaction Db.ReadCommited $ do
-    tagRef <- Reference <$> generateBytes 4
+    tagRef <- Reference <$> generateBytes storageConfigTagIdLength
     doQuery
         (Insert "sn_tags"
             (fReference "tag_id" :/ fText "tag_name" :/ E)
@@ -702,7 +781,7 @@ sqlStoragePerform (TagList view) = runTransaction Db.ReadCommited $ do
             (parseList $ parseOne Tag)
 
 sqlStoragePerform (CommentCreate articleRef userRef text) = runTransaction Db.ReadCommited $ do
-    commentRef <- Reference <$> generateBytes 16
+    commentRef <- Reference <$> generateBytes storageConfigCommentIdLength
     commentDate <- currentTime
     doQuery
         (Insert "sn_comments"
@@ -798,7 +877,7 @@ sqlStorageUpload
 sqlStorageUpload storage name mimeType articleRef userRef uploader = do
     tret <- Db.execute (storageDb storage) Db.ReadCommited $ do
         uploadTime <- currentTime
-        fileRef <- (Reference <$> generateBytes 16) `runReaderT` storage
+        fileRef <- (Reference <$> generateBytes storageConfigFileIdLength) `runReaderT` storage
         maxIndexQret <- Db.query
             (Select ["sn_files"]
                 (fInt "COALESCE(MAX(file_index), 0)" :/ E)
@@ -857,11 +936,22 @@ sqlStorageDownload
     :: SqlStorage
     -> Reference FileInfo
     -> (StorageError -> IO r)
-    -> (Int64 -> ((BS.ByteString -> IO ()) -> IO ()) -> IO r)
+    -> (Int64 -> Text.Text -> ((BS.ByteString -> IO ()) -> IO ()) -> IO r)
     -> IO r
 sqlStorageDownload storage fileRef onError onStream = do
     pmResult <- newIORef Nothing
     tret <- Db.execute (storageDb storage) Db.RepeatableRead $ do
+        filetypeQret <- Db.query
+            (Select
+                ["sn_files"]
+                (fText "file_mimetype" :/ E)
+                [WhereIs fileRef "file_id"]
+                []
+                (RowRange 0 1))
+        filetype <- case filetypeQret of
+            [Just filetype :/ E] -> return filetype
+            [] -> Db.rollback $ Left NotFoundError
+            _ -> Db.abort
         filesizeQret <- Db.query
             (Select
                 ["sn_file_chunks"]
@@ -875,7 +965,7 @@ sqlStorageDownload storage fileRef onError onStream = do
             _ -> Db.abort
         sink <- Db.mshift $ \cont -> do
             pOut <- newIORef $ error "invalid onStream callback"
-            result <- onStream filesize $ \sink -> do
+            result <- onStream filesize filetype $ \sink -> do
                 cont sink >>= writeIORef pOut
             writeIORef pmResult $ Just result
             readIORef pOut
@@ -909,13 +999,23 @@ hashAccessKey (AccessKey (Reference front) back) = do
     let ctx2 = CHash.hashUpdate ctx1 front
     BA.convert $ CHash.hashFinalize ctx2
 
+hashPassword :: BS.ByteString -> Password -> BS.ByteString
+hashPassword salt (Password back) = do
+    let ctx0 = CHash.hashInitWith CHash.SHA3_256
+    let ctx1 = CHash.hashUpdate ctx0 back
+    let ctx2 = CHash.hashUpdate ctx1 salt
+    BA.convert $ CHash.hashFinalize ctx2
+
 type Transaction a = ReaderT SqlStorage (Db.Transaction (Either StorageError a))
 
-generateBytes :: (MonadReader SqlStorage m, MonadIO m) => Int -> m BS.ByteString
-generateBytes len = do
-    tgen <- storageGen <$> ask
+generateBytes :: (MonadReader SqlStorage m, MonadIO m) => (StorageConfig -> Int) -> m BS.ByteString
+generateBytes getter = do
+    SqlStorage
+        { storageConfig = config
+        , storageGen = tgen
+        } <- ask
     liftIO $ atomicModifyIORef' tgen $ \gen1 ->
-        let (value, gen2) = CRand.randomBytesGenerate len gen1
+        let (value, gen2) = CRand.randomBytesGenerate (getter config) gen1
         in (gen2, value)
 
 doQuery :: Query qr -> (qr -> Either StorageError r) -> Transaction a r

@@ -1,12 +1,14 @@
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE FunctionalDependencies #-}
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE StandaloneDeriving #-}
 {-# LANGUAGE TemplateHaskell #-}
 
 module Storage.Fake
-    ( UploadExpectation(..)
-    , ActionEx(..)
+    ( UploadProcess(..)
+    , DownloadProcess(..)
+    , StorageAction(..)
     , ActionExpectation
     , (|>>)
     , FakeStorage
@@ -15,6 +17,8 @@ module Storage.Fake
     ) where
 
 import Data.IORef
+import Data.Int
+import Data.Semigroup
 import GHC.Stack
 import Test.Hspec
 import Type.Reflection
@@ -23,39 +27,34 @@ import qualified Data.Text as Text
 import HEq1
 import Storage
 
-data UploadExpectation
-    = ExpectError StorageError
-    | ExpectChunks FileInfo [BS.ByteString] Bool (Maybe StorageError)
+data UploadProcess = UploadProcess FileInfo [BS.ByteString] (Either StorageError (Bool, Maybe StorageError))
     deriving (Show, Eq)
 
-data ActionEx a where
-    BaseAction :: Action a -> ActionEx (Either StorageError a)
-    UploadAction
-        :: Text.Text
-        -> Text.Text
-        -> Reference Article
-        -> Reference User
-        -> ActionEx UploadExpectation
-    -- DownloadAction
-        -- :: Reference FileInfo
-        -- -> (StorageError -> IO r)
-        -- -> (Int64 -> IO b)
-        -- -> (b -> BS.ByteString -> IO b)
-        -- -> (b -> IO r)
-        -- -> ActionEx ()
-deriving instance Show (ActionEx a)
-deriving instance Eq (ActionEx a)
+data DownloadProcess = DownloadProcess Text.Text [BS.ByteString]
+    deriving (Show, Eq)
 
-instance HEq1 ActionEx where
-    heq (BaseAction ba) (BaseAction bb)
+data StorageAction a where
+    StoragePerform :: Action a -> StorageAction (Either StorageError a)
+    StorageGenerateBytes :: Int -> StorageAction BS.ByteString
+    StorageUpload :: Text.Text -> Text.Text -> Reference Article -> Reference User -> StorageAction (Either StorageError UploadProcess)
+    StorageDownload :: Reference FileInfo -> StorageAction (Either StorageError DownloadProcess)
+deriving instance Show (StorageAction a)
+deriving instance Eq (StorageAction a)
+
+instance HEq1 StorageAction where
+    heq (StoragePerform ba) (StoragePerform bb)
         | Just Refl <- heq ba bb = Just Refl
-    heq a@(UploadAction {}) b@(UploadAction {})
+    heq a@(StorageGenerateBytes {}) b@(StorageGenerateBytes {})
+        | a == b = Just Refl
+    heq a@(StorageUpload {}) b@(StorageUpload {})
+        | a == b = Just Refl
+    heq a@(StorageDownload {}) b@(StorageDownload {})
         | a == b = Just Refl
     heq _ _ = Nothing
 
 data ActionExpectation
     = forall a. Show a => ActionExpectation
-        (ActionEx a)
+        (StorageAction a)
         a
         (forall t u. (HasCallStack => t -> u) -> (t -> u))
 
@@ -68,11 +67,11 @@ infix 1 |>>
 class IsActionExpectation a r | a -> r where
     (|>>) :: (Show r, HasCallStack) => a -> r -> ActionExpectation
 
-instance IsActionExpectation (ActionEx a) a where
+instance IsActionExpectation (StorageAction a) a where
     action |>> result = ActionExpectation action result id
 
 instance IsActionExpectation (Action a) (Either StorageError a) where
-    action |>> result = ActionExpectation (BaseAction action) result id
+    action |>> result = ActionExpectation (StoragePerform action) result id
 
 data Context = Context
     [ActionExpectation]
@@ -97,9 +96,11 @@ withFakeStorage body = do
     context <- FakeStorage <$> newIORef (Context [] id)
     result <- body context $ Storage
         { storagePerform = \action -> do
-            expectAction context (BaseAction action) return
+            expectAction context (StoragePerform action) return
+        , storageGenerateBytes = \len -> do
+            expectAction context (StorageGenerateBytes len) return
         , storageUpload = fakeStorageUpload context
-        , storageDownload = undefined
+        , storageDownload = fakeStorageDownload context
         }
     checkpoint context []
     return result
@@ -112,34 +113,56 @@ fakeStorageUpload
     -> Reference User
     -> (FileInfo -> IO (Upload r))
     -> IO (Either StorageError r)
-fakeStorageUpload context name mimeType articleRef userRef uploader0 = do
-    expectAction context (UploadAction name mimeType articleRef userRef) $ go uploader0
+fakeStorageUpload context name mimeType articleRef userRef uploader = do
+    expectAction context (StorageUpload name mimeType articleRef userRef) $ \case
+        Left err -> return $ Left err
+        Right (UploadProcess finfo chunks uend) -> do
+            driveUploader chunks uend $ uploader finfo
   where
-    go :: HasCallStack => (FileInfo -> IO (Upload r)) -> UploadExpectation -> IO (Either StorageError r)
-    go _ (ExpectError err) = return $ Left err
-    go uploader (ExpectChunks finfo chunks accept merr) = do
-        r <- driveUploader chunks accept $ uploader finfo
-        case merr of
-            Nothing -> return $ Right r
-            Just err -> return $ Left err
-    driveUploader :: HasCallStack => [BS.ByteString] -> Bool -> IO (Upload r) -> IO r
-    driveUploader [] True func = do
-        ur <- func
-        AnUpload ur `shouldBe` AnUpload (UploadFinish ())
-        let UploadFinish r = ur
-        return r
-    driveUploader [] False func = do
-        ur <- func
-        AnUpload ur `shouldBe` AnUpload (UploadAbort ())
-        let UploadAbort r = ur
-        return r
-    driveUploader (x : xs) accept func = do
+    driveUploader
+        :: HasCallStack
+        => [BS.ByteString]
+        -> Either StorageError (Bool, Maybe StorageError)
+        -> IO (Upload r)
+        -> IO (Either StorageError r)
+    driveUploader [] uend func = do
+        case uend of
+            Left err -> return $ Left err
+            Right (accept, merr) -> do
+                ur <- func
+                r <- case accept of
+                    True -> do
+                        AnUpload ur `shouldBe` AnUpload (UploadFinish ())
+                        let UploadFinish r = ur
+                        return r
+                    False -> do
+                        AnUpload ur `shouldBe` AnUpload (UploadAbort ())
+                        let UploadAbort r = ur
+                        return r
+                case merr of
+                    Nothing -> return $ Right r
+                    Just err -> return $ Left err
+    driveUploader (x : xs) uend func = do
         ur <- func
         AnUpload ur `shouldBe` AnUpload (UploadChunk x undefined)
         let UploadChunk _ next = ur
-        driveUploader xs accept next
+        driveUploader xs uend next
 
-expectAction :: FakeStorage -> ActionEx a -> (HasCallStack => a -> IO b) -> IO b
+fakeStorageDownload
+    :: FakeStorage
+    -> Reference FileInfo
+    -> (StorageError -> IO r)
+    -> (Int64 -> Text.Text -> ((BS.ByteString -> IO ()) -> IO ()) -> IO r)
+    -> IO r
+fakeStorageDownload context fileRef onError onStream = do
+    expectAction context (StorageDownload fileRef) $ \case
+        Left err -> onError err
+        Right (DownloadProcess ftype chunks) -> do
+            let fsize = getSum $ foldMap (Sum . fromIntegral . BS.length) chunks
+            onStream fsize ftype $ \sink -> do
+                mapM_ sink chunks
+
+expectAction :: FakeStorage -> StorageAction a -> (HasCallStack => a -> IO b) -> IO b
 expectAction (FakeStorage pBuffer) action cont = do
     Context buffer withStackOuter <- readIORef pBuffer
     case buffer of
@@ -156,7 +179,7 @@ expectAction (FakeStorage pBuffer) action cont = do
             fail "shouldn't reach there"
 
 data AnAction =
-    forall a. AnAction (ActionEx a)
+    forall a. AnAction (StorageAction a)
 
 instance Show AnAction where
     showsPrec d (AnAction x) = showsPrec d x
@@ -168,11 +191,11 @@ data AnUpload = forall a. AnUpload (Upload a)
 
 instance Show AnUpload where
     showsPrec d (AnUpload (UploadChunk chunk _)) = showParen (d > 10) $
-        showString "UploadChunk " . showsPrec 11 chunk . showString " ..."
+        showString "UploadChunk " . showsPrec 11 chunk . showString " <<continuation>>"
     showsPrec d (AnUpload (UploadFinish _)) = showParen (d > 10) $
-        showString "UploadFinish ..."
+        showString "UploadFinish <<result>>"
     showsPrec d (AnUpload (UploadAbort _)) = showParen (d > 10) $
-        showString "UploadAbort ..."
+        showString "UploadAbort <<result>>"
 
 instance Eq AnUpload where
     (==) (AnUpload (UploadChunk ca _)) (AnUpload (UploadChunk cb _)) = ca == cb

@@ -83,12 +83,12 @@ wAccept respond = JI.Accept (wAcceptResponse respond) (wAcceptStream respond)
 wAcceptResponse :: (Wai.Response -> IO received) -> JI.Response -> IO received
 wAcceptResponse respond jiResponse = respond $ transformResponse jiResponse
 
-wAcceptStream :: (Wai.Response -> IO received) -> Int64 -> ((BS.ByteString -> IO ()) -> IO ()) -> IO received
-wAcceptStream respond fileSize inner = do
+wAcceptStream :: (Wai.Response -> IO received) -> Int64 -> Text.Text -> ((BS.ByteString -> IO ()) -> IO ()) -> IO received
+wAcceptStream respond fileSize fileType inner = do
     respond $ Wai.responseStream
         Http.ok200
         [ (Http.hContentLength, BSChar.pack $ show fileSize)
-        , (Http.hContentType, "application/octet-stream")
+        , (Http.hContentType, Text.encodeUtf8 fileType)
         ]
         (\send _ -> inner (send . Builder.byteString))
 
@@ -107,4 +107,5 @@ transformResponse (JI.Response jiStatus jiBody) = Wai.responseLBS
         JI.StatusForbidden -> Http.forbidden403
         JI.StatusNotFound -> Http.notFound404
         JI.StatusConflict -> Http.conflict409
+        JI.StatusPayloadTooLarge -> Http.requestEntityTooLarge413
         JI.StatusInternalError -> Http.internalServerError500

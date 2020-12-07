@@ -11,19 +11,23 @@ module JsonInterface.Response
     , OkResponseBody(..)
     , okResponse
     , errorResponse
+    , ExpansionContext
+    , newExpansionContext
     , Expanded(..)
     , Expandable(..)
     , Retrievable(..)
     , UploadStatus(..)
-    , expandFileInfo'
-    , expandUploadStatus'
     , toHexText
     ) where
 
 import Control.Monad
+import Control.Monad.Fix
 import Data.Aeson
+import Data.Coerce
+import Data.IORef
 import Data.Int
 import Data.Time.Clock
+import Data.Typeable
 import qualified Data.Aeson.Encoding as Encoding
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Builder as Builder
@@ -32,10 +36,11 @@ import qualified Data.Text.Encoding as TextEncoding
 import Hex
 import JsonInterface.ActionTicket
 import Storage
+import qualified TData.PolyMap as PolyMap
 
 data Accept r = Accept
     { acceptResponse :: Response -> IO r
-    , acceptStream :: Int64 -> ((BS.ByteString -> IO ()) -> IO ()) -> IO r
+    , acceptStream :: Int64 -> Text.Text -> ((BS.ByteString -> IO ()) -> IO ()) -> IO r
     }
 
 data Response = Response ResponseStatus ResponseBody
@@ -47,11 +52,14 @@ data ResponseStatus
     | StatusForbidden
     | StatusNotFound
     | StatusConflict
+    | StatusPayloadTooLarge
     | StatusInternalError
     deriving (Show, Eq)
 
 data ErrorMessage
     = ErrAccessDenied
+    | ErrArticleNotEditable
+    | ErrFileTooLarge
     | ErrInternal
     | ErrInvalidAccessKey
     | ErrInvalidRequest
@@ -66,6 +74,8 @@ data ErrorMessage
 errorMessageContent :: KeyValue a => ErrorMessage -> [a]
 errorMessageContent = \case
     ErrAccessDenied -> ["class" .= String "Access denied"]
+    ErrArticleNotEditable -> ["class" .= String "Article not editable"]
+    ErrFileTooLarge -> ["class" .= String "File too large"]
     ErrInternal -> ["class" .= String "Internal error"]
     ErrInvalidAccessKey -> ["class" .= String "Invalid access key"]
     ErrInvalidRequest -> ["class" .= String "Invalid request"]
@@ -123,6 +133,8 @@ errorResponse err = Response (errorStatus err) $ ResponseBodyError err
 errorStatus :: ErrorMessage -> ResponseStatus
 errorStatus = \case
     ErrAccessDenied -> StatusForbidden
+    ErrArticleNotEditable -> StatusForbidden
+    ErrFileTooLarge -> StatusPayloadTooLarge
     ErrInternal -> StatusInternalError
     ErrInvalidAccessKey -> StatusForbidden
     ErrInvalidRequest -> StatusBadRequest
@@ -135,11 +147,31 @@ errorStatus = \case
 
 data family Expanded a
 
+data ExpansionContext = ExpansionContext
+    Storage
+    Text.Text
+    (IORef (PolyMap.PolyMap Reference))
+
+newExpansionContext :: Storage -> Text.Text -> IO ExpansionContext
+newExpansionContext storage approot = do
+    cache <- newIORef PolyMap.empty
+    return $ ExpansionContext storage approot cache
+
 class Expandable a where
-    expand' :: Storage -> a -> IO (Expanded a)
+    expand' :: ExpansionContext -> a -> IO (Expanded a)
 
 class Retrievable a where
-    retrieve :: Storage -> Reference a -> IO (Maybe (Expanded a))
+    doRetrieve :: ExpansionContext -> Reference a -> IO (Maybe (Expanded a))
+
+retrieve :: (Typeable a, Retrievable a) => ExpansionContext -> Reference a -> IO (Maybe (Expanded a))
+retrieve _ "" = return Nothing
+retrieve ecx@(ExpansionContext _ _ cache) ref = do
+    cmap <- readIORef cache
+    case PolyMap.lookup (coerce ref) cmap of
+        Just mx -> return mx
+        Nothing -> mfix $ \mx -> do
+            modifyIORef' cache $ PolyMap.insert (coerce ref) mx
+            doRetrieve ecx ref
 
 data instance Expanded User = ExUser User
     deriving (Show, Eq)
@@ -148,8 +180,7 @@ instance Expandable User where
     expand' _ u = return $ ExUser u
 
 instance Retrievable User where
-    retrieve _ "" = return Nothing
-    retrieve storage ref = do
+    doRetrieve (ExpansionContext storage _ _) ref = do
         qret <- storagePerform storage $ UserList $
             ListView 0 1 [FilterUserId ref] []
         case qret of
@@ -186,8 +217,7 @@ instance Expandable Author where
     expand' _ u = return $ ExAuthor u
 
 instance Retrievable Author where
-    retrieve _ "" = return Nothing
-    retrieve storage ref = do
+    doRetrieve (ExpansionContext storage _ _) ref = do
         qret <- storagePerform storage $ AuthorList $
             ListView 0 1 [FilterAuthorId ref] []
         case qret of
@@ -213,15 +243,14 @@ data instance Expanded Category = ExCategory
     deriving (Show, Eq)
 
 instance Expandable Category where
-    expand' storage (Category ref name parentRef) =
-        ExCategory ref name <$> retrieve storage parentRef
+    expand' cex (Category ref name parentRef) =
+        ExCategory ref name <$> retrieve cex parentRef
 
 instance Retrievable Category where
-    retrieve storage "" = return Nothing
-    retrieve storage ref = do
+    doRetrieve cex@(ExpansionContext storage _ _) ref = do
         qret <- storagePerform storage $ CategoryList $ ListView 0 1 [FilterCategoryId ref] []
         case qret of
-            Right [category] -> Just <$> expand' storage category
+            Right [category] -> Just <$> expand' cex category
             _ -> return Nothing
 
 instance ToJSON (Expanded Category) where
@@ -255,14 +284,14 @@ data instance Expanded Article = ExArticle
     deriving (Show, Eq)
 
 instance Expandable Article where
-    expand' storage article = do
-        mAuthorEx <- retrieve storage $ articleAuthor article
-        mCategoryEx <- retrieve storage $ articleCategory article
+    expand' cex@(ExpansionContext storage _ _) article = do
+        mAuthorEx <- retrieve cex $ articleAuthor article
+        mCategoryEx <- retrieve cex $ articleCategory article
         mTags <- storagePerform storage $ TagList $
             ListView 0 maxBound [FilterTagArticleId (articleId article)] [(OrderTagName, Ascending)]
         tagsEx <- case mTags of
             Left _ -> return []
-            Right tags -> forM tags $ expand' storage
+            Right tags -> forM tags $ expand' cex
         return $ ExArticle
             (articleId article)
             (articleVersion article)
@@ -273,11 +302,10 @@ instance Expandable Article where
             tagsEx
 
 instance Retrievable Article where
-    retrieve storage "" = return Nothing
-    retrieve storage ref = do
+    doRetrieve cex@(ExpansionContext storage _ _) ref = do
         qret <- storagePerform storage $ ArticleList True $ ListView 0 1 [FilterArticleId ref] []
         case qret of
-            Right [article] -> Just <$> expand' storage article
+            Right [article] -> Just <$> expand' cex article
             _ -> return Nothing
 
 instance ToJSON (Expanded Article) where
@@ -330,9 +358,9 @@ data instance Expanded Comment = ExComment
     deriving (Show, Eq)
 
 instance Expandable Comment where
-    expand' storage comment = do
-        mArticleEx <- retrieve storage $ commentArticle comment
-        mUserEx <- retrieve storage $ commentUser comment
+    expand' cex comment = do
+        mArticleEx <- retrieve cex $ commentArticle comment
+        mUserEx <- retrieve cex $ commentUser comment
         return $ ExComment
             (commentId comment)
             mArticleEx
@@ -372,19 +400,19 @@ data instance Expanded FileInfo = ExFileInfo
     Text.Text
     deriving (Show, Eq)
 
-expandFileInfo' :: Storage -> Text.Text -> FileInfo -> IO (Expanded FileInfo)
-expandFileInfo' storage approot finfo = do
-    mArticleEx <- retrieve storage $ fileArticle finfo
-    mUserEx <- retrieve storage $ fileUser finfo
-    return $ ExFileInfo
-        (fileId finfo)
-        (fileName finfo)
-        (fileMimeType finfo)
-        (fileUploadDate finfo)
-        mArticleEx
-        (fileIndex finfo)
-        mUserEx
-        (expandFileName approot finfo)
+instance Expandable FileInfo where
+    expand' cex@(ExpansionContext _ approot _) finfo = do
+        mArticleEx <- retrieve cex $ fileArticle finfo
+        mUserEx <- retrieve cex $ fileUser finfo
+        return $ ExFileInfo
+            (fileId finfo)
+            (fileName finfo)
+            (fileMimeType finfo)
+            (fileUploadDate finfo)
+            mArticleEx
+            (fileIndex finfo)
+            mUserEx
+            (expandFileName approot finfo)
 
 instance ToJSON (Expanded FileInfo) where
     toJSON (ExFileInfo ref@(Reference refBytes) name mimeType uploadDate mArticle index mUser link) = object
@@ -416,10 +444,10 @@ data instance Expanded UploadStatus = ExUploadStatus
     Text.Text (Either ErrorMessage (Expanded FileInfo))
     deriving (Show, Eq)
 
-expandUploadStatus' :: Storage -> Text.Text -> UploadStatus -> IO (Expanded UploadStatus)
-expandUploadStatus' storage approot (UploadStatus pname status) = case status of
-    Left errm -> return $ ExUploadStatus pname (Left errm)
-    Right finfo -> ExUploadStatus pname . Right <$> expandFileInfo' storage approot finfo
+instance Expandable UploadStatus where
+    expand' cex@(ExpansionContext _ approot _) (UploadStatus pname status) = case status of
+        Left errm -> return $ ExUploadStatus pname (Left errm)
+        Right finfo -> ExUploadStatus pname . Right <$> expand' cex finfo
 
 instance ToJSON (Expanded UploadStatus) where
     toJSON (ExUploadStatus pname status) = case status of

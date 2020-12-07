@@ -2,9 +2,13 @@
 {-# LANGUAGE LambdaCase #-}
 
 module JsonInterface
-    ( Response(..)
+    ( Accept(..)
+    , Response(..)
     , ResponseStatus(..)
+    , ErrorMessage(..)
     , ResponseBody(..)
+    , Expanded(..)
+    , UploadStatus
     , Request(..)
     , RequestData(..)
     , JsonInterface(..)
@@ -55,9 +59,9 @@ jintExecuteRequest context newName rname (Accept onResponse onStream) request = 
         (\response -> do
             logDebug (contextLogger context) $ "JsonInterface: " << rnameText rname << " (" <<| i << ") response:\n    " <<| response
             onResponse response)
-        (\fsize inner -> do
-            logDebug (contextLogger context) $ "JsonInterface: " << rnameText rname << " (" <<| i << ") download: " <<| fsize << " bytes"
-            onStream fsize inner)
+        (\fsize ftype inner -> do
+            logDebug (contextLogger context) $ "JsonInterface: " << rnameText rname << " (" <<| i << ") download: " <<|| ftype << ", " <<| fsize << " bytes"
+            onStream fsize ftype inner)
   where
     rnameText (a : b : bs) = toLog a << "/" << rnameText (b : bs)
     rnameText [a] = toLog a
@@ -66,6 +70,8 @@ jintExecuteRequest context newName rname (Accept onResponse onStream) request = 
     requestLog (UploadRequest _) = " upload request"
     paramText = Map.foldrWithKey paramTextIter ""
     paramTextIter "akey" _ rest = "\n    \"akey\" = ..." << rest
+    paramTextIter "password" _ rest = "\n    \"password\" = ..." << rest
+    paramTextIter "newPassword" _ rest = "\n    \"newPassword\" = ..." << rest
     paramTextIter pname pvalue rest = "\n    " <<| pname << " = " <<| pvalue << rest
 
 simpleRequest :: ReaderT RequestData (RequestHandler r) void -> Request -> RequestHandler r void
@@ -76,7 +82,11 @@ requestDispatch :: [Text.Text] -> Request -> RequestHandler r void
 requestDispatch ["users", "create"] = simpleRequest $ do
     name <- getParam "name" textParser
     surname <- getParam "surname" textParser
-    user <- performRequire $ UserCreate name surname
+    newPassword <- getParam "newPassword" passwordParser
+    minPasswordLength <- Config.minPasswordLength . contextConfig <$> askContext
+    when (BS.length (getPassword newPassword) < minPasswordLength) $
+        exitError $ ErrInvalidParameter "newPassword"
+    user <- performRequire $ UserCreate name surname newPassword
     exitOk =<< expand user
 requestDispatch ["users", "me"] = simpleRequest $ do
     myUser <- requireUserAccess
@@ -86,6 +96,16 @@ requestDispatch ["users", "setName"] = simpleRequest $ do
     newSurname <- getParam "surname" textParser
     myUser <- requireUserAccess
     performRequire $ UserSetName (userId myUser) newName newSurname
+    exitOk ()
+requestDispatch ["users", "setPassword"] = simpleRequest $ do
+    userRef <- getParam "user" referenceParser
+    oldPassword <- getParam "password" passwordParser
+    newPassword <- getParam "newPassword" passwordParser
+    minPasswordLength <- Config.minPasswordLength . contextConfig <$> askContext
+    when (BS.length (getPassword newPassword) < minPasswordLength) $
+        exitError $ ErrInvalidParameter "newPassword"
+    checkUserPassword userRef oldPassword
+    performRequire $ UserSetPassword userRef newPassword
     exitOk ()
 requestDispatch ["users", "delete"] = simpleRequest $ do
     myUser <- requireUserAccess
@@ -104,7 +124,7 @@ requestDispatch ["users", "grantAdmin_"] = simpleRequest $ do
     ref <- getParam "user" referenceParser
     performRequire $ UserSetIsAdmin ref True
     exitOk ()
-requestDispatch ["users", "dropAdmin_"] = simpleRequest $ do
+requestDispatch ["users", "revokeAdmin_"] = simpleRequest $ do
     myUser <- requireAdminAccess
     ref <- getParam "user" referenceParser
     if ref == userId myUser
@@ -134,8 +154,8 @@ requestDispatch ["users", "list_"] = simpleRequest $ do
     exitOk =<< mapM expand elems
 
 requestDispatch ["files", "upload"] = simpleRequest $ do
-    myUser <- requireUserAccess
     articleRef <- getParam "article" referenceParser
+    myUser <- requireUserAccess
     void $ assertArticleAccess (userId myUser) articleRef
     Reference ticketKey <- createActionTicket $ UploadTicket articleRef (userId myUser)
     approot <- rqdataApproot <$> ask
@@ -164,7 +184,7 @@ requestDispatch ["upload", ticketParam] = \case
                         articleRef userRef pUploadStatusList
                 uploadStatusList <- liftIO $ readIORef pUploadStatusList
                 flip runReaderT rqdata $ do
-                    statusList <- mapM expandUploadStatus $ reverse $ uploadStatusList
+                    statusList <- expandList $ reverse $ uploadStatusList
                     exitOk statusList
             _ -> exitInvalidTicket
   where
@@ -205,7 +225,7 @@ handleFileUpload
                 Right text -> return text
         let paramNameLenient = Text.decodeUtf8With Text.lenientDecode paramNameBS
         paramName <- decodeText paramNameBS $
-            UploadStatus paramNameLenient $ Left $ ErrInvalidRequestMsg "Invalid parameter name"
+            UploadStatus paramNameLenient $ Left ErrInvalidRequest
         fileName <- decodeText fileNameBS $
             UploadStatus paramName $ Left $ ErrInvalidParameter "fileName"
         mimeType <- decodeText mimeTypeBS $
@@ -232,7 +252,7 @@ handleFileUpload
                 else do
                     let newTotalSize = totalSize + fromIntegral (BS.length chunk)
                     if newTotalSize > maxFileSize
-                        then return $ UploadAbort $ Left $ ErrInvalidRequestMsg "File is too large"
+                        then return $ UploadAbort $ Left ErrFileTooLarge
                         else uploader newTotalSize (pending <> LBS.fromStrict chunk) finfo
     uploaderFinal pending finfo
         | LBS.null pending = return $ UploadFinish $ Right finfo
@@ -242,41 +262,3 @@ handleFileUpload
         chunk <- getChunk
         unless (BS.null chunk) $ do
             drain
-
-    -- AccessKeyCreate :: Reference User -> Action AccessKey
-    -- AccessKeyDelete :: Reference User -> Reference AccessKey -> Action ()
-    -- AccessKeyList :: Reference User -> ListView AccessKey -> Action [Reference AccessKey]
-    -- AccessKeyLookup :: AccessKey -> Action (Reference User)
-
-    -- AuthorCreate :: Text.Text -> Text.Text -> Action Author
-    -- AuthorSetName :: Reference Author -> Text.Text -> Action ()
-    -- AuthorSetDescription :: Reference Author -> Text.Text -> Action ()
-    -- AuthorDelete :: Reference Author -> Action ()
-    -- AuthorList :: ListView Author -> Action [Author]
-    -- AuthorSetOwnership :: Reference Author -> Reference User -> Bool -> Action ()
-
-    -- CategoryCreate :: Text.Text -> Reference Category -> Action Category
-    -- CategorySetName :: Reference Category -> Text.Text -> Action ()
-    -- CategorySetParent :: Reference Category -> Reference Category -> Action ()
-    -- CategoryDelete :: Reference Category -> Action ()
-    -- CategoryList :: ListView Category -> Action [Category]
-
-    -- ArticleCreate :: Reference Author -> Action Article
-    -- ArticleSetAuthor :: Reference Article -> Reference Author -> Action ()
-    -- ArticleSetName :: Reference Article -> Version Article -> Text.Text -> Action (Version Article)
-    -- ArticleSetText :: Reference Article -> Version Article -> Text.Text -> Action (Version Article)
-    -- ArticleSetCategory :: Reference Article -> Reference Category -> Action ()
-    -- ArticleSetPublicationStatus :: Reference Article -> PublicationStatus -> Action ()
-    -- ArticleDelete :: Reference Article -> Action ()
-    -- ArticleList :: Bool -> ListView Article -> Action [Article]
-    -- ArticleSetTag :: Reference Article -> Reference Tag -> Bool -> Action ()
-
-    -- TagCreate :: Text.Text -> Action Tag
-    -- TagSetName :: Reference Tag -> Text.Text -> Action ()
-    -- TagDelete :: Reference Tag -> Action ()
-    -- TagList :: ListView Tag -> Action [Tag]
-
-    -- CommentCreate :: Reference Article -> Reference User -> Text.Text -> Action Comment
-    -- CommentSetText :: Reference Comment -> Text.Text -> Action ()
-    -- CommentDelete :: Reference Comment -> Action ()
-    -- CommentList :: ListView Comment -> Action [Comment]

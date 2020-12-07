@@ -30,10 +30,12 @@ insert (TimedHashmap table tQueue) key value deltaTime
     | otherwise = do
         now <- getCurrentTime
         let endTime = addUTCTime deltaTime now
-        toDelete <- atomically $ stateTVar tQueue $ \q1 -> do
-            let (old, q2) = MinHeap.break (\(MinHeap.Arg et _) -> et < now) q1
+        toDelete <- atomically $ do
+            q1 <- readTVar tQueue
+            let (olds, q2) = MinHeap.break (\(MinHeap.Arg et _) -> et < now) q1
             let q3 = MinHeap.insert (MinHeap.Arg endTime key) q2
-            (old, q3)
+            writeTVar tQueue $! q3
+            return olds
         forM_ toDelete $ \(MinHeap.Arg _ delKey) -> do
             atomically $ Map.delete delKey table
         atomically $ Map.insert value key table
