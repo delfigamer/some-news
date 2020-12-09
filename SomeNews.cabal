@@ -4,7 +4,7 @@ cabal-version: 1.12
 --
 -- see: https://github.com/sol/hpack
 --
--- hash: d31a42b36541597aab8fe630817064b4f1e4b313ba3c8c66bf2bd28a5f970206
+-- hash: bfeedcafbe8954a3b402491f586cc09f1fce2d22e76ce1210397415e3915b0b8
 
 name:           SomeNews
 version:        0.1.0.0
@@ -27,31 +27,31 @@ source-repository head
 
 library
   exposed-modules:
-      Cont
-      HEq1
-      Hex
-      JsonInterface
-      JsonInterface.ActionTicket
-      JsonInterface.Config
-      JsonInterface.Internal
-      JsonInterface.Response
       Lib
-      Logger
-      ResourcePool
-      Sql.Database
-      Sql.Database.Config
-      Sql.Database.Postgres
-      Sql.Database.Sqlite
-      Sql.Database.Transaction
-      Sql.Query
-      Sql.Query.Render
-      Storage
-      Storage.Schema
-      TData.MinHeap
-      TData.PolyMap
-      TData.TimedHashmap
-      Tuple
-      WApp
+      SN.Control.Monad.Cont
+      SN.Control.ResourcePool
+      SN.Data.HEq1
+      SN.Data.Hex
+      SN.Data.HList
+      SN.Data.MinHeap
+      SN.Data.PolyMap
+      SN.Data.TimedHashmap
+      SN.Ground
+      SN.Ground.Schema
+      SN.Logger
+      SN.Medium
+      SN.Medium.ActionTicket
+      SN.Medium.Config
+      SN.Medium.Internal
+      SN.Medium.Response
+      SN.Sql.Database
+      SN.Sql.Database.Config
+      SN.Sql.Database.Postgres
+      SN.Sql.Database.Sqlite
+      SN.Sql.Database.Transaction
+      SN.Sql.Query
+      SN.Sql.Query.Render
+      SN.Surface
   other-modules:
       Paths_SomeNews
   hs-source-dirs:
@@ -136,16 +136,16 @@ test-suite SomeNews-test
   type: exitcode-stdio-1.0
   main-is: Spec.hs
   other-modules:
-      Gen
-      HexSpec
-      JsonInterfaceSpec
-      Parallel
-      Storage.Fake
-      StorageSpec
-      TData.Map
-      TData.Multimap
-      TData.Relmap
-      TData.Tree
+      SN.Control.Parallel
+      SN.Data.HexSpec
+      SN.Data.Map
+      SN.Data.Multimap
+      SN.Data.Relmap
+      SN.Data.Tree
+      SN.Gen
+      SN.Ground.Fake
+      SN.GroundSpec
+      SN.MediumSpec
       Paths_SomeNews
   hs-source-dirs:
       test
