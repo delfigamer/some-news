@@ -11,6 +11,7 @@ module SN.Medium
     , UploadStatus
     , Request(..)
     , RequestData(..)
+    , MediumConfig(..)
     , Medium(..)
     , withMedium
     ) where
@@ -25,10 +26,9 @@ import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text
 import qualified Data.Text.Encoding.Error as Text
 import SN.Data.Hex
-import SN.Ground
+import SN.Ground.Interface
 import SN.Logger
 import SN.Medium.Internal
-import qualified SN.Medium.Config as Config
 
 data Request
     = SimpleRequest RequestData
@@ -41,7 +41,7 @@ newtype Medium = Medium
 
 type DList a = [a] -> [a]
 
-withMedium :: Config.Config -> Logger -> Ground -> (Medium -> IO r) -> IO r
+withMedium :: MediumConfig -> Logger -> Ground -> (Medium -> IO r) -> IO r
 withMedium config logger ground body = do
     context <- initializeContext config logger ground
     counter <- newIORef 0
@@ -82,7 +82,7 @@ requestDispatch ["users", "create"] = simpleRequest $ do
     name <- getParam "name" textParser
     surname <- getParam "surname" textParser
     newPassword <- getParam "newPassword" passwordParser
-    minPasswordLength <- Config.minPasswordLength . contextConfig <$> askContext
+    minPasswordLength <- mediumConfigMinPasswordLength . contextConfig <$> askContext
     when (BS.length (getPassword newPassword) < minPasswordLength) $
         exitError $ ErrInvalidParameter "newPassword"
     user <- performRequire $ UserCreate name surname newPassword
@@ -104,7 +104,7 @@ requestDispatch ["users", "setName"] = simpleRequest $ do
     exitOk ()
 requestDispatch ["users", "setPassword"] = simpleRequest $ do
     newPassword <- getParam "newPassword" passwordParser
-    minPasswordLength <- Config.minPasswordLength . contextConfig <$> askContext
+    minPasswordLength <- mediumConfigMinPasswordLength . contextConfig <$> askContext
     when (BS.length (getPassword newPassword) < minPasswordLength) $
         exitError $ ErrInvalidParameter "newPassword"
     userRef <- requireUserPassword
@@ -117,7 +117,7 @@ requestDispatch ["users", "delete"] = simpleRequest $ do
 requestDispatch ["users", "createAccessKey"] = simpleRequest $ do
     userRef <- requireUserPassword
     akeyList <- performRequire $ AccessKeyList userRef $ ListView 0 maxBound [] []
-    maxAccessKeyCount <- Config.maxAccessKeyCount . contextConfig <$> askContext
+    maxAccessKeyCount <- mediumConfigMaxAccessKeyCount . contextConfig <$> askContext
     when (length akeyList >= maxAccessKeyCount) $
         exitError ErrLimitExceeded
     akey <- performRequire $ AccessKeyCreate userRef
@@ -236,9 +236,9 @@ requestDispatch ["upload", ticketParam] = \case
         case mTicket of
             Just (UploadTicket articleRef userRef) -> do
                 Context
-                    { contextConfig = Config.Config
-                        { Config.fileChunkSize = fileChunkSize
-                        , Config.maxFileSize = maxFileSize
+                    { contextConfig = MediumConfig
+                        { mediumConfigFileChunkSize = fileChunkSize
+                        , mediumConfigMaxFileSize = maxFileSize
                         }
                     } <- askContext
                 pUploadStatusList <- liftIO $ newIORef []

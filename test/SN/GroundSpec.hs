@@ -306,6 +306,7 @@ minceUsers ground sampleSize userTable = do
         userPasswordList <- Map.elems userTable
         let userList = sortOn userId $ map fst userPasswordList
         parallelFor_ userPasswordList $ \(user, password) -> do
+            BS.length (getReference $ userId user) `shouldBe` groundConfigUserIdLength testGroundConfig
             groundPerform ground (UserList (ListView 0 1 [FilterUserId (userId user)] []))
                 `shouldReturn`
                 Right [user]
@@ -363,6 +364,12 @@ minceAccessKeys ground sampleSize userTable akeyTable = do
             assertRight =<< groundPerform ground (AccessKeyClear userRef)
             Multimap.deleteAll akeyTable userRef
         validateAccessKeys ground userTable akeyTable
+    do
+        akeyGroups <- Multimap.toGroupsWith akeyTable userTable
+        parallelFor_ akeyGroups $ \(userRef, userAkeys) -> do
+            parallelFor_ userAkeys $ \akey -> do
+                BS.length (getReference $ accessKeyId akey) `shouldBe` groundConfigAccessKeyIdLength testGroundConfig
+                BS.length (accessKeyToken akey) `shouldBe` groundConfigAccessKeyTokenLength testGroundConfig
     return ()
 
 validateAccessKeys
@@ -440,6 +447,7 @@ minceAuthors ground sampleSize authorTable = do
     do
         authorList <- sortOn authorId <$> Map.elems authorTable
         parallelFor_ authorList $ \author -> do
+            BS.length (getReference $ authorId author) `shouldBe` groundConfigAuthorIdLength testGroundConfig
             groundPerform ground (AuthorList (ListView 0 1 [FilterAuthorId (authorId author)] []))
                 `shouldReturn`
                 Right [author]
@@ -606,6 +614,7 @@ minceCategories ground sampleSize categoryTree = do
     do
         categoryList <- map toCategory <$> Tree.toList categoryTree
         parallelFor_ categoryList $ \category -> do
+            BS.length (getReference $ categoryId category) `shouldBe` groundConfigCategoryIdLength testGroundConfig
             groundPerform ground (CategoryList (ListView 0 1 [FilterCategoryId (categoryId category)] []))
                 `shouldReturn`
                 Right [category]
@@ -803,6 +812,8 @@ minceArticles ground sampleSize userTable authorTable userAuthorConnSet category
         articleList <- sortOn (articleId . fst) <$> Map.elems articleTable
         let (articleInfoList, articleTextList) = unzip articleList
         parallelFor_ articleList $ \(article, text) -> do
+            BS.length (getReference $ articleId article) `shouldBe` groundConfigArticleIdLength testGroundConfig
+            BS.length (getVersion $ articleVersion article) `shouldBe` groundConfigArticleVersionLength testGroundConfig
             groundPerform ground (ArticleList (ListView 0 1 [FilterArticleId (articleId article)] []))
                 `shouldReturn`
                 Right [article]
@@ -957,6 +968,7 @@ minceTags ground sampleSize tagTable = do
     do
         tagList <- Map.elems tagTable
         parallelFor_ tagList $ \tag -> do
+            BS.length (getReference $ tagId tag) `shouldBe` groundConfigTagIdLength testGroundConfig
             groundPerform ground (TagList (ListView 0 1 [FilterTagId (tagId tag)] []))
                 `shouldReturn`
                 Right [tag]
@@ -1160,6 +1172,7 @@ minceComments ground sampleSize userTable articleTable commentTable = do
         articleRefs <- Map.keys articleTable
         commentList <- sortOn commentId <$> Map.elems commentTable
         parallelFor_ commentList $ \comment -> do
+            BS.length (getReference $ commentId comment) `shouldBe` groundConfigCommentIdLength testGroundConfig
             groundPerform ground (CommentList (ListView 0 1 [FilterCommentId (commentId comment)] []))
                 `shouldReturn`
                 Right [comment]
@@ -1303,6 +1316,7 @@ minceFiles ground sampleSize userTable articleTable fileTable = do
         articleRefs <- Map.keys articleTable
         fileList <- sortOn (fileId . fst) <$> Map.elems fileTable
         parallelFor_ fileList $ \(finfo, content) -> do
+            BS.length (getReference $ fileId finfo) `shouldBe` groundConfigFileIdLength testGroundConfig
             groundPerform ground (FileList (ListView 0 1 [FilterFileId (fileId finfo)] []))
                 `shouldReturn`
                 Right [finfo]

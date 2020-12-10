@@ -34,7 +34,7 @@ import qualified Data.ByteString.Builder as Builder
 import qualified Data.Text as Text
 import qualified Data.Text.Encoding as TextEncoding
 import SN.Data.Hex
-import SN.Ground
+import SN.Ground.Interface
 import SN.Medium.ActionTicket
 import qualified SN.Data.PolyMap as PolyMap
 

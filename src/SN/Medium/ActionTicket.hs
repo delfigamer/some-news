@@ -4,7 +4,7 @@ module SN.Medium.ActionTicket
 
 import Data.Maybe
 import SN.Data.HEq1
-import SN.Ground
+import SN.Ground.Interface
 
 data ActionTicket
     = forall a. ActionTicket (Action a)

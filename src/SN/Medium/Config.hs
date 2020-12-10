@@ -1,5 +1,5 @@
 module SN.Medium.Config
-    ( Config(..)
+    ( MediumConfig(..)
     ) where
 
 import Data.Aeson
@@ -7,20 +7,20 @@ import Data.Time.Clock
 import Data.Int
 import qualified Data.Text as Text
 
-data Config = Config
-    { defaultPageLimit :: Int64
-    , maxPageLimit :: Int64
-    , minPasswordLength :: Int
-    , maxAccessKeyCount :: Int
-    , ticketLength :: Int
-    , ticketLifetime :: NominalDiffTime
-    , fileChunkSize :: Int64
-    , maxFileSize :: Int64
+data MediumConfig = MediumConfig
+    { mediumConfigDefaultPageLimit :: Int64
+    , mediumConfigMaxPageLimit :: Int64
+    , mediumConfigMinPasswordLength :: Int
+    , mediumConfigMaxAccessKeyCount :: Int
+    , mediumConfigTicketLength :: Int
+    , mediumConfigTicketLifetime :: NominalDiffTime
+    , mediumConfigFileChunkSize :: Int64
+    , mediumConfigMaxFileSize :: Int64
     }
 
-instance FromJSON Config where
-    parseJSON = withObject "JsonInterface.Config" $ \v -> do
-        Config
+instance FromJSON MediumConfig where
+    parseJSON = withObject "Medium.Config" $ \v -> do
+        MediumConfig
             <$> v .:? "defaultPageLimit" .!= 20
             <*> v .:? "maxPageLimit" .!= 100
             <*> v .:? "minPasswordLength" .!= 8

@@ -25,7 +25,7 @@ import Type.Reflection
 import qualified Data.ByteString as BS
 import qualified Data.Text as Text
 import SN.Data.HEq1
-import SN.Ground
+import SN.Ground.Interface
 
 data UploadProcess = UploadProcess FileInfo [BS.ByteString] (Either GroundError (Bool, Maybe GroundError))
     deriving (Show, Eq)

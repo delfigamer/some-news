@@ -22,25 +22,24 @@ import qualified Data.Time.Clock as TClock
 import qualified Data.Time.Format.ISO8601 as TFormat
 import qualified Data.Vector as Vector
 import SN.Data.Hex
-import SN.Ground
+import SN.Ground.Interface
 import SN.Ground.Fake
 import SN.Logger
 import SN.Medium
-import qualified SN.Medium.Config as Config
 
 mkTime :: String -> TClock.UTCTime
 mkTime = fromJust . TFormat.iso8601ParseM
 
-testConfig :: Config.Config
-testConfig = Config.Config
-    { Config.defaultPageLimit = 10
-    , Config.maxPageLimit = 100
-    , Config.minPasswordLength = 4
-    , Config.maxAccessKeyCount = 3
-    , Config.ticketLength = 4
-    , Config.ticketLifetime = 10
-    , Config.fileChunkSize = 10
-    , Config.maxFileSize = 50
+testConfig :: MediumConfig
+testConfig = MediumConfig
+    { mediumConfigDefaultPageLimit = 10
+    , mediumConfigMaxPageLimit = 100
+    , mediumConfigMinPasswordLength = 4
+    , mediumConfigMaxAccessKeyCount = 3
+    , mediumConfigTicketLength = 4
+    , mediumConfigTicketLifetime = 10
+    , mediumConfigFileChunkSize = 10
+    , mediumConfigMaxFileSize = 50
     }
 
 expectResponse :: HasCallStack => Response -> Accept ()

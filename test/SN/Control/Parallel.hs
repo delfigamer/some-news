@@ -11,8 +11,6 @@ import Control.Concurrent.STM
 import Control.Exception
 import Control.Monad
 
-import Data.Time.Clock
-
 data AsyncResult a
     = Pending
     | Error SomeException

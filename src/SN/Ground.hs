@@ -1,12 +1,6 @@
-{-# LANGUAGE EmptyCase #-}
-{-# LANGUAGE EmptyDataDeriving #-}
 {-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE StandaloneDeriving #-}
-{-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TypeFamilies #-}
-{-# LANGUAGE UndecidableInstances #-}
 
 module SN.Ground
     ( Reference(..)
@@ -23,7 +17,6 @@ module SN.Ground
     , FileInfo(..)
     , Upload(..)
     , InitFailure(..)
-    , GroundConfig(..)
     , Ground(..)
     , withSqlGround
     , currentSchema
@@ -31,192 +24,29 @@ module SN.Ground
     , Action(..)
     , GroundError(..)
     , ListView(..)
+    , OrderDirection(..)
     , ViewFilter(..)
     , ViewOrder(..)
-    , OrderDirection(..)
+    , module SN.Ground.Config
     ) where
 
-import Control.Monad
 import Control.Monad.Reader
-import Data.Hashable
 import Data.IORef
 import Data.Int
-import Data.List
 import Data.Maybe
-import Data.Semigroup
-import Data.String
 import Data.Time.Clock
-import qualified Crypto.Hash as CHash
 import qualified Crypto.Random as CRand
-import qualified Data.ByteArray as BA
 import qualified Data.ByteString as BS
 import qualified Data.Text as Text
-import SN.Data.HEq1
 import SN.Data.HList
-import SN.Data.Hex
+import SN.Ground.Config
+import SN.Ground.Interface
+import SN.Ground.ListView
 import SN.Ground.Schema
+import SN.Ground.Types
 import SN.Logger
 import SN.Sql.Query
 import qualified SN.Sql.Database as Db
-
-newtype Reference a = Reference
-    { getReference :: BS.ByteString
-    }
-    deriving (Eq, Ord, IsString, Hashable)
-
-instance Show (Reference a) where
-    showsPrec d (Reference x) = showHex d $ BS.unpack x
-
-newtype Version a = Version
-    { getVersion :: BS.ByteString
-    }
-    deriving (Eq, Ord, IsString, Hashable)
-
-instance Show (Version a) where
-    showsPrec d (Version x) = showHex d $ BS.unpack x
-
-data User = User
-    { userId :: !(Reference User)
-    , userName :: !Text.Text
-    , userSurname :: !Text.Text
-    , userJoinDate :: !UTCTime
-    , userIsAdmin :: !Bool
-    }
-    deriving (Show, Eq, Ord)
-
-newtype Password = Password
-    { getPassword :: BS.ByteString
-    }
-    deriving (Eq, Ord, IsString)
-
-instance Show Password where
-    showsPrec d _ = showParen (d > 10)
-        $ showString "Password <<token>>"
-
-data AccessKey = AccessKey
-    { accessKeyId :: !(Reference AccessKey)
-    , accessKeyToken :: !BS.ByteString
-    }
-    deriving (Eq, Ord)
-
-instance Show AccessKey where
-    showsPrec d (AccessKey ref _) = showParen (d > 10)
-        $ showString "AccessKey "
-        . showsPrec 11 ref
-        . showString " <<token>>"
-
-data Author = Author
-    { authorId :: !(Reference Author)
-    , authorName :: !Text.Text
-    , authorDescription :: !Text.Text
-    }
-    deriving (Show, Eq, Ord)
-
-data Category = Category
-    { categoryId :: !(Reference Category)
-    , categoryName :: !Text.Text
-    , categoryParent :: !(Reference Category)
-    }
-    deriving (Show, Eq, Ord)
-
-data PublicationStatus
-    = PublishAt !UTCTime
-    | NonPublished
-    deriving (Show, Eq)
-
-instance Ord PublicationStatus where
-    NonPublished `compare` NonPublished = EQ
-    NonPublished `compare` PublishAt _ = LT
-    PublishAt _  `compare` NonPublished = GT
-    PublishAt a  `compare` PublishAt b = b `compare` a
-
-data Article = Article
-    { articleId :: !(Reference Article)
-    , articleVersion :: !(Version Article)
-    , articleAuthor :: !(Reference Author)
-    , articleName :: !Text.Text
-    , articlePublicationStatus :: !PublicationStatus
-    , articleCategory :: !(Reference Category)
-    }
-    deriving (Show, Eq, Ord)
-
-data Tag = Tag
-    { tagId :: !(Reference Tag)
-    , tagName :: !Text.Text
-    }
-    deriving (Show, Eq, Ord)
-
-data Comment = Comment
-    { commentId :: !(Reference Comment)
-    , commentArticle :: !(Reference Article)
-    , commentUser :: !(Reference User)
-    , commentText :: !Text.Text
-    , commentDate :: !UTCTime
-    , commentEditDate :: !(Maybe UTCTime)
-    }
-    deriving (Show, Eq, Ord)
-
-data FileInfo = FileInfo
-    { fileId :: !(Reference FileInfo)
-    , fileName :: !Text.Text
-    , fileMimeType :: !Text.Text
-    , fileUploadDate :: !UTCTime
-    , fileArticle :: !(Reference Article)
-    , fileIndex :: !Int64
-    , fileUser :: !(Reference User)
-    }
-    deriving (Show, Eq, Ord)
-
-data Upload r
-    = UploadAbort !r
-    | UploadFinish !r
-    | UploadChunk !BS.ByteString (IO (Upload r))
-
-data GroundConfig = GroundConfig
-    { groundConfigUserIdLength :: Int
-    , groundConfigAccessKeyIdLength :: Int
-    , groundConfigAccessKeyTokenLength :: Int
-    , groundConfigAuthorIdLength :: Int
-    , groundConfigCategoryIdLength :: Int
-    , groundConfigArticleIdLength :: Int
-    , groundConfigArticleVersionLength :: Int
-    , groundConfigTagIdLength :: Int
-    , groundConfigCommentIdLength :: Int
-    , groundConfigFileIdLength :: Int
-    , groundConfigTransactionRetryCount :: Int
-    }
-
-defaultGroundConfig :: GroundConfig
-defaultGroundConfig = GroundConfig
-    { groundConfigUserIdLength = 16
-    , groundConfigAccessKeyIdLength = 16
-    , groundConfigAccessKeyTokenLength = 48
-    , groundConfigAuthorIdLength = 16
-    , groundConfigCategoryIdLength = 4
-    , groundConfigArticleIdLength = 16
-    , groundConfigArticleVersionLength = 16
-    , groundConfigTagIdLength = 4
-    , groundConfigCommentIdLength = 16
-    , groundConfigFileIdLength = 16
-    , groundConfigTransactionRetryCount = 1000
-    }
-
-data Ground = Ground
-    { groundPerform :: forall a. Action a -> IO (Either GroundError a)
-    , groundGenerateBytes :: Int -> IO BS.ByteString
-    , groundUpload :: forall r.
-           Text.Text
-        -> Text.Text
-        -> Reference Article
-        -> Reference User
-        -> (FileInfo -> IO (Upload r))
-        -> IO (Either GroundError r)
-    , groundDownload :: forall r b.
-           Reference FileInfo
-        -> (GroundError -> IO r)
-        -> (Int64 -> Text.Text -> ((BS.ByteString -> IO ()) -> IO ()) -> IO r)
-        -> IO r
-    }
 
 data SqlGround = SqlGround
     { groundConfig :: GroundConfig
@@ -248,174 +78,6 @@ withSqlGround config logger db onFail onSuccess = do
   where
     resultLogLevel (Left InternalError) = LevelWarn
     resultLogLevel _ = LevelDebug
-
-data Action a where
-    UserCreate :: Text.Text -> Text.Text -> Password -> Action User
-    UserCheckPassword :: Reference User -> Password -> Action ()
-    UserSetName :: Reference User -> Text.Text -> Text.Text -> Action ()
-    UserSetIsAdmin :: Reference User -> Bool -> Action ()
-    UserSetPassword :: Reference User -> Password -> Action ()
-    UserDelete :: Reference User -> Action ()
-    UserList :: ListView User -> Action [User]
-
-    AccessKeyCreate :: Reference User -> Action AccessKey
-    AccessKeyClear :: Reference User -> Action ()
-    AccessKeyList :: Reference User -> ListView AccessKey -> Action [Reference AccessKey]
-
-    AuthorCreate :: Text.Text -> Text.Text -> Action Author
-    AuthorSetName :: Reference Author -> Text.Text -> Action ()
-    AuthorSetDescription :: Reference Author -> Text.Text -> Action ()
-    AuthorDelete :: Reference Author -> Action ()
-    AuthorList :: ListView Author -> Action [Author]
-    AuthorSetOwnership :: Reference Author -> Reference User -> Bool -> Action ()
-
-    CategoryCreate :: Text.Text -> Reference Category -> Action Category
-    CategorySetName :: Reference Category -> Text.Text -> Action ()
-    CategorySetParent :: Reference Category -> Reference Category -> Action ()
-    CategoryDelete :: Reference Category -> Action ()
-    CategoryList :: ListView Category -> Action [Category]
-
-    ArticleCreate :: Reference Author -> Action Article
-    ArticleGetText :: Reference Article -> Action Text.Text
-    ArticleSetAuthor :: Reference Article -> Reference Author -> Action ()
-    ArticleSetName :: Reference Article -> Text.Text -> Action ()
-    ArticleSetText :: Reference Article -> Version Article -> Text.Text -> Action (Version Article)
-    ArticleSetCategory :: Reference Article -> Reference Category -> Action ()
-    ArticleSetPublicationStatus :: Reference Article -> PublicationStatus -> Action ()
-    ArticleDelete :: Reference Article -> Action ()
-    ArticleList :: ListView Article -> Action [Article]
-    ArticleSetTag :: Reference Article -> Reference Tag -> Bool -> Action ()
-
-    TagCreate :: Text.Text -> Action Tag
-    TagSetName :: Reference Tag -> Text.Text -> Action ()
-    TagDelete :: Reference Tag -> Action ()
-    TagList :: ListView Tag -> Action [Tag]
-
-    CommentCreate :: Reference Article -> Reference User -> Text.Text -> Action Comment
-    CommentSetText :: Reference Comment -> Text.Text -> Action ()
-    CommentDelete :: Reference Comment -> Action ()
-    CommentList :: ListView Comment -> Action [Comment]
-
-    FileSetName :: Reference FileInfo -> Text.Text -> Action ()
-    FileSetIndex :: Reference FileInfo -> Int64 -> Action ()
-    FileDelete :: Reference FileInfo -> Action ()
-    FileList :: ListView FileInfo -> Action [FileInfo]
-deriving instance Show (Action a)
-deriving instance Eq (Action a)
-
-data ListView a = ListView
-    { viewOffset :: Int64
-    , viewLimit :: Int64
-    , viewFilter :: [ViewFilter a]
-    , viewOrder :: [(ViewOrder a, OrderDirection)]
-    }
-deriving instance (Show (ViewFilter a), Show (ViewOrder a)) => Show (ListView a)
-deriving instance (Eq (ViewFilter a), Eq (ViewOrder a)) => Eq (ListView a)
-
-data OrderDirection
-    = Ascending
-    | Descending
-    deriving (Show, Eq)
-
-data family ViewFilter a
-data family ViewOrder a
-
-data instance ViewFilter User
-    = FilterUserId (Reference User)
-    | FilterUserIsAdmin Bool
-    | FilterUserAuthorId (Reference Author)
-    | FilterUserAccessKey AccessKey
-    deriving (Show, Eq)
-
-data instance ViewOrder User
-    = OrderUserName
-    | OrderUserSurname
-    | OrderUserJoinDate
-    | OrderUserIsAdmin
-    deriving (Show, Eq)
-
-data instance ViewFilter AccessKey
-    deriving (Show, Eq)
-
-data instance ViewOrder AccessKey
-    deriving (Show, Eq)
-
-data instance ViewFilter Author
-    = FilterAuthorId (Reference Author)
-    | FilterAuthorUserId (Reference User)
-    deriving (Show, Eq)
-
-data instance ViewOrder Author
-    = OrderAuthorName
-    deriving (Show, Eq)
-
-data instance ViewFilter Category
-    = FilterCategoryId (Reference Category)
-    | FilterCategoryParentId (Reference Category)
-    | FilterCategoryTransitiveParentId (Reference Category)
-    deriving (Show, Eq)
-
-data instance ViewOrder Category
-    = OrderCategoryName
-    deriving (Show, Eq)
-
-data instance ViewFilter Article
-    = FilterArticleId (Reference Article)
-    | FilterArticleAuthorId (Reference Author)
-    | FilterArticleUserId (Reference User)
-    | FilterArticleCategoryId (Reference Category)
-    | FilterArticleTransitiveCategoryId (Reference Category)
-    | FilterArticlePublishedCurrently
-    | FilterArticlePublishedBefore UTCTime
-    | FilterArticlePublishedAfter UTCTime
-    | FilterArticleTagIds [Reference Tag]
-    deriving (Show, Eq)
-
-data instance ViewOrder Article
-    = OrderArticleName
-    | OrderArticleDate
-    | OrderArticleAuthorName
-    | OrderArticleCategoryName
-    deriving (Show, Eq)
-
-data instance ViewFilter Tag
-    = FilterTagId (Reference Tag)
-    | FilterTagArticleId (Reference Article)
-    deriving (Show, Eq)
-
-data instance ViewOrder Tag
-    = OrderTagName
-    deriving (Show, Eq)
-
-data instance ViewFilter Comment
-    = FilterCommentId (Reference Comment)
-    | FilterCommentArticleId (Reference Article)
-    | FilterCommentUserId (Reference User)
-    deriving (Show, Eq)
-
-data instance ViewOrder Comment
-    = OrderCommentDate
-    deriving (Show, Eq)
-
-data instance ViewFilter FileInfo
-    = FilterFileId (Reference FileInfo)
-    | FilterFileArticleId (Reference Article)
-    | FilterFileUserId (Reference User)
-    deriving (Show, Eq)
-
-data instance ViewOrder FileInfo
-    = OrderFileName
-    | OrderFileMimeType
-    | OrderFileUploadDate
-    | OrderFileIndex
-    deriving (Show, Eq)
-
-data GroundError
-    = NotFoundError
-    | VersionError
-    | InvalidRequestError
-    | InternalError
-    deriving (Show, Eq, Ord)
 
 sqlGroundPerform :: Action a -> SqlGround -> (Show a => Either GroundError a -> IO r) -> IO r
 sqlGroundPerform (UserCreate name surname password) = runTransaction Db.ReadCommited $ do
@@ -484,7 +146,8 @@ sqlGroundPerform (UserDelete userRef) = runTransaction Db.ReadCommited $ do
             [WhereIs userRef "user_id"])
         parseCount
 sqlGroundPerform (UserList view) = runTransaction Db.ReadCommited $ do
-    withView view $ \tables filter order range _ -> do
+    time <- currentTime
+    withView time view $ \tables filter order range _ -> do
         doQuery
             (Select ("sn_users" : tables)
                 (fReference "user_id" :/ fText "user_name" :/ fText "user_surname" :/ fTime "user_join_date" :/ fBool "user_is_admin" :/ E)
@@ -508,7 +171,8 @@ sqlGroundPerform (AccessKeyClear userRef) = runTransaction Db.ReadCommited $ do
         (Delete "sn_access_keys"
             [WhereIs userRef "access_key_user_id"])
 sqlGroundPerform (AccessKeyList userRef view) = runTransaction Db.ReadCommited $ do
-    withView view $ \tables filter order range _ -> do
+    time <- currentTime
+    withView time view $ \tables filter order range _ -> do
         doQuery
             (Select ("sn_access_keys" : tables)
                 (fReference "access_key_id" :/ E)
@@ -547,7 +211,8 @@ sqlGroundPerform (AuthorDelete authorRef) = runTransaction Db.ReadCommited $ do
             [WhereIs authorRef "author_id"])
         parseCount
 sqlGroundPerform (AuthorList view) = runTransaction Db.ReadCommited $ do
-    withView view $ \tables filter order range _ -> do
+    time <- currentTime
+    withView time view $ \tables filter order range _ -> do
         doQuery
             (Select ("sn_authors" : tables)
                 (fReference "author_id" :/ fText "author_name" :/ fText "author_description" :/ E)
@@ -630,7 +295,8 @@ sqlGroundPerform (CategoryDelete categoryRef) = runTransaction Db.Serializable $
         (Delete "sn_categories"
             [WhereIs categoryRef "category_id"])
 sqlGroundPerform (CategoryList view) = runTransaction Db.ReadCommited $ do
-    withView view $ \tables filter order range _ -> do
+    time <- currentTime
+    withView time view $ \tables filter order range _ -> do
         doQuery
             (Select ("sn_categories" : tables)
                 (fReference "category_id" :/ fText "category_name" :/ fReference "category_parent_id" :/ E)
@@ -723,7 +389,8 @@ sqlGroundPerform (ArticleDelete articleRef) = runTransaction Db.ReadCommited $ d
             [WhereIs articleRef "article_id"])
         parseCount
 sqlGroundPerform (ArticleList view) = runTransaction Db.ReadCommited $ do
-    withView view $ \tables filter order range time -> do
+    time <- currentTime
+    withView time view $ \tables filter order range time -> do
         doQuery
             (Select ("sn_articles" : tables)
                 (  fReference "article_id"
@@ -767,7 +434,8 @@ sqlGroundPerform (TagDelete tagRef) = runTransaction Db.ReadCommited $ do
             [WhereIs tagRef "tag_id"])
         parseCount
 sqlGroundPerform (TagList view) = runTransaction Db.ReadCommited $ do
-    withView view $ \tables filter order range time -> do
+    time <- currentTime
+    withView time view $ \tables filter order range time -> do
         doQuery
             (Select ("sn_tags" : tables)
                 (fReference "tag_id" :/ fText "tag_name" :/ E)
@@ -808,7 +476,8 @@ sqlGroundPerform (CommentDelete commentRef) = runTransaction Db.ReadCommited $ d
             [WhereIs commentRef "comment_id"])
         parseCount
 sqlGroundPerform (CommentList view) = runTransaction Db.ReadCommited $ do
-    withView view $ \tables filter order range time -> do
+    time <- currentTime
+    withView time view $ \tables filter order range time -> do
         doQuery
             (Select ("sn_comments" : tables)
                 (  fReference "comment_id"
@@ -846,7 +515,8 @@ sqlGroundPerform (FileDelete fileRef) = runTransaction Db.ReadCommited $ do
             [WhereIs fileRef "file_id"])
         parseCount
 sqlGroundPerform (FileList view) = runTransaction Db.ReadCommited $ do
-    withView view $ \tables filter order range time -> do
+    time <- currentTime
+    withView time view $ \tables filter order range time -> do
         doQuery
             (Select ("sn_files" : tables)
                 (  fReference "file_id"
@@ -988,20 +658,6 @@ sqlGroundDownload ground fileRef onError onStream = do
                 driveDownloader (index + 1) sink
             _ -> Db.abort
 
-hashAccessKey :: AccessKey -> BS.ByteString
-hashAccessKey (AccessKey (Reference front) back) = do
-    let ctx0 = CHash.hashInitWith CHash.SHA3_256
-    let ctx1 = CHash.hashUpdate ctx0 back
-    let ctx2 = CHash.hashUpdate ctx1 front
-    BA.convert $ CHash.hashFinalize ctx2
-
-hashPassword :: BS.ByteString -> Password -> BS.ByteString
-hashPassword salt (Password back) = do
-    let ctx0 = CHash.hashInitWith CHash.SHA3_256
-    let ctx1 = CHash.hashUpdate ctx0 back
-    let ctx2 = CHash.hashUpdate ctx1 salt
-    BA.convert $ CHash.hashFinalize ctx2
-
 type Transaction a = ReaderT SqlGround (Db.Transaction (Either GroundError a))
 
 generateBytes :: (MonadReader SqlGround m, MonadIO m) => (GroundConfig -> Int) -> m BS.ByteString
@@ -1069,183 +725,3 @@ parseOne :: Returning r ts -> HList Maybe ts -> Maybe r
 parseOne f (Just x :/ xs) = parseOne (f x) xs
 parseOne _ (Nothing :/ xs) = Nothing
 parseOne x E = Just x
-
-instance IsValue (Reference a) where
-    type PrimOf (Reference a) = BS.ByteString
-    fromPrim (VBlob x) = Just $ Reference x
-    fromPrim VNull = Just $ Reference ""
-    toPrim (Reference "") = VNull
-    toPrim (Reference bstr) = VBlob bstr
-
-fReference :: FieldName -> Field (Reference a)
-fReference = Field . FBlob
-
-instance IsValue (Version a) where
-    type PrimOf (Version a) = BS.ByteString
-    fromPrim (VBlob version) = Just $ Version version
-    fromPrim _ = Nothing
-    toPrim (Version version) = VBlob version
-
-fVersion :: FieldName -> Field (Version a)
-fVersion = Field . FBlob
-
-instance IsValue PublicationStatus where
-    type PrimOf PublicationStatus = UTCTime
-    fromPrim (VTime date) = Just $ PublishAt date
-    fromPrim VTPosInf = Just NonPublished
-    fromPrim _ = Nothing
-    toPrim (PublishAt date) = VTime date
-    toPrim NonPublished = VTPosInf
-
-fPublicationStatus :: FieldName -> Field PublicationStatus
-fPublicationStatus = Field . FTime
-
-class ListableObject a where
-    applyFilter :: ViewFilter a -> QueryDemand
-    applyOrder :: ViewOrder a -> OrderDirection -> QueryDemand
-
-instance ListableObject User where
-    applyFilter (FilterUserId ref) = demandCondition (WhereIs ref "user_id")
-    applyFilter (FilterUserIsAdmin True) = demandCondition (Where "user_is_admin")
-    applyFilter (FilterUserIsAdmin False) = demandCondition (Where "NOT user_is_admin")
-    applyFilter (FilterUserAuthorId ref) = demandCondition (WhereIs ref "a2u_author_id")
-        <> demandJoin "sn_author2user" [Where "a2u_user_id = user_id"]
-    applyFilter (FilterUserAccessKey key@(AccessKey keyFront _)) =
-        demandCondition (WhereIs keyFront "access_key_id")
-            <> demandCondition (WhereIs (hashAccessKey key) "access_key_hash")
-            <> demandJoin "sn_access_keys" [Where "access_key_user_id = user_id"]
-    applyOrder OrderUserName = demandOrder "user_name"
-    applyOrder OrderUserSurname = demandOrder "user_surname"
-    applyOrder OrderUserJoinDate = demandOrder "user_join_date" . inverseDirection
-    applyOrder OrderUserIsAdmin = demandOrder "user_is_admin" . inverseDirection
-
-instance ListableObject AccessKey where
-    applyFilter = \case {}
-    applyOrder = \case {}
-
-instance ListableObject Author where
-    applyFilter (FilterAuthorId ref) = demandCondition (WhereIs ref "author_id")
-    applyFilter (FilterAuthorUserId ref) = demandCondition (WhereIs ref "a2u_user_id")
-        <> demandJoin "sn_author2user" [Where "a2u_author_id = author_id"]
-    applyOrder OrderAuthorName = demandOrder "author_name"
-
-instance ListableObject Category where
-    applyFilter (FilterCategoryId ref) = demandCondition (WhereIs ref "category_id")
-    applyFilter (FilterCategoryParentId ref) = demandCondition (WhereIs ref "category_parent_id")
-    applyFilter (FilterCategoryTransitiveParentId ref) = demandJoin (subcategoriesSource ref) [Where "category_id = subcategory_id"]
-    applyOrder OrderCategoryName = demandOrder "category_name"
-
-instance ListableObject Article where
-    applyFilter (FilterArticleId ref) = demandCondition (WhereIs ref "article_id")
-    applyFilter (FilterArticleAuthorId ref) = demandCondition (WhereIs ref "article_author_id")
-    applyFilter (FilterArticleUserId ref) = demandCondition (WhereIs ref "a2u_user_id")
-        <> demandJoin (OuterJoinSource "sn_author2user" (WhereFieldIs "a2u_author_id" "article_author_id")) []
-    applyFilter (FilterArticleCategoryId ref) = demandCondition (WhereIs ref "article_category_id")
-    applyFilter (FilterArticleTransitiveCategoryId (Reference "")) = demandCondition (Where "article_category_id IS NULL")
-    applyFilter (FilterArticleTransitiveCategoryId ref) = demandJoin (subcategoriesSource ref) [Where "article_category_id = subcategory_id"]
-    applyFilter FilterArticlePublishedCurrently = withCurrentTime $ \time -> demandCondition (WhereWith time "article_publication_date <= ?")
-    applyFilter (FilterArticlePublishedBefore end) = demandCondition (WhereWith end "article_publication_date < ?")
-    applyFilter (FilterArticlePublishedAfter begin) = demandCondition (WhereWith begin "article_publication_date >= ?")
-    applyFilter (FilterArticleTagIds []) = mempty
-    applyFilter (FilterArticleTagIds tagRefs) = demandCondition (WhereWithList "EXISTS (SELECT * FROM sn_article2tag WHERE a2t_article_id = article_id AND a2t_tag_id IN " tagRefs ")")
-    applyOrder OrderArticleName = demandOrder "article_name"
-    applyOrder OrderArticleDate = demandOrder "article_publication_date" . inverseDirection
-    applyOrder OrderArticleAuthorName = demandOrder "COALESCE(author_name, '')"
-        <> pure (demandJoin (OuterJoinSource "sn_authors" (WhereFieldIs "author_id" "article_author_id")) [])
-    applyOrder OrderArticleCategoryName = demandOrder "COALESCE(category_name, '')"
-        <> pure (demandJoin (OuterJoinSource "sn_categories" (WhereFieldIs "category_id" "article_category_id")) [])
-
-instance ListableObject Tag where
-    applyFilter (FilterTagId ref) = demandCondition (WhereIs ref "tag_id")
-    applyFilter (FilterTagArticleId ref) = demandCondition (WhereIs ref "a2t_article_id")
-        <> demandJoin "sn_article2tag" [Where "a2t_tag_id = tag_id"]
-    applyOrder OrderTagName = demandOrder "tag_name"
-
-instance ListableObject Comment where
-    applyFilter (FilterCommentId ref) = demandCondition (WhereIs ref "comment_id")
-    applyFilter (FilterCommentArticleId ref) = demandCondition (WhereIs ref "comment_article_id")
-    applyFilter (FilterCommentUserId ref) = demandCondition (WhereIs ref "comment_user_id")
-    applyOrder OrderCommentDate = demandOrder "comment_date" . inverseDirection
-
-instance ListableObject FileInfo where
-    applyFilter (FilterFileId ref) = demandCondition (WhereIs ref "file_id")
-    applyFilter (FilterFileArticleId ref) = demandCondition (WhereIs ref "file_article_id")
-    applyFilter (FilterFileUserId ref) = demandCondition (WhereIs ref "file_user_id")
-    applyOrder OrderFileName = demandOrder "file_name"
-    applyOrder OrderFileMimeType = demandOrder "file_mimetype"
-    applyOrder OrderFileUploadDate = demandOrder "file_upload_date" . inverseDirection
-    applyOrder OrderFileIndex = demandOrder "file_index"
-
-subcategoriesSource :: Reference Category -> RowSource
-subcategoriesSource ref = RecursiveSource "subcategories"
-    (fReference "subcategory_id" :/ E)
-    (Select ["sn_categories"] (fReference "category_id" :/ E) [WhereIs ref "category_id"] [] (RowRange 0 maxBound))
-    (Select ["sn_categories", "subcategories"] (fReference "category_id" :/ E) [Where "category_parent_id = subcategory_id"] [] (RowRange 0 maxBound))
-
-data JoinDemand = JoinDemand RowSource (Endo [Condition])
-
-instance Eq JoinDemand where
-    JoinDemand (TableSource t1) _ == JoinDemand (TableSource t2) _ = t1 == t2
-    JoinDemand (OuterJoinSource t1 _) _ == JoinDemand (OuterJoinSource t2 _) _ = t1 == t2
-    JoinDemand (RecursiveSource t1 _ _ _) _ == JoinDemand (RecursiveSource t2 _ _ _) _ = t1 == t2
-    _ == _ = False
-
-newtype QueryDemand = QueryDemand
-    { withQueryDemand :: forall r. UTCTime
-        -> (Endo [JoinDemand] -> Endo [Condition] -> Endo [RowOrder] -> r)
-        -> r
-    }
-
-instance Semigroup QueryDemand where
-    QueryDemand b1 <> QueryDemand b2 = QueryDemand $ \time cont ->
-        b1 time $ \j1 c1 o1 ->
-            b2 time $ \j2 c2 o2 ->
-                cont (j1 <> j2) (c1 <> c2) (o1 <> o2)
-
-instance Monoid QueryDemand where
-    mempty = QueryDemand $ \_ cont -> cont mempty mempty mempty
-
-withCurrentTime :: (UTCTime -> QueryDemand) -> QueryDemand
-withCurrentTime inner = QueryDemand $ \time cont -> do
-    withQueryDemand (inner time) time cont
-
-demandJoin :: RowSource -> [Condition] -> QueryDemand
-demandJoin source cond = QueryDemand $ \_ cont -> do
-    let demand = JoinDemand source (Endo (cond ++))
-    cont (Endo (demand :)) mempty mempty
-
-demandCondition :: Condition -> QueryDemand
-demandCondition cond = QueryDemand $ \_ cont ->
-    cont mempty (Endo (cond :)) mempty
-
-demandOrder :: FieldName -> OrderDirection -> QueryDemand
-demandOrder field dir = QueryDemand $ \_ cont ->
-    cont mempty mempty (Endo (order :))
-  where
-    order = case dir of
-        Ascending -> Asc field
-        Descending -> Desc field
-
-inverseDirection :: OrderDirection -> OrderDirection
-inverseDirection Ascending = Descending
-inverseDirection Descending = Ascending
-
-withView
-    :: (ListableObject a, MonadIO m)
-    => ListView a
-    -> ([RowSource] -> [Condition] -> (FieldName -> [RowOrder]) -> RowRange -> UTCTime -> m r)
-    -> m r
-withView view cont = do
-    let demand = foldMap applyFilter (viewFilter view) <> foldMap (uncurry applyOrder) (viewOrder view)
-    time <- currentTime
-    withQueryDemand demand time $ \joinEndo filterEndo orderEndo -> do
-        let joins = nub (appEndo joinEndo [])
-        let (joinSources, joinFilters) = unzip $ map (\(JoinDemand source filter) -> (source, filter)) joins
-        cont
-            joinSources
-            (appEndo (mconcat joinFilters <> filterEndo) [])
-            (\fieldName -> appEndo orderEndo [Asc fieldName])
-            (RowRange (viewOffset view) (viewLimit view))
-            time
-
-declareHEq1Instance ''Action

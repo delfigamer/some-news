@@ -43,6 +43,7 @@ module SN.Medium.Internal
     , exitError
     , module SN.Control.Monad.Cont
     , module SN.Medium.ActionTicket
+    , module SN.Medium.Config
     , module SN.Medium.Response
     ) where
 
@@ -57,21 +58,21 @@ import qualified Data.Text.Encoding as Text
 import qualified Data.Text.Encoding.Error as Text
 import SN.Control.Monad.Cont
 import SN.Data.Hex
-import SN.Ground
+import SN.Ground.Interface
 import SN.Logger
 import SN.Medium.ActionTicket
+import SN.Medium.Config
 import SN.Medium.Response
 import qualified SN.Data.TimedHashmap as TimedHashmap
-import qualified SN.Medium.Config as Config
 
 data Context = Context
-    { contextConfig :: Config.Config
+    { contextConfig :: MediumConfig
     , contextLogger :: Logger
     , contextGround :: Ground
     , contextTicketMap :: TimedHashmap.TimedHashmap (Reference ActionTicket) ActionTicket
     }
 
-initializeContext :: Config.Config -> Logger -> Ground -> IO Context
+initializeContext :: MediumConfig -> Logger -> Ground -> IO Context
 initializeContext config logger ground = do
     ticketMap <- TimedHashmap.new
     return $ Context config logger ground ticketMap
@@ -257,16 +258,16 @@ getListView filters orderCols = do
     offset <- getParam "offset" $
         withDefault 0 $ intParser 0 maxBound
     limit <- getParam "limit" $
-        withDefault (Config.defaultPageLimit config) $ intParser 1 (Config.maxPageLimit config)
+        withDefault (mediumConfigDefaultPageLimit config) $ intParser 1 (mediumConfigMaxPageLimit config)
     order <- getParam "order" $ sortOrderParser orderCols
     return $ ListView offset limit filters order
 
 createActionTicket :: MonadRequestHandler f m => ActionTicket -> m (Reference ActionTicket)
 createActionTicket ticket = do
     Context
-        { contextConfig = Config.Config
-            { Config.ticketLength = ticketLength
-            , Config.ticketLifetime = ticketLifetime
+        { contextConfig = MediumConfig
+            { mediumConfigTicketLength = ticketLength
+            , mediumConfigTicketLifetime = ticketLifetime
             }
         , contextGround = ground
         , contextTicketMap = ticketMap
