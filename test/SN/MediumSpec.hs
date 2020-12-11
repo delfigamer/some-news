@@ -21,7 +21,7 @@ import qualified Data.Text.Lazy as TextLazy
 import qualified Data.Time.Clock as TClock
 import qualified Data.Time.Format.ISO8601 as TFormat
 import qualified Data.Vector as Vector
-import SN.Data.Hex
+import SN.Data.Base64
 import SN.Ground.Interface
 import SN.Ground.Fake
 import SN.Logger
@@ -145,13 +145,13 @@ spec = around withTestEnv $ do
                 (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrInvalidParameter "newPassword")
                 (SimpleRequest $ rqdata [("name", "foo"), ("surname", "bar"), ("newPassword", "123")])
             checkpoint fake
-                [ UserCreate "foo" "bar" "1234" |>> Right tuser
+                [ UserCreate "foo" "bar" "1234" False |>> Right tuser
                 ]
             exec
                 (expectResponse $ Response StatusOk $ ResponseBodyOkUser $ ExUser tuser)
                 (SimpleRequest $ rqdata [("name", "foo"), ("surname", "bar"), ("newPassword", "1234")])
             checkpoint fake
-                [ UserCreate "foo" "bar" "abc\255" |>> Right tuser
+                [ UserCreate "foo" "bar" "abc\255" False |>> Right tuser
                 ]
             exec
                 (expectResponse $ Response StatusOk $ ResponseBodyOkUser $ ExUser tuser)
@@ -169,13 +169,13 @@ spec = around withTestEnv $ do
                 ]
             exec
                 (expectResponse $ Response StatusNotFound $ ResponseBodyError ErrNotFound)
-                (SimpleRequest $ rqdata [("user", hex "uid1")])
+                (SimpleRequest $ rqdata [("user", toBase64 "uid1")])
             checkpoint fake
                 [ UserList (ListView 0 1 [FilterUserId "uid1"] []) |>> Right [tuser]
                 ]
             exec
                 (expectResponse $ Response StatusOk $ ResponseBodyOkUser $ ExUser tuser)
-                (SimpleRequest $ rqdata [("user", hex "uid1")])
+                (SimpleRequest $ rqdata [("user", toBase64 "uid1")])
         specifyMethod "users/me; also user authorization" $ \(MethodEnv fake exec) -> do
             {- akey :: required user access key -}
             exec
@@ -183,20 +183,20 @@ spec = around withTestEnv $ do
                 (SimpleRequest $ rqdata [])
             let invalidAkeys =
                     [ ""
-                    , "0123"
-                    , "0123:45:67"
-                    , "0123:def"
-                    , "012:cdef"
-                    , "0123:defg"
-                    , "FE:3210"
+                    , "0001"
+                    , "0002:56:78"
+                    , "0003:AAA="
+                    , "0004:A"
+                    , "00056:AAAA"
+                    , "+=AA:3210"
                     ]
             forM_ invalidAkeys $ \akey -> do
                 exec
                     (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrInvalidParameter "akey")
                     (SimpleRequest $ rqdata [("akey", akey)])
             let validAkeys =
-                    [ ("01234567:89abcdef", "\x01\x23\x45\x67", "\x89\xab\xcd\xef")
-                    , ("fe:3210", "\xfe", "\x32\x10")
+                    [ ("ASNFZw:iavN7w", "\x01\x23\x45\x67", "\x89\xab\xcd\xef")
+                    , ("_g:MhA", "\xfe", "\x32\x10")
                     ]
             forM_ validAkeys $ \(akey, keyref, keytoken) -> do
                 checkpoint fake
@@ -223,26 +223,26 @@ spec = around withTestEnv $ do
                 (SimpleRequest $ rqdata [("akey", "01:23"), ("name", "foo")])
             exec
                 (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrInvalidParameter "surname")
-                (SimpleRequest $ rqdata [("akey", "01:23"), ("name", "foo"), ("surname", "")])
+                (SimpleRequest $ rqdata [("akey", "AQI:AwQ"), ("name", "foo"), ("surname", "")])
             exec
                 (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrMissingParameter "name")
-                (SimpleRequest $ rqdata [("akey", "01:23"), ("surname", "bar")])
+                (SimpleRequest $ rqdata [("akey", "AQI:AwQ"), ("surname", "bar")])
             exec
                 (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrInvalidParameter "name")
-                (SimpleRequest $ rqdata [("akey", "01:23"), ("name", ""), ("surname", "bar")])
+                (SimpleRequest $ rqdata [("akey", "AQI:AwQ"), ("name", ""), ("surname", "bar")])
             checkpoint fake
                 [ UserList (ListView 0 1 [FilterUserAccessKey $ AccessKey (Reference "\x01\x02") "\x03\x04"] []) |>> Right []
                 ]
             exec
                 (expectResponse $ Response StatusForbidden $ ResponseBodyError ErrInvalidAccessKey)
-                (SimpleRequest $ rqdata [("akey", "0102:0304"), ("name", "foo"), ("surname", "bar")])
+                (SimpleRequest $ rqdata [("akey", "AQI:AwQ"), ("name", "foo"), ("surname", "bar")])
             checkpoint fake
                 [ UserList (ListView 0 1 [FilterUserAccessKey $ AccessKey (Reference "\x01\x02") "\x03\x04"] []) |>> Right [tuser]
                 , UserSetName "uid" "foo" "bar" |>> Right ()
                 ]
             exec
                 (expectResponse $ Response StatusOk ResponseBodyOk)
-                (SimpleRequest $ rqdata [("akey", "0102:0304"), ("name", "foo"), ("surname", "bar")])
+                (SimpleRequest $ rqdata [("akey", "AQI:AwQ"), ("name", "foo"), ("surname", "bar")])
         specifyMethod "users/setPassword; also password authorization" $ \(MethodEnv fake exec) -> do
             {- user :: required user id -}
             {- password :: required current password -}
@@ -255,26 +255,26 @@ spec = around withTestEnv $ do
                 (SimpleRequest $ rqdata [("user", "not a reference"), ("password", "1234"), ("newPassword", "abcd")])
             exec
                 (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrMissingParameter "password")
-                (SimpleRequest $ rqdata [("user", hex "uid1"), ("newPassword", "abcd")])
+                (SimpleRequest $ rqdata [("user", toBase64 "uid1"), ("newPassword", "abcd")])
             exec
                 (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrMissingParameter "newPassword")
-                (SimpleRequest $ rqdata [("user", hex "uid1"), ("password", "1234")])
+                (SimpleRequest $ rqdata [("user", toBase64 "uid1"), ("password", "1234")])
             exec
                 (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrInvalidParameter "newPassword")
-                (SimpleRequest $ rqdata [("user", hex "uid1"), ("password", "1234"), ("newPassword", "a")])
+                (SimpleRequest $ rqdata [("user", toBase64 "uid1"), ("password", "1234"), ("newPassword", "a")])
             checkpoint fake
                 [ UserCheckPassword "uid1" "1234" |>> Left NotFoundError
                 ]
             exec
                 (expectResponse $ Response StatusForbidden $ ResponseBodyError ErrInvalidAccessKey)
-                (SimpleRequest $ rqdata [("user", hex "uid1"), ("password", "1234"), ("newPassword", "abcd")])
+                (SimpleRequest $ rqdata [("user", toBase64 "uid1"), ("password", "1234"), ("newPassword", "abcd")])
             checkpoint fake
                 [ UserCheckPassword "uid1" "1234" |>> Right ()
                 , UserSetPassword "uid1" "abcd" |>> Right ()
                 ]
             exec
                 (expectResponse $ Response StatusOk ResponseBodyOk)
-                (SimpleRequest $ rqdata [("user", hex "uid1"), ("password", "1234"), ("newPassword", "abcd")])
+                (SimpleRequest $ rqdata [("user", toBase64 "uid1"), ("password", "1234"), ("newPassword", "abcd")])
         specifyMethod "users/delete; also confirmation tickets" $ \(MethodEnv fake exec) -> do
             {- akey :: required user access key -}
             {- confirm :: confirmation ticket -}
@@ -297,28 +297,28 @@ spec = around withTestEnv $ do
                     ]
                 exec
                     (expectResponse $ Response StatusOk $ ResponseBodyConfirm "tikt")
-                    (SimpleRequest $ rqdata $ ticket ++ [("akey", "01:02")])
+                    (SimpleRequest $ rqdata $ ticket ++ [("akey", "AQ:Ag")])
             checkpoint fake
                 [ UserList (ListView 0 1 [FilterUserAccessKey $ AccessKey (Reference "\x03") "\x04"] []) |>> Right [tuser2]
                 , GroundGenerateBytes 4 |>> "2222"
                 ]
             exec
                 (expectResponse $ Response StatusOk $ ResponseBodyConfirm "2222")
-                (SimpleRequest $ rqdata [("akey", "03:04"), ("confirm", hex "tikt")])
+                (SimpleRequest $ rqdata [("akey", "Aw:BA"), ("confirm", toBase64 "tikt")])
             checkpoint fake
                 [ UserList (ListView 0 1 [FilterUserAccessKey $ AccessKey (Reference "\x01") "\x02"] []) |>> Right [tuser1]
                 , UserDelete "uid1" |>> Right ()
                 ]
             exec
                 (expectResponse $ Response StatusOk ResponseBodyOk)
-                (SimpleRequest $ rqdata [("akey", "01:02"), ("confirm", hex "tikt")])
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("confirm", toBase64 "tikt")])
             checkpoint fake
                 [ UserList (ListView 0 1 [FilterUserAccessKey $ AccessKey (Reference "\x03") "\x04"] []) |>> Right [tuser2]
                 , UserDelete "uid2" |>> Right ()
                 ]
             exec
                 (expectResponse $ Response StatusOk ResponseBodyOk)
-                (SimpleRequest $ rqdata [("akey", "03:04"), ("confirm", hex "2222")])
+                (SimpleRequest $ rqdata [("akey", "Aw:BA"), ("confirm", toBase64 "2222")])
         specifyMethod "users/createAccessKey" $ \(MethodEnv fake exec) -> do
             {- user :: required user id -}
             {- password :: required current password -}
@@ -330,20 +330,20 @@ spec = around withTestEnv $ do
                 (SimpleRequest $ rqdata [("user", "not a reference"), ("password", "1234")])
             exec
                 (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrMissingParameter "password")
-                (SimpleRequest $ rqdata [("user", hex "uid1")])
+                (SimpleRequest $ rqdata [("user", toBase64 "uid1")])
             checkpoint fake
                 [ UserCheckPassword "uid1" "1234" |>> Left NotFoundError
                 ]
             exec
                 (expectResponse $ Response StatusForbidden $ ResponseBodyError ErrInvalidAccessKey)
-                (SimpleRequest $ rqdata [("user", hex "uid1"), ("password", "1234")])
+                (SimpleRequest $ rqdata [("user", toBase64 "uid1"), ("password", "1234")])
             checkpoint fake
                 [ UserCheckPassword "uid1" "1234" |>> Right ()
                 , AccessKeyList "uid1" (ListView 0 maxBound [] []) |>> Right ["a1", "a2", "a3"]
                 ]
             exec
                 (expectResponse $ Response StatusForbidden $ ResponseBodyError ErrLimitExceeded)
-                (SimpleRequest $ rqdata [("user", hex "uid1"), ("password", "1234")])
+                (SimpleRequest $ rqdata [("user", toBase64 "uid1"), ("password", "1234")])
             checkpoint fake
                 [ UserCheckPassword "uid1" "1234" |>> Right ()
                 , AccessKeyList "uid1" (ListView 0 maxBound [] []) |>> Right ["a1", "a2"]
@@ -351,7 +351,7 @@ spec = around withTestEnv $ do
                 ]
             exec
                 (expectResponse $ Response StatusOk $ ResponseBodyOkAccessKey (AccessKey "akid" "aktok"))
-                (SimpleRequest $ rqdata [("user", hex "uid1"), ("password", "1234")])
+                (SimpleRequest $ rqdata [("user", toBase64 "uid1"), ("password", "1234")])
         specifyMethod "users/listAccessKeys" $ \(MethodEnv fake exec) -> do
             {- user :: required user id -}
             {- password :: required current password -}
@@ -361,7 +361,7 @@ spec = around withTestEnv $ do
                 ]
             exec
                 (expectResponse $ Response StatusOk $ ResponseBodyOkAccessKeyList ["a1", "a2", "a3"])
-                (SimpleRequest $ rqdata [("user", hex "uid1"), ("password", "1234")])
+                (SimpleRequest $ rqdata [("user", toBase64 "uid1"), ("password", "1234")])
         specifyMethod "users/clearAccessKeys" $ \(MethodEnv fake exec) -> do
             {- user :: required user id -}
             {- password :: required current password -}
@@ -371,7 +371,7 @@ spec = around withTestEnv $ do
                 ]
             exec
                 (expectResponse $ Response StatusOk ResponseBodyOk)
-                (SimpleRequest $ rqdata [("user", hex "uid1"), ("password", "1234")])
+                (SimpleRequest $ rqdata [("user", toBase64 "uid1"), ("password", "1234")])
         specifyMethod "users/setName_; also admin authorization" $ \(MethodEnv fake exec) -> do
             {- akey :: required admin access key -}
             {- name :: required non-empty text -}
@@ -387,45 +387,45 @@ spec = around withTestEnv $ do
                 ]
             exec
                 (expectResponse $ Response StatusNotFound $ ResponseBodyError ErrUnknownRequest)
-                (SimpleRequest $ rqdata [("akey", "01:02")])
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag")])
             checkpoint fake
                 [ adminLookup |>> Right [tadmin]
                 ]
             exec
                 (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrMissingParameter "user")
-                (SimpleRequest $ rqdata [("akey", "01:02"), ("name", "foo"), ("surname", "bar")])
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("name", "foo"), ("surname", "bar")])
             checkpoint fake
                 [ adminLookup |>> Right [tadmin]
                 ]
             exec
                 (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrInvalidParameter "user")
-                (SimpleRequest $ rqdata [("akey", "01:02"), ("name", "foo"), ("surname", "bar"), ("user", "not a hex string")])
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("name", "foo"), ("surname", "bar"), ("user", "not a hex string")])
             checkpoint fake
                 [ adminLookup |>> Right [tadmin]
                 ]
             exec
                 (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrInvalidParameter "name")
-                (SimpleRequest $ rqdata [("akey", "01:02"), ("name", ""), ("surname", "bar"), ("user", hex "uid")])
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("name", ""), ("surname", "bar"), ("user", toBase64 "uid")])
             checkpoint fake
                 [ adminLookup |>> Right [tadmin]
                 ]
             exec
                 (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrInvalidParameter "surname")
-                (SimpleRequest $ rqdata [("akey", "01:02"), ("name", "foo"), ("surname", ""), ("user", hex "uid")])
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("name", "foo"), ("surname", ""), ("user", toBase64 "uid")])
             checkpoint fake
                 [ adminLookup |>> Right [tadmin]
                 , UserSetName "uid" "foo" "bar" |>> Left NotFoundError
                 ]
             exec
                 (expectResponse $ Response StatusNotFound $ ResponseBodyError $ ErrNotFound)
-                (SimpleRequest $ rqdata [("akey", "01:02"), ("name", "foo"), ("surname", "bar"), ("user", hex "uid")])
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("name", "foo"), ("surname", "bar"), ("user", toBase64 "uid")])
             checkpoint fake
                 [ adminLookup |>> Right [tadmin]
                 , UserSetName "uid" "foo" "bar" |>> Right ()
                 ]
             exec
                 (expectResponse $ Response StatusOk ResponseBodyOk)
-                (SimpleRequest $ rqdata [("akey", "01:02"), ("name", "foo"), ("surname", "bar"), ("user", hex "uid")])
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("name", "foo"), ("surname", "bar"), ("user", toBase64 "uid")])
         specifyMethod "users/grantAdmin_" $ \(MethodEnv fake exec) -> do
             {- akey :: required admin access key -}
             {- user :: required user id -}
@@ -434,20 +434,20 @@ spec = around withTestEnv $ do
                 ]
             exec
                 (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrMissingParameter "user")
-                (SimpleRequest $ rqdata [("akey", "01:02")])
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag")])
             checkpoint fake
                 [ adminLookup |>> Right [tadmin]
                 ]
             exec
                 (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrInvalidParameter "user")
-                (SimpleRequest $ rqdata [("akey", "01:02"), ("user", "not an uid")])
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("user", "not an uid")])
             checkpoint fake
                 [ adminLookup |>> Right [tadmin]
                 , UserSetIsAdmin "uid" True |>> Right ()
                 ]
             exec
                 (expectResponse $ Response StatusOk ResponseBodyOk)
-                (SimpleRequest $ rqdata [("akey", "01:02"), ("user", hex "uid")])
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("user", toBase64 "uid")])
         specifyMethod "users/revokeAdmin_" $ \(MethodEnv fake exec) -> do
             {- akey :: required admin access key -}
             {- user :: required user id -}
@@ -458,34 +458,34 @@ spec = around withTestEnv $ do
                 ]
             exec
                 (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrMissingParameter "user")
-                (SimpleRequest $ rqdata [("akey", "01:02")])
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag")])
             checkpoint fake
                 [ adminLookup |>> Right [tadmin]
                 ]
             exec
                 (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrInvalidParameter "user")
-                (SimpleRequest $ rqdata [("akey", "01:02"), ("user", "not an uid")])
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("user", "not an uid")])
             checkpoint fake
                 [ adminLookup |>> Right [tadmin]
                 , UserSetIsAdmin "uid" False |>> Right ()
                 ]
             exec
                 (expectResponse $ Response StatusOk ResponseBodyOk)
-                (SimpleRequest $ rqdata [("akey", "01:02"), ("user", hex "uid")])
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("user", toBase64 "uid")])
             checkpoint fake
                 [ adminLookup |>> Right [tadmin]
                 , GroundGenerateBytes 4 |>> "tikt"
                 ]
             exec
                 (expectResponse $ Response StatusOk $ ResponseBodyConfirm "tikt")
-                (SimpleRequest $ rqdata [("akey", "01:02"), ("user", hex "uida")])
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("user", toBase64 "uida")])
             checkpoint fake
                 [ adminLookup |>> Right [tadmin]
                 , UserSetIsAdmin "uida" False |>> Right ()
                 ]
             exec
                 (expectResponse $ Response StatusOk ResponseBodyOk)
-                (SimpleRequest $ rqdata [("akey", "01:02"), ("user", hex "uida"), ("confirm", hex "tikt")])
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("user", toBase64 "uida"), ("confirm", toBase64 "tikt")])
         specifyMethod "users/delete_" $ \(MethodEnv fake exec) -> do
             {- akey :: required admin access key -}
             {- user :: required user id -}
@@ -495,28 +495,28 @@ spec = around withTestEnv $ do
                 ]
             exec
                 (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrMissingParameter "user")
-                (SimpleRequest $ rqdata [("akey", "01:02")])
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag")])
             checkpoint fake
                 [ adminLookup |>> Right [tadmin]
                 , GroundGenerateBytes 4 |>> "tikt"
                 ]
             exec
                 (expectResponse $ Response StatusOk $ ResponseBodyConfirm "tikt")
-                (SimpleRequest $ rqdata [("akey", "01:02"), ("user", hex "uida")])
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("user", toBase64 "uida")])
             checkpoint fake
                 [ adminLookup |>> Right [tadmin]
                 , UserDelete "uida" |>> Left NotFoundError
                 ]
             exec
                 (expectResponse $ Response StatusNotFound $ ResponseBodyError ErrNotFound)
-                (SimpleRequest $ rqdata [("akey", "01:02"), ("user", hex "uida"), ("confirm", hex "tikt")])
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("user", toBase64 "uida"), ("confirm", toBase64 "tikt")])
             checkpoint fake
                 [ adminLookup |>> Right [tadmin]
                 , UserDelete "uida" |>> Right ()
                 ]
             exec
                 (expectResponse $ Response StatusOk ResponseBodyOk)
-                (SimpleRequest $ rqdata [("akey", "01:02"), ("user", hex "uida"), ("confirm", hex "tikt")])
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("user", toBase64 "uida"), ("confirm", toBase64 "tikt")])
         specifyMethod "users/list_" $ \(MethodEnv fake exec) -> do
             {- akey :: required admin access key -}
             {- offset :: optional integer, 0 <= offset, default -> 0 -}
@@ -534,7 +534,7 @@ spec = around withTestEnv $ do
                 ]
             exec
                 (expectResponse $ Response StatusOk $ ResponseBodyOkUserList $ map ExUser users)
-                (SimpleRequest $ rqdata [("akey", "01:02")])
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag")])
             do
                 forM_
                     [ ("0", 0)
@@ -547,7 +547,7 @@ spec = around withTestEnv $ do
                             ]
                         exec
                             (expectResponse $ Response StatusInternalError $ ResponseBodyError ErrInternal)
-                            (SimpleRequest $ rqdata [("akey", "01:02"), ("offset", offsetParam)])
+                            (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("offset", offsetParam)])
                 forM_
                     [ ""
                     , "-1"
@@ -560,7 +560,7 @@ spec = around withTestEnv $ do
                             ]
                         exec
                             (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrInvalidParameter "offset")
-                            (SimpleRequest $ rqdata [("akey", "01:02"), ("offset", offsetParam)])
+                            (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("offset", offsetParam)])
             do
                 forM_
                     [ ("1", 1)
@@ -573,7 +573,7 @@ spec = around withTestEnv $ do
                             ]
                         exec
                             (expectResponse $ Response StatusInternalError $ ResponseBodyError ErrInternal)
-                            (SimpleRequest $ rqdata [("akey", "01:02"), ("limit", limitParam)])
+                            (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("limit", limitParam)])
                 forM_
                     [ ""
                     , "0"
@@ -588,7 +588,7 @@ spec = around withTestEnv $ do
                             ]
                         exec
                             (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrInvalidParameter "limit")
-                            (SimpleRequest $ rqdata [("akey", "01:02"), ("limit", limitParam)])
+                            (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("limit", limitParam)])
             do
                 forM_
                     [ ("", [])
@@ -606,7 +606,7 @@ spec = around withTestEnv $ do
                             ]
                         exec
                             (expectResponse $ Response StatusInternalError $ ResponseBodyError ErrInternal)
-                            (SimpleRequest $ rqdata [("akey", "01:02"), ("order", orderParam)])
+                            (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("order", orderParam)])
                 forM_
                     [ "not an order"
                     , "+"
@@ -619,27 +619,27 @@ spec = around withTestEnv $ do
                             ]
                         exec
                             (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrInvalidParameter "order")
-                            (SimpleRequest $ rqdata [("akey", "01:02"), ("order", orderParam)])
+                            (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("order", orderParam)])
             checkpoint fake
                 [ adminLookup |>> Right [tadmin]
                 ]
             exec
                 (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrInvalidParameter "author")
-                (SimpleRequest $ rqdata [("akey", "01:02"), ("author", "not a ref")])
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("author", "not a ref")])
             checkpoint fake
                 [ adminLookup |>> Right [tadmin]
                 , UserList (ListView 0 10 [FilterUserAuthorId "aid"] []) |>> Left InternalError
                 ]
             exec
                 (expectResponse $ Response StatusInternalError $ ResponseBodyError ErrInternal)
-                (SimpleRequest $ rqdata [("akey", "01:02"), ("author", hex "aid")])
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("author", toBase64 "aid")])
             checkpoint fake
                 [ adminLookup |>> Right [tadmin]
                 , UserList (ListView 1 2 [FilterUserAuthorId "aid"] [(OrderUserName, Descending), (OrderUserJoinDate, Ascending)]) |>> Left InternalError
                 ]
             exec
                 (expectResponse $ Response StatusInternalError $ ResponseBodyError ErrInternal)
-                (SimpleRequest $ rqdata [("akey", "01:02"), ("author", hex "aid"), ("offset", "1"), ("limit", "2"), ("order", "nameDesc+joinDate")])
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("author", toBase64 "aid"), ("offset", "1"), ("limit", "2"), ("order", "nameDesc+joinDate")])
         specifyMethod "authors/info" $ \(MethodEnv fake exec) -> do
             {- author :: required author id -}
             exec
@@ -653,13 +653,13 @@ spec = around withTestEnv $ do
                 ]
             exec
                 (expectResponse $ Response StatusNotFound $ ResponseBodyError ErrNotFound)
-                (SimpleRequest $ rqdata [("author", hex "author")])
+                (SimpleRequest $ rqdata [("author", toBase64 "author")])
             checkpoint fake
                 [ AuthorList (ListView 0 1 [FilterAuthorId "author"] []) |>> Right [tauthor]
                 ]
             exec
                 (expectResponse $ Response StatusOk $ ResponseBodyOkAuthor $ ExAuthor tauthor)
-                (SimpleRequest $ rqdata [("author", hex "author")])
+                (SimpleRequest $ rqdata [("author", toBase64 "author")])
         specifyMethod "authors/create_" $ \(MethodEnv fake exec) -> do
             {- akey :: required admin access key -}
             {- name :: required non-empty text -}
@@ -669,32 +669,32 @@ spec = around withTestEnv $ do
                 ]
             exec
                 (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrMissingParameter "name")
-                (SimpleRequest $ rqdata [("akey", "01:02"), ("description", "bar")])
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("description", "bar")])
             checkpoint fake
                 [ adminLookup |>> Right [tadmin]
                 ]
             exec
                 (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrInvalidParameter "name")
-                (SimpleRequest $ rqdata [("akey", "01:02"), ("name", "")])
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("name", "")])
             checkpoint fake
                 [ adminLookup |>> Right [tadmin]
                 ]
             exec
                 (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrMissingParameter "description")
-                (SimpleRequest $ rqdata [("akey", "01:02"), ("name", "foo")])
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("name", "foo")])
             checkpoint fake
                 [ adminLookup |>> Right [tadmin]
                 ]
             exec
                 (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrInvalidParameter "description")
-                (SimpleRequest $ rqdata [("akey", "01:02"), ("name", "foo"), ("description", "")])
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("name", "foo"), ("description", "")])
             checkpoint fake
                 [ adminLookup |>> Right [tadmin]
                 , AuthorCreate "foo" "bar" |>> Right tauthor
                 ]
             exec
                 (expectResponse $ Response StatusOk $ ResponseBodyOkAuthor $ ExAuthor tauthor)
-                (SimpleRequest $ rqdata [("akey", "01:02"), ("name", "foo"), ("description", "bar")])
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("name", "foo"), ("description", "bar")])
         specifyMethod "authors/setName_" $ \(MethodEnv fake exec) -> do
             {- akey :: required admin access key -}
             {- author :: required author id -}
@@ -704,26 +704,26 @@ spec = around withTestEnv $ do
                 ]
             exec
                 (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrMissingParameter "author")
-                (SimpleRequest $ rqdata [("akey", "01:02"), ("name", "foo")])
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("name", "foo")])
             checkpoint fake
                 [ adminLookup |>> Right [tadmin]
                 ]
             exec
                 (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrMissingParameter "name")
-                (SimpleRequest $ rqdata [("akey", "01:02"), ("author", hex "aid")])
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("author", toBase64 "aid")])
             checkpoint fake
                 [ adminLookup |>> Right [tadmin]
                 ]
             exec
                 (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrInvalidParameter "name")
-                (SimpleRequest $ rqdata [("akey", "01:02"), ("author", hex "aid"), ("name", "")])
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("author", toBase64 "aid"), ("name", "")])
             checkpoint fake
                 [ adminLookup |>> Right [tadmin]
                 , AuthorSetName "aid" "foo" |>> Right ()
                 ]
             exec
                 (expectResponse $ Response StatusOk $ ResponseBodyOk)
-                (SimpleRequest $ rqdata [("akey", "01:02"), ("author", hex "aid"), ("name", "foo")])
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("author", toBase64 "aid"), ("name", "foo")])
         specifyMethod "authors/setDescription_" $ \(MethodEnv fake exec) -> do
             {- akey :: required admin access key -}
             {- author :: required author id -}
@@ -733,26 +733,26 @@ spec = around withTestEnv $ do
                 ]
             exec
                 (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrMissingParameter "author")
-                (SimpleRequest $ rqdata [("akey", "01:02"), ("description", "foo")])
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("description", "foo")])
             checkpoint fake
                 [ adminLookup |>> Right [tadmin]
                 ]
             exec
                 (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrMissingParameter "description")
-                (SimpleRequest $ rqdata [("akey", "01:02"), ("author", hex "aid")])
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("author", toBase64 "aid")])
             checkpoint fake
                 [ adminLookup |>> Right [tadmin]
                 ]
             exec
                 (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrInvalidParameter "description")
-                (SimpleRequest $ rqdata [("akey", "01:02"), ("author", hex "aid"), ("description", "")])
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("author", toBase64 "aid"), ("description", "")])
             checkpoint fake
                 [ adminLookup |>> Right [tadmin]
                 , AuthorSetDescription "aid" "foo" |>> Right ()
                 ]
             exec
                 (expectResponse $ Response StatusOk $ ResponseBodyOk)
-                (SimpleRequest $ rqdata [("akey", "01:02"), ("author", hex "aid"), ("description", "foo")])
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("author", toBase64 "aid"), ("description", "foo")])
         specifyMethod "authors/delete_" $ \(MethodEnv fake exec) -> do
             {- akey :: required admin access key -}
             {- author :: required author id -}
@@ -762,21 +762,21 @@ spec = around withTestEnv $ do
                 ]
             exec
                 (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrMissingParameter "author")
-                (SimpleRequest $ rqdata [("akey", "01:02")])
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag")])
             checkpoint fake
                 [ adminLookup |>> Right [tadmin]
                 , GroundGenerateBytes 4 |>> "tikt"
                 ]
             exec
                 (expectResponse $ Response StatusOk $ ResponseBodyConfirm "tikt")
-                (SimpleRequest $ rqdata [("akey", "01:02"), ("author", hex "aida")])
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("author", toBase64 "aida")])
             checkpoint fake
                 [ adminLookup |>> Right [tadmin]
                 , AuthorDelete "aida" |>> Right ()
                 ]
             exec
                 (expectResponse $ Response StatusOk ResponseBodyOk)
-                (SimpleRequest $ rqdata [("akey", "01:02"), ("author", hex "aida"), ("confirm", hex "tikt")])
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("author", toBase64 "aida"), ("confirm", toBase64 "tikt")])
         specifyMethod "authors/list_" $ \(MethodEnv fake exec) -> do
             {- akey :: required admin access key -}
             {- offset :: optional integer, 0 <= offset, default -> 0 -}
@@ -794,41 +794,41 @@ spec = around withTestEnv $ do
                 ]
             exec
                 (expectResponse $ Response StatusOk $ ResponseBodyOkAuthorList $ map ExAuthor authors)
-                (SimpleRequest $ rqdata [("akey", "01:02")])
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag")])
             checkpoint fake
                 [ adminLookup |>> Right [tadmin]
                 , AuthorList (ListView 50 7 [] []) |>> Right authors
                 ]
             exec
                 (expectResponse $ Response StatusOk $ ResponseBodyOkAuthorList $ map ExAuthor authors)
-                (SimpleRequest $ rqdata [("akey", "01:02"), ("offset", "50"), ("limit", "7")])
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("offset", "50"), ("limit", "7")])
             checkpoint fake
                 [ adminLookup |>> Right [tadmin]
                 , AuthorList (ListView 0 10 [] [(OrderAuthorName, Ascending)]) |>> Left InternalError
                 ]
             exec
                 (expectResponse $ Response StatusInternalError $ ResponseBodyError ErrInternal)
-                (SimpleRequest $ rqdata [("akey", "01:02"), ("order", "name")])
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("order", "name")])
             checkpoint fake
                 [ adminLookup |>> Right [tadmin]
                 ]
             exec
                 (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrInvalidParameter "user")
-                (SimpleRequest $ rqdata [("akey", "01:02"), ("user", "not a ref")])
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("user", "not a ref")])
             checkpoint fake
                 [ adminLookup |>> Right [tadmin]
                 , AuthorList (ListView 0 10 [FilterAuthorUserId "uid"] []) |>> Left InternalError
                 ]
             exec
                 (expectResponse $ Response StatusInternalError $ ResponseBodyError ErrInternal)
-                (SimpleRequest $ rqdata [("akey", "01:02"), ("user", hex "uid")])
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("user", toBase64 "uid")])
             checkpoint fake
                 [ adminLookup |>> Right [tadmin]
                 , AuthorList (ListView 1 2 [FilterAuthorUserId "uid"] [(OrderAuthorName, Descending)]) |>> Left InternalError
                 ]
             exec
                 (expectResponse $ Response StatusInternalError $ ResponseBodyError ErrInternal)
-                (SimpleRequest $ rqdata [("akey", "01:02"), ("user", hex "uid"), ("offset", "1"), ("limit", "2"), ("order", "nameDesc")])
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("user", toBase64 "uid"), ("offset", "1"), ("limit", "2"), ("order", "nameDesc")])
         specifyMethod "authors/addOwner_" $ \(MethodEnv fake exec) -> do
             {- akey :: required admin access key -}
             {- author :: required author id -}
@@ -838,20 +838,20 @@ spec = around withTestEnv $ do
                 ]
             exec
                 (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrMissingParameter "author")
-                (SimpleRequest $ rqdata [("akey", "01:02"), ("user", hex "uid")])
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("user", toBase64 "uid")])
             checkpoint fake
                 [ adminLookup |>> Right [tadmin]
                 ]
             exec
                 (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrMissingParameter "user")
-                (SimpleRequest $ rqdata [("akey", "01:02"), ("author", hex "aid")])
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("author", toBase64 "aid")])
             checkpoint fake
                 [ adminLookup |>> Right [tadmin]
                 , AuthorSetOwnership "aid" "uid" True |>> Right ()
                 ]
             exec
                 (expectResponse $ Response StatusOk ResponseBodyOk)
-                (SimpleRequest $ rqdata [("akey", "01:02"), ("author", hex "aid"), ("user", hex "uid")])
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("author", toBase64 "aid"), ("user", toBase64 "uid")])
         specifyMethod "authors/removeOwner_" $ \(MethodEnv fake exec) -> do
             {- akey :: required admin access key -}
             {- author :: required author id -}
@@ -861,45 +861,45 @@ spec = around withTestEnv $ do
                 ]
             exec
                 (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrMissingParameter "author")
-                (SimpleRequest $ rqdata [("akey", "01:02"), ("user", hex "uid")])
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("user", toBase64 "uid")])
             checkpoint fake
                 [ adminLookup |>> Right [tadmin]
                 ]
             exec
                 (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrMissingParameter "user")
-                (SimpleRequest $ rqdata [("akey", "01:02"), ("author", hex "aid")])
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("author", toBase64 "aid")])
             checkpoint fake
                 [ adminLookup |>> Right [tadmin]
                 , AuthorSetOwnership "aid" "uid" False |>> Right ()
                 ]
             exec
                 (expectResponse $ Response StatusOk ResponseBodyOk)
-                (SimpleRequest $ rqdata [("akey", "01:02"), ("author", hex "aid"), ("user", hex "uid")])
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("author", toBase64 "aid"), ("user", toBase64 "uid")])
         specifyMethod "files/upload" $ \(MethodEnv fake exec) -> do
             {- akey :: required user access key -}
             {- article :: required article id -}
             {- user must possess the article -}
             exec
                 (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrMissingParameter "article")
-                (SimpleRequest $ rqdata [("akey", "01:02")])
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag")])
             exec
                 (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrInvalidParameter "article")
-                (SimpleRequest $ rqdata [("akey", "01:02"), ("article", "not an id")])
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("article", "not an id")])
             checkpoint fake
                 [ userLookup |>> Right [tuser]
                 , ArticleList (ListView 0 1 [FilterArticleId "aid", FilterArticleUserId "uid"] []) |>> Right []
                 ]
             exec
                 (expectResponse $ Response StatusForbidden $ ResponseBodyError ErrArticleNotEditable)
-                (SimpleRequest $ rqdata [("akey", "01:02"), ("article", hex "aid")])
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("article", toBase64 "aid")])
             checkpoint fake
                 [ userLookup |>> Right [tuser]
                 , ArticleList (ListView 0 1 [FilterArticleId "aid", FilterArticleUserId "uid"] []) |>> Right [tarticle]
                 , GroundGenerateBytes 4 |>> "uptk"
                 ]
             exec
-                (expectResponse $ Response StatusOk $ ResponseBodyFollow $ "host/upload/" <> hex "uptk")
-                (SimpleRequest $ rqdata [("akey", "01:02"), ("article", hex "aid")])
+                (expectResponse $ Response StatusOk $ ResponseBodyFollow $ "host/upload/" <> toBase64Text "uptk")
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("article", toBase64 "aid")])
         specify "upload/..." $ \(TestEnv fake medium) -> do
             checkpoint fake
                 [ userLookup |>> Right [tuser]
@@ -907,11 +907,11 @@ spec = around withTestEnv $ do
                 , GroundGenerateBytes 4 |>> "uptk"
                 ]
             executeRequest medium ["files", "upload"]
-                (expectResponse $ Response StatusOk $ ResponseBodyFollow $ "host/upload/" <> hex "uptk")
-                (SimpleRequest $ rqdata [("akey", "01:02"), ("article", hex "aid")])
-            executeRequest medium ["upload", hex "uptk"]
+                (expectResponse $ Response StatusOk $ ResponseBodyFollow $ "host/upload/" <> toBase64Text "uptk")
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("article", toBase64 "aid")])
+            executeRequest medium ["upload", toBase64Text "uptk"]
                 (expectResponse $ Response StatusBadRequest $ ResponseBodyError ErrInvalidRequest)
-                (SimpleRequest $ rqdata [("akey", "01:02"), ("article", hex "aid")])
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("article", toBase64 "aid")])
             checkpoint fake
                 [ GroundUpload "file1.txt" "text/plain" "aid" "uid"
                     |>> Right (UploadProcess
@@ -940,14 +940,14 @@ spec = around withTestEnv $ do
                 , TagList (ListView 0 maxBound [FilterTagArticleId "aid"] [(OrderTagName, Ascending)]) |>> Right [ttag1, ttag2]
                 , UserList (ListView 0 1 [FilterUserId "uid"] []) |>> Right [tuser]
                 ]
-            executeRequest medium ["upload", hex "uptk"]
+            executeRequest medium ["upload", toBase64Text "uptk"]
                 (expectResponse $ Response StatusOk $ ResponseBodyUploadStatusList
                     [ ExUploadStatus "param1" $ Right $ ExFileInfo
                         "fid1" "file1.txt" "text/plain" (mkTime "2020-01-01T01:01:01Z")
-                        (Just tarticleEx) 0 (Just $ ExUser tuser) ("host/get/" <> hex "fid1" <> "/file1.txt")
+                        (Just tarticleEx) 0 (Just $ ExUser tuser) ("host/get/" <> toBase64Text "fid1" <> "/file1.txt")
                     , ExUploadStatus "param2" $ Right $ ExFileInfo
                         "fid2" "file2.txt" "text/plain" (mkTime "2020-01-01T01:01:02Z")
-                        (Just tarticleEx) 1 (Just $ ExUser tuser) ("host/get/" <> hex "fid2" <> "/file2.txt")
+                        (Just tarticleEx) 1 (Just $ ExUser tuser) ("host/get/" <> toBase64Text "fid2" <> "/file2.txt")
                     , ExUploadStatus "param3\xfffd" $ Left ErrInvalidRequest
                     , ExUploadStatus "param4" $ Left $ ErrInvalidParameter "fileName"
                     , ExUploadStatus "param5" $ Left $ ErrInvalidParameter "mimeType"
@@ -975,12 +975,12 @@ spec = around withTestEnv $ do
                 [ GroundDownload "fid1" |>>
                     Right (DownloadProcess "text/plain" ["1234567890", "1234567890", "123"])
                 ]
-            executeRequest medium ["get", hex "fid1", "filename that should be ignored"]
+            executeRequest medium ["get", toBase64Text "fid1", "filename that should be ignored"]
                 (expectStream "text/plain" ["1234567890", "1234567890", "123"])
                 (SimpleRequest $ rqdata [])
             checkpoint fake
                 [ GroundDownload "fid2" |>> Left NotFoundError
                 ]
-            executeRequest medium ["get", hex "fid2", "filename that should be ignored"]
+            executeRequest medium ["get", toBase64Text "fid2", "filename that should be ignored"]
                 (expectResponse $ Response StatusNotFound $ ResponseBodyError ErrNotFound)
                 (SimpleRequest $ rqdata [])

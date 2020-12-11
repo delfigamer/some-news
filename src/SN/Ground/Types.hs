@@ -29,7 +29,7 @@ import qualified Crypto.Hash as CHash
 import qualified Data.ByteArray as BA
 import qualified Data.ByteString as BS
 import qualified Data.Text as Text
-import SN.Data.Hex
+import SN.Data.Base64
 import SN.Sql.Query
 
 newtype Reference a = Reference
@@ -38,7 +38,7 @@ newtype Reference a = Reference
     deriving (Eq, Ord, IsString, Hashable)
 
 instance Show (Reference a) where
-    showsPrec d (Reference x) = showHex d $ BS.unpack x
+    showsPrec d (Reference x) = showBase64 d x
 
 instance IsValue (Reference a) where
     type PrimOf (Reference a) = BS.ByteString
@@ -56,7 +56,7 @@ newtype Version a = Version
     deriving (Eq, Ord, IsString, Hashable)
 
 instance Show (Version a) where
-    showsPrec d (Version x) = showHex d $ BS.unpack x
+    showsPrec d (Version x) = showBase64 d x
 
 instance IsValue (Version a) where
     type PrimOf (Version a) = BS.ByteString

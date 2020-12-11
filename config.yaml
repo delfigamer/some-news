@@ -1,0 +1,39 @@
+host: "*4:1234"
+
+tlsCertFile: cert\certificate.pem
+tlsKeyFile: cert\key.pem
+
+logger:
+  - html: ".main-log.html"
+  - std
+
+database:
+  sqlite: "tdb~"
+  # postgres:
+    # https://www.postgresql.org/docs/13/libpq-connect.html#LIBPQ-PARAMKEYWORDS
+    # host: localhost
+    # user: user
+    # password: password
+
+ground:
+  userIdLength: 18
+  accessKeyIdLength: 18
+  accessKeyTokenLength: 36
+  authorIdLength: 18
+  categoryIdLength: 6
+  articleIdLength: 18
+  articleVersionLength: 18
+  tagIdLength: 6
+  commentIdLength: 18
+  fileIdLength: 18
+  transactionRetryCount: 1000
+
+meduim:
+  defaultPageLimit: 20
+  maxPageLimit: 100
+  minPasswordLength: 8
+  maxAccessKeyCount: 100
+  ticketLength: 32
+  ticketLifetime: 300
+  fileChunkSize: 0x10000 # 64 K
+  maxFileSize: 0x1000000 # 16 M

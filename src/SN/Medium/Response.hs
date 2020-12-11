@@ -17,7 +17,6 @@ module SN.Medium.Response
     , Expandable(..)
     , Retrievable(..)
     , UploadStatus(..)
-    , toHexText
     ) where
 
 import Control.Monad
@@ -33,7 +32,7 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Builder as Builder
 import qualified Data.Text as Text
 import qualified Data.Text.Encoding as TextEncoding
-import SN.Data.Hex
+import SN.Data.Base64
 import SN.Ground.Interface
 import SN.Medium.ActionTicket
 import qualified SN.Data.PolyMap as PolyMap
@@ -72,26 +71,6 @@ data ErrorMessage
     | ErrVersionConflict
     deriving (Show, Eq)
 
-errorMessageContent :: KeyValue a => ErrorMessage -> [a]
-errorMessageContent = \case
-    ErrAccessDenied -> ["class" .= String "Access denied"]
-    ErrArticleNotEditable -> ["class" .= String "Article not editable"]
-    ErrFileTooLarge -> ["class" .= String "File too large"]
-    ErrInternal -> ["class" .= String "Internal error"]
-    ErrInvalidAccessKey -> ["class" .= String "Invalid access key"]
-    ErrInvalidRequest -> ["class" .= String "Invalid request"]
-    ErrInvalidRequestMsg msg -> ["class" .= String "Invalid request", "message" .= msg]
-    ErrInvalidParameter key -> ["class" .= String "Invalid parameter", "parameterName" .= key]
-    ErrLimitExceeded -> ["class" .= String "Limit exceeded"]
-    ErrMissingParameter key -> ["class" .= String "Missing parameter", "parameterName" .= key]
-    ErrNotFound -> ["class" .= String "Not found"]
-    ErrUnknownRequest -> ["class" .= String "Unknown request"]
-    ErrVersionConflict -> ["class" .= String "Version conflict"]
-
-instance ToJSON ErrorMessage where
-    toJSON msg = object $ errorMessageContent msg
-    toEncoding msg = pairs $ mconcat $ errorMessageContent msg
-
 data ResponseBody
     = ResponseBodyError ErrorMessage
     | ResponseBodyConfirm (Reference ActionTicket)
@@ -118,24 +97,6 @@ instance OkResponseBody [Expanded UploadStatus] where okResponseBody = ResponseB
 
 okResponse :: OkResponseBody a => a -> Response
 okResponse a = Response StatusOk $ okResponseBody a
-
-instance ToJSON ResponseBody where
-    toJSON = \case
-        ResponseBodyError msg -> object ["error" .= msg]
-        ResponseBodyConfirm ref -> object ["confirm" .= ref]
-        ResponseBodyFollow link -> object ["follow" .= link]
-        ResponseBodyOk -> object ["ok" .= True]
-        ResponseBodyOkUser user -> object ["ok" .= user]
-        ResponseBodyOkUserList list -> object ["ok" .= list]
-        ResponseBodyUploadStatusList list -> object ["uploads" .= list]
-    toEncoding = \case
-        ResponseBodyError msg -> pairs $ "error" .= msg
-        ResponseBodyConfirm ref -> pairs $ "confirm" .= ref
-        ResponseBodyFollow link -> pairs $ "follow" .= link
-        ResponseBodyOk -> pairs $ "ok" .= True
-        ResponseBodyOkUser user -> pairs $ "ok" .= user
-        ResponseBodyOkUserList list -> pairs $ "ok" .= list
-        ResponseBodyUploadStatusList list -> pairs $ "uploads" .= list
 
 errorResponse :: ErrorMessage -> Response
 errorResponse err = Response (errorStatus err) $ ResponseBodyError err
@@ -198,29 +159,6 @@ instance Retrievable User where
             Right [user] -> return $ Just $ ExUser user
             _ -> return Nothing
 
-instance ToJSON (Expanded User) where
-    toJSON (ExUser user) = object
-        [ "class" .= String "User"
-        , "id" .= userId user
-        , "name" .= userName user
-        , "surname" .= userSurname user
-        , "joinDate" .= userJoinDate user
-        , "isAdmin" .= userIsAdmin user
-        ]
-    toEncoding (ExUser user) = pairs $ mconcat
-        [ "class" .= String "User"
-        , "id" .= userId user
-        , "name" .= userName user
-        , "surname" .= userSurname user
-        , "joinDate" .= userJoinDate user
-        , "isAdmin" .= userIsAdmin user
-        ]
-
-instance ToJSON AccessKey where
-    toJSON (AccessKey (Reference ref) token) = String $ toHexText ref <> ":" <> toHexText token
-    toEncoding (AccessKey (Reference ref) token) = Encoding.unsafeToEncoding $
-        "\"" <> Builder.byteStringHex ref <> ":" <> Builder.byteStringHex token <> "\""
-
 data instance Expanded Author = ExAuthor Author
     deriving (Show, Eq)
 
@@ -234,20 +172,6 @@ instance Retrievable Author where
         case qret of
             Right [author] -> return $ Just $ ExAuthor author
             _ -> return Nothing
-
-instance ToJSON (Expanded Author) where
-    toJSON (ExAuthor author) = object
-        [ "class" .= String "Author"
-        , "id" .= authorId author
-        , "name" .= authorName author
-        , "description" .= authorDescription author
-        ]
-    toEncoding (ExAuthor author) = pairs $ mconcat
-        [ "class" .= String "Author"
-        , "id" .= authorId author
-        , "name" .= authorName author
-        , "description" .= authorDescription author
-        ]
 
 data instance Expanded Category = ExCategory
     (Reference Category) Text.Text (Maybe (Expanded Category))
@@ -263,26 +187,6 @@ instance Retrievable Category where
         case qret of
             Right [category] -> Just <$> expand' cex category
             _ -> return Nothing
-
-instance ToJSON (Expanded Category) where
-    toJSON (ExCategory ref name parent) = object
-        [ "class" .= String "Category"
-        , "id" .= ref
-        , "name" .= name
-        , "parent" .= parent
-        ]
-    toEncoding (ExCategory ref name parent) = pairs $ mconcat
-        [ "class" .= String "Category"
-        , "id" .= ref
-        , "name" .= name
-        , "parent" .= parent
-        ]
-
-instance ToJSON PublicationStatus where
-    toJSON (PublishAt time) = toJSON time
-    toJSON NonPublished = Null
-    toEncoding (PublishAt time) = toEncoding time
-    toEncoding NonPublished = Encoding.null_
 
 data instance Expanded Article = ExArticle
     (Reference Article)
@@ -319,45 +223,11 @@ instance Retrievable Article where
             Right [article] -> Just <$> expand' cex article
             _ -> return Nothing
 
-instance ToJSON (Expanded Article) where
-    toJSON (ExArticle ref version mAuthor name pubStat mCategory tags) = object
-        [ "class" .= String "Article"
-        , "id" .= ref
-        , "version" .= version
-        , "author" .= mAuthor
-        , "name" .= name
-        , "publicationStatus" .= pubStat
-        , "category" .= mCategory
-        , "tags" .= tags
-        ]
-    toEncoding (ExArticle ref version mAuthor name pubStat mCategory tags) = pairs $ mconcat
-        [ "class" .= String "Article"
-        , "id" .= ref
-        , "version" .= version
-        , "author" .= mAuthor
-        , "name" .= name
-        , "publicationStatus" .= pubStat
-        , "category" .= mCategory
-        , "tags" .= tags
-        ]
-
 data instance Expanded Tag = ExTag Tag
     deriving (Show, Eq)
 
 instance Expandable Tag where
     expand' _ u = return $ ExTag u
-
-instance ToJSON (Expanded Tag) where
-    toJSON (ExTag tag) = object
-        [ "class" .= String "Tag"
-        , "id" .= tagId tag
-        , "name" .= tagName tag
-        ]
-    toEncoding (ExTag tag) = pairs $ mconcat
-        [ "class" .= String "Tag"
-        , "id" .= tagId tag
-        , "name" .= tagName tag
-        ]
 
 data instance Expanded Comment = ExComment
     (Reference Comment)
@@ -379,26 +249,6 @@ instance Expandable Comment where
             (commentText comment)
             (commentDate comment)
             (commentEditDate comment)
-
-instance ToJSON (Expanded Comment) where
-    toJSON (ExComment ref mArticle mUser text date editDate) = object
-        [ "class" .= String "Comment"
-        , "id" .= ref
-        , "article" .= mArticle
-        , "user" .= mUser
-        , "text" .= text
-        , "date" .= date
-        , "editDate" .= editDate
-        ]
-    toEncoding (ExComment ref mArticle mUser text date editDate) = pairs $ mconcat
-        [ "class" .= String "Comment"
-        , "id" .= ref
-        , "article" .= mArticle
-        , "user" .= mUser
-        , "text" .= text
-        , "date" .= date
-        , "editDate" .= editDate
-        ]
 
 data instance Expanded FileInfo = ExFileInfo
     (Reference FileInfo)
@@ -425,30 +275,6 @@ instance Expandable FileInfo where
             mUserEx
             (expandFileName approot finfo)
 
-instance ToJSON (Expanded FileInfo) where
-    toJSON (ExFileInfo ref@(Reference refBytes) name mimeType uploadDate mArticle index mUser link) = object
-        [ "class" .= String "File"
-        , "id" .= ref
-        , "name" .= name
-        , "mimeType" .= mimeType
-        , "uploadDate" .= uploadDate
-        , "article" .= mArticle
-        , "index" .= index
-        , "user" .= mUser
-        , "link" .= link
-        ]
-    toEncoding (ExFileInfo ref@(Reference refBytes) name mimeType uploadDate mArticle index mUser link) = pairs $ mconcat
-        [ "class" .= String "File"
-        , "id" .= ref
-        , "name" .= name
-        , "mimeType" .= mimeType
-        , "uploadDate" .= uploadDate
-        , "article" .= mArticle
-        , "index" .= index
-        , "user" .= mUser
-        , "link" .= link
-        ]
-
 data UploadStatus = UploadStatus Text.Text (Either ErrorMessage FileInfo)
 
 data instance Expanded UploadStatus = ExUploadStatus
@@ -460,40 +286,5 @@ instance Expandable UploadStatus where
         Left errm -> return $ ExUploadStatus pname (Left errm)
         Right finfo -> ExUploadStatus pname . Right <$> expand' cex finfo
 
-instance ToJSON (Expanded UploadStatus) where
-    toJSON (ExUploadStatus pname status) = case status of
-        Left err -> object
-            [ "param" .= pname
-            , "error" .= err
-            ]
-        Right finfo -> object
-            [ "param" .= pname
-            , "ok" .= finfo
-            ]
-    toEncoding (ExUploadStatus pname status) = case status of
-        Left err -> pairs $ mconcat
-            [ "param" .= pname
-            , "error" .= err
-            ]
-        Right finfo -> pairs $ mconcat
-            [ "param" .= pname
-            , "ok" .= finfo
-            ]
-
 expandFileName :: Text.Text -> FileInfo -> Text.Text
-expandFileName approot finfo = approot <> "/get/" <> (toHexText $ getReference $ fileId finfo) <> "/" <> fileName finfo
-
-instance ToJSON (Reference a) where
-    toJSON (Reference "") = String "-"
-    toJSON (Reference refBytes) = String $ toHexText refBytes
-    toEncoding (Reference "") = Encoding.text "-"
-    toEncoding (Reference refBytes) = Encoding.unsafeToEncoding $
-        "\"" <> Builder.byteStringHex refBytes <> "\""
-
-instance ToJSON (Version a) where
-    toJSON (Version v) = String $ toHexText v
-    toEncoding (Version v) = Encoding.unsafeToEncoding $
-        "\"" <> Builder.byteStringHex v <> "\""
-
-toHexText :: BS.ByteString -> Text.Text
-toHexText = Text.pack . toHex . BS.unpack
+expandFileName approot finfo = approot <> "/get/" <> (toBase64Text $ getReference $ fileId finfo) <> "/" <> fileName finfo

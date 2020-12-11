@@ -44,8 +44,8 @@ import Data.Time.Clock
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BSChar
 import qualified Data.Text as Text
+import SN.Data.Base64
 import SN.Data.HList
-import SN.Data.Hex
 
 newtype TableName = TableName String
 deriving instance Show TableName
@@ -76,7 +76,7 @@ instance Show (PrimValue a) where
     showsPrec d (VInt x) = showParen (d > 10) $ showString "VInt " . showsPrec 11 x
     showsPrec d (VBool x) = showParen (d > 10) $ showString "VBool " . showsPrec 11 x
     showsPrec d (VText x) = showParen (d > 10) $ showString "VText " . showsPrec 11 x
-    showsPrec d (VBlob x) = showParen (d > 10) $ showString "VBlob " . showHex 11 (BS.unpack x)
+    showsPrec d (VBlob x) = showParen (d > 10) $ showString "VBlob " . showBase64 11 x
     showsPrec d (VTime x) = showParen (d > 10) $ showString "VInt " . showsPrec 11 x
     showsPrec _ VTPosInf = showString "VTPosInf"
     showsPrec _ VTNegInf = showString "VTNegInf"

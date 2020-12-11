@@ -4,7 +4,7 @@ cabal-version: 1.12
 --
 -- see: https://github.com/sol/hpack
 --
--- hash: bfeedcafbe8954a3b402491f586cc09f1fce2d22e76ce1210397415e3915b0b8
+-- hash: 950476f11eaefea455ee5815a575871bd74ef29bd9625df93367a8d2f85d320c
 
 name:           SomeNews
 version:        0.1.0.0
@@ -27,18 +27,22 @@ source-repository head
 
 library
   exposed-modules:
-      Lib
       SN.Control.Monad.Cont
       SN.Control.ResourcePool
+      SN.Data.Base64
       SN.Data.HEq1
-      SN.Data.Hex
       SN.Data.HList
       SN.Data.MinHeap
       SN.Data.PolyMap
       SN.Data.TimedHashmap
       SN.Ground
+      SN.Ground.Config
+      SN.Ground.Interface
+      SN.Ground.ListView
       SN.Ground.Schema
+      SN.Ground.Types
       SN.Logger
+      SN.Logger.Config
       SN.Medium
       SN.Medium.ActionTicket
       SN.Medium.Config
@@ -52,6 +56,7 @@ library
       SN.Sql.Query
       SN.Sql.Query.Render
       SN.Surface
+      SN.Surface.EncodeResponse
   other-modules:
       Paths_SomeNews
   hs-source-dirs:
@@ -62,6 +67,7 @@ library
     , ansi-terminal
     , array
     , base
+    , base64
     , bytestring
     , containers
     , cryptonite
@@ -87,6 +93,7 @@ library
     , wai
     , wai-extra
     , warp
+    , warp-tls
     , yaml
   default-language: Haskell2010
 
@@ -104,6 +111,7 @@ executable SomeNews-exe
     , ansi-terminal
     , array
     , base
+    , base64
     , bytestring
     , containers
     , cryptonite
@@ -129,6 +137,7 @@ executable SomeNews-exe
     , wai
     , wai-extra
     , warp
+    , warp-tls
     , yaml
   default-language: Haskell2010
 
@@ -137,7 +146,6 @@ test-suite SomeNews-test
   main-is: Spec.hs
   other-modules:
       SN.Control.Parallel
-      SN.Data.HexSpec
       SN.Data.Map
       SN.Data.Multimap
       SN.Data.Relmap
@@ -157,6 +165,7 @@ test-suite SomeNews-test
     , ansi-terminal
     , array
     , base
+    , base64
     , bytestring
     , containers
     , cryptonite
@@ -182,5 +191,6 @@ test-suite SomeNews-test
     , wai
     , wai-extra
     , warp
+    , warp-tls
     , yaml
   default-language: Haskell2010

@@ -54,7 +54,7 @@ data Ground = Ground
     }
 
 data Action a where
-    UserCreate :: Text.Text -> Text.Text -> Password -> Action User
+    UserCreate :: Text.Text -> Text.Text -> Password -> Bool -> Action User
     UserCheckPassword :: Reference User -> Password -> Action ()
     UserSetName :: Reference User -> Text.Text -> Text.Text -> Action ()
     UserSetIsAdmin :: Reference User -> Bool -> Action ()

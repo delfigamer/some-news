@@ -225,15 +225,12 @@ generateUsers ground sampleSize = do
         name <- generate $ randomText
         surname <- generate $ randomText
         password <- generate $ randomWithin 0 100 >>= randomByteString
-        user <- assertRight =<< groundPerform ground (UserCreate name surname (Password password))
+        isAdmin <- generate $ randomBool
+        user <- assertRight =<< groundPerform ground (UserCreate name surname (Password password) isAdmin)
         userName user `shouldBe` name
         userSurname user `shouldBe` surname
-        userIsAdmin user `shouldBe` False
-        isAdmin <- generate $ randomBool
-        when isAdmin $
-            assertRight =<< groundPerform ground (UserSetIsAdmin (userId user) True)
-        Map.insert userTable (userId user) $
-            (user {userIsAdmin = isAdmin}, password)
+        userIsAdmin user `shouldBe` isAdmin
+        Map.insert userTable (userId user) (user, password)
     return userTable
 
 validateUsers

@@ -3,31 +3,36 @@ module SN.Ground.Config
     , defaultGroundConfig
     ) where
 
+import Data.Aeson
+
 data GroundConfig = GroundConfig
-    { groundConfigUserIdLength :: Int
-    , groundConfigAccessKeyIdLength :: Int
-    , groundConfigAccessKeyTokenLength :: Int
-    , groundConfigAuthorIdLength :: Int
-    , groundConfigCategoryIdLength :: Int
-    , groundConfigArticleIdLength :: Int
-    , groundConfigArticleVersionLength :: Int
-    , groundConfigTagIdLength :: Int
-    , groundConfigCommentIdLength :: Int
-    , groundConfigFileIdLength :: Int
-    , groundConfigTransactionRetryCount :: Int
+    { groundConfigUserIdLength :: !Int
+    , groundConfigAccessKeyIdLength :: !Int
+    , groundConfigAccessKeyTokenLength :: !Int
+    , groundConfigAuthorIdLength :: !Int
+    , groundConfigCategoryIdLength :: !Int
+    , groundConfigArticleIdLength :: !Int
+    , groundConfigArticleVersionLength :: !Int
+    , groundConfigTagIdLength :: !Int
+    , groundConfigCommentIdLength :: !Int
+    , groundConfigFileIdLength :: !Int
+    , groundConfigTransactionRetryCount :: !Int
     }
 
+instance FromJSON GroundConfig where
+    parseJSON = withObject "Ground.Config" $ \v -> do
+        GroundConfig
+            <$> v .:? "userIdLength" .!= 18
+            <*> v .:? "accessKeyIdLength" .!= 18
+            <*> v .:? "accessKeyTokenLength" .!= 36
+            <*> v .:? "authorIdLength" .!= 18
+            <*> v .:? "categoryIdLength" .!= 6
+            <*> v .:? "articleIdLength" .!= 18
+            <*> v .:? "articleVersionLength" .!= 18
+            <*> v .:? "tagIdLength" .!= 6
+            <*> v .:? "commentIdLength" .!= 18
+            <*> v .:? "fileIdLength" .!= 18
+            <*> v .:? "transactionRetryCount" .!= 1000
+
 defaultGroundConfig :: GroundConfig
-defaultGroundConfig = GroundConfig
-    { groundConfigUserIdLength = 16
-    , groundConfigAccessKeyIdLength = 16
-    , groundConfigAccessKeyTokenLength = 48
-    , groundConfigAuthorIdLength = 16
-    , groundConfigCategoryIdLength = 4
-    , groundConfigArticleIdLength = 16
-    , groundConfigArticleVersionLength = 16
-    , groundConfigTagIdLength = 4
-    , groundConfigCommentIdLength = 16
-    , groundConfigFileIdLength = 16
-    , groundConfigTransactionRetryCount = 1000
-    }
+Success defaultGroundConfig = fromJSON $ Object mempty

@@ -57,7 +57,7 @@ import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text
 import qualified Data.Text.Encoding.Error as Text
 import SN.Control.Monad.Cont
-import SN.Data.Hex
+import SN.Data.Base64
 import SN.Ground.Interface
 import SN.Logger
 import SN.Medium.ActionTicket
@@ -207,22 +207,18 @@ passwordParser = fmap Password
 
 referenceParser :: Maybe BS.ByteString -> Maybe (Reference a)
 referenceParser Nothing = Nothing
-referenceParser (Just "-") = Just $ Reference ""
-referenceParser (Just bs) = parseHex (BS.unpack bs) $ \idBytes rest -> do
-    case rest of
-        [] -> Just $ Reference $ BS.pack idBytes
-        _ -> Nothing
+referenceParser (Just ".") = Just $ Reference ""
+referenceParser (Just bs) = Reference <$> fromBase64 bs
 
 accessKeyParser :: Maybe BS.ByteString -> Maybe AccessKey
 accessKeyParser Nothing = Nothing
-accessKeyParser (Just bs) = parseHex (BS.unpack bs) $ \idBytes rest1 -> do
-    case rest1 of
-        {- 58 == fromEnum ':' -}
-        58 : tokenChars -> parseHex tokenChars $ \tokenBytes rest2 -> do
-            case rest2 of
-                [] -> Just $ AccessKey (Reference $ BS.pack idBytes) (BS.pack tokenBytes)
-                _ -> Nothing
-        _ -> Nothing
+accessKeyParser (Just bs) = do
+    {- 58 == fromEnum ':' -}
+    let (left, mid) = BS.break (== 58) bs
+    (58, right) <- BS.uncons mid
+    idBytes <- fromBase64 left
+    tokenBytes <- fromBase64 right
+    Just $ AccessKey (Reference idBytes) tokenBytes
 
 sortOrderParser
     :: [(BSChar.ByteString, ViewOrder a)]

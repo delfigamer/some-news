@@ -26,6 +26,7 @@ dependencies:
 - ansi-terminal
 - array
 - base
+- base64
 - bytestring
 - containers
 - cryptonite
@@ -51,6 +52,7 @@ dependencies:
 - wai
 - wai-extra
 - warp
+- warp-tls
 - yaml
 
 library:

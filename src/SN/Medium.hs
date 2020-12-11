@@ -12,6 +12,7 @@ module SN.Medium
     , Request(..)
     , RequestData(..)
     , MediumConfig(..)
+    , defaultMediumConfig
     , Medium(..)
     , withMedium
     ) where
@@ -25,7 +26,7 @@ import qualified Data.HashMap.Strict as Map
 import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text
 import qualified Data.Text.Encoding.Error as Text
-import SN.Data.Hex
+import SN.Data.Base64
 import SN.Ground.Interface
 import SN.Logger
 import SN.Medium.Internal
@@ -85,7 +86,7 @@ requestDispatch ["users", "create"] = simpleRequest $ do
     minPasswordLength <- mediumConfigMinPasswordLength . contextConfig <$> askContext
     when (BS.length (getPassword newPassword) < minPasswordLength) $
         exitError $ ErrInvalidParameter "newPassword"
-    user <- performRequire $ UserCreate name surname newPassword
+    user <- performRequire $ UserCreate name surname newPassword False
     exitOk =<< expand user
 requestDispatch ["users", "info"] = simpleRequest $ do
     userRef <- getParam "user" referenceParser
@@ -223,15 +224,15 @@ requestDispatch ["files", "upload"] = simpleRequest $ do
     void $ assertArticleAccess (userId myUser) articleRef
     Reference ticketKey <- createActionTicket $ UploadTicket articleRef (userId myUser)
     approot <- rqdataApproot <$> ask
-    let uri = approot <> "/upload/" <> toHexText ticketKey
+    let uri = approot <> "/upload/" <> toBase64Text ticketKey
     exitRespond $ Response StatusOk $ ResponseBodyFollow uri
 
 requestDispatch ["upload", ticketParam] = \case
     SimpleRequest _ -> exitError ErrInvalidRequest
     UploadRequest body -> do
-        ticketRef <- parseHex (Text.unpack ticketParam) $ \idBytes rest -> case rest of
-            [] -> return $ Reference $ BS.pack idBytes
-            _ -> exitInvalidTicket
+        ticketRef <- case fromBase64Text ticketParam of
+            Just idBytes -> return $ Reference idBytes
+            Nothing -> exitInvalidTicket
         mTicket <- lookupActionTicket ticketRef
         case mTicket of
             Just (UploadTicket articleRef userRef) -> do

@@ -80,7 +80,7 @@ withSqlGround config logger db onFail onSuccess = do
     resultLogLevel _ = LevelDebug
 
 sqlGroundPerform :: Action a -> SqlGround -> (Show a => Either GroundError a -> IO r) -> IO r
-sqlGroundPerform (UserCreate name surname password) = runTransaction Db.ReadCommited $ do
+sqlGroundPerform (UserCreate name surname password isAdmin) = runTransaction Db.ReadCommited $ do
     ref <- Reference <$> generateBytes groundConfigUserIdLength
     joinDate <- currentTime
     salt <- generateBytes (const 16)
@@ -98,11 +98,11 @@ sqlGroundPerform (UserCreate name surname password) = runTransaction Db.ReadComm
             :/ Value name
             :/ Value surname
             :/ Value joinDate
-            :/ Value False
+            :/ Value isAdmin
             :/ Value salt
             :/ Value (hashPassword salt password)
             :/ E))
-        (parseInsert $ User ref name surname joinDate False)
+        (parseInsert $ User ref name surname joinDate isAdmin)
 sqlGroundPerform (UserCheckPassword userRef password) = runTransaction Db.ReadCommited $ do
     (salt, hash1) <- doQuery
         (Select ["sn_users"]

@@ -1,7 +1,7 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 
 module SN.Surface
-    (
+    ( surfaceApplication
     ) where
 
 import Control.Exception
@@ -23,11 +23,12 @@ import qualified Network.Wai.Middleware.Approot as Approot
 import qualified Network.Wai.Handler.Warp as Warp
 import qualified Network.Wai.Parse as Parse
 import SN.Logger
+import SN.Surface.EncodeResponse
 import qualified SN.Medium as Medium
 import qualified SN.Medium.Response as Medium
 
-wApplication :: Logger -> Medium.Medium -> Wai.Application
-wApplication logger medium = Approot.fromRequest $ \request respond -> do
+surfaceApplication :: Logger -> Medium.Medium -> Wai.Application
+surfaceApplication logger medium = Approot.fromRequest $ \request respond -> do
     wApplicationInner logger medium request respond
         `catches`
         [ Handler $ \(ex :: SomeException) -> do
@@ -100,7 +101,7 @@ transformResponse (Medium.Response medStatus medBody) = Wai.responseLBS
     ]
     content
   where
-    content = encode medBody
+    content = Builder.toLazyByteString $ encodeResponseBody medBody
     waiStatus = case medStatus of
         Medium.StatusOk -> Http.ok200
         Medium.StatusBadRequest -> Http.badRequest400
