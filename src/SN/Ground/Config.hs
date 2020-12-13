@@ -11,6 +11,7 @@ data GroundConfig = GroundConfig
     , groundConfigAccessKeyTokenLength :: !Int
     , groundConfigAuthorIdLength :: !Int
     , groundConfigCategoryIdLength :: !Int
+    , groundConfigCategoryAncestryLimit :: !Int
     , groundConfigArticleIdLength :: !Int
     , groundConfigArticleVersionLength :: !Int
     , groundConfigTagIdLength :: !Int
@@ -27,6 +28,7 @@ instance FromJSON GroundConfig where
             <*> v .:? "accessKeyTokenLength" .!= 36
             <*> v .:? "authorIdLength" .!= 18
             <*> v .:? "categoryIdLength" .!= 6
+            <*> v .:? "categoryAncestryLimit" .!= 100
             <*> v .:? "articleIdLength" .!= 18
             <*> v .:? "articleVersionLength" .!= 18
             <*> v .:? "tagIdLength" .!= 6

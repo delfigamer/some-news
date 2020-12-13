@@ -17,22 +17,21 @@ data AsyncResult a
     | Done a
 
 withAsync :: IO a -> (STM (AsyncResult a) -> IO b) -> IO b
-withAsync async inner = bracket
-    (do
-        tvar <- newTVarIO Pending
-        tid <- forkIOWithUnmask $ \unmask -> do
-            r <- try $ unmask async
-            atomically $ writeTVar tvar $ either Error Done r
-        return (readTVar tvar, tid))
-    (\(poll, tid) -> uninterruptibleMask_ $ do
-        killThread tid
-        atomically $ do
-            ar <- poll
-            case ar of
-                Pending -> retry
-                _ -> return ())
-    (\(poll, _) -> do
-        inner poll)
+withAsync async inner = uninterruptibleMask $ \restore -> do
+    tvar <- newTVarIO Pending
+    tid <- forkIOWithUnmask $ \unmask -> do
+        r <- try $ unmask async
+        atomically $ writeTVar tvar $ either Error Done r
+    ir <- try $ restore $ inner $ readTVar tvar
+    killThread tid
+    atomically $ do
+        ar <- readTVar tvar
+        case ar of
+            Pending -> retry
+            _ -> return ()
+    case ir of
+        Left ex -> throwIO (ex :: SomeException)
+        Right r -> return r
 
 parallelAp :: IO (a -> b) -> IO a -> IO b
 parallelAp ioF ioX = do

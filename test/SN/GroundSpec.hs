@@ -53,6 +53,15 @@ instance FromJSON TestConfig where
             <$> v .: "database"
             <*> v .: "sample-size"
 
+fst3 :: (a, b, c) -> a
+fst3 (x, _, _) = x
+
+snd3 :: (a, b, c) -> b
+snd3 (_, x, _) = x
+
+thr3 :: (a, b, c) -> c
+thr3 (_, _, x) = x
+
 randomText :: Gen Text.Text
 randomText = fmap Text.pack $ randomPrintableString =<< randomWithin 4 32
 
@@ -196,20 +205,21 @@ testGroundConfig = GroundConfig
     , groundConfigAccessKeyTokenLength = 12
     , groundConfigAuthorIdLength = 13
     , groundConfigCategoryIdLength = 14
+    , groundConfigCategoryAncestryLimit = 3
     , groundConfigArticleIdLength = 15
     , groundConfigArticleVersionLength = 16
     , groundConfigTagIdLength = 17
     , groundConfigCommentIdLength = 18
     , groundConfigFileIdLength = 19
-    , groundConfigTransactionRetryCount = 1000000
+    , groundConfigTransactionRetryCount = maxBound
     }
 
 clearGround :: String -> (Int -> Ground -> IO ()) -> SpecWith [TestConfig]
 clearGround name body = do
     it name $ \testConfList -> do
-        forM_ testConfList $ \testConf -> do
-            let logfile = ".test-" ++ name ++ ".html"
-            withHtmlLogger logfile $ \logger -> do
+        let logfile = ".test-" ++ name ++ ".html"
+        withHtmlLogger logfile $ \logger -> do
+            forM_ testConfList $ \testConf -> do
                 Db.withDatabase (databaseConfig testConf) logger $ \db -> do
                     clearDatabase db
                     upgradeSchema logger db `shouldReturn` Right ()
@@ -547,20 +557,27 @@ generateCategories
     -> IO (Tree.Tree (Reference Category) Text.Text)
 generateCategories ground sampleSize = do
     categoryTree <- Tree.new
-    parallelFor_ [1 .. sampleSize] $ \_ -> do
-        prevCats <- Tree.keys categoryTree
-        name <- generate $ randomText
-        parent <- generate $ do
-            x <- randomWithin 0 (length prevCats)
-            y <- randomWithin 0 x
-            case y of
-                0 -> return $ ""
-                _ -> return $ prevCats !! (y - 1)
-        category <- assertRight =<< groundPerform ground (CategoryCreate name parent)
-        categoryName category `shouldBe` name
-        categoryParent category `shouldBe` parent
-        Tree.include categoryTree (categoryId category) name parent
+    let levelCount = 2 * (ceiling $ sqrt $ fromIntegral sampleSize)
+    generateDownward levelCount sampleSize categoryTree $ return ("", "")
     return categoryTree
+  where
+    generateDownward levelCount totalCount categoryTree randomParent
+        | levelCount <= 0 || totalCount <= 0 = return ()
+        | otherwise = do
+            let currentCount = totalCount `div` levelCount
+            cats <- parallelFor [1 .. currentCount] $ \_ -> do
+                name <- generate $ randomText
+                (parentRef, parentName) <- generate $ randomParent
+                category <- assertRight =<< groundPerform ground (CategoryCreate name parentRef)
+                categoryName category `shouldBe` name
+                categoryParent category `shouldBe` parentRef
+                categoryParentName category `shouldBe` parentName
+                Tree.include categoryTree (categoryId category) name parentRef
+                return (categoryId category, name)
+            let nextRandomParent = case cats of
+                    [] -> randomParent
+                    _ -> chooseOne cats
+            generateDownward (levelCount - 1) (totalCount - currentCount) categoryTree nextRandomParent
 
 minceCategories
     :: Ground -> Int
@@ -569,35 +586,32 @@ minceCategories
 minceCategories ground sampleSize categoryTree = do
     validateCategories ground categoryTree
     do
-        categoryList <- map toCategory <$> Tree.toList categoryTree
+        categoryList <- Tree.toList categoryTree
         toAlter <- generate $ chooseFrom (sampleSize `div` 5) categoryList
-        parallelFor_ toAlter $ \category -> do
+        parallelFor_ toAlter $ \(categoryRef, _, _) -> do
             name <- generate $ randomText
-            assertRight =<< groundPerform ground (CategorySetName (categoryId category) name)
-            Tree.adjust categoryTree (categoryId category) $ \_ -> name
+            assertRight =<< groundPerform ground (CategorySetName categoryRef name)
+            Tree.adjust categoryTree categoryRef $ \_ -> name
         validateCategories ground categoryTree
     do
-        categoryList <- map toCategory <$> Tree.toList categoryTree
+        categoryList <- Tree.toList categoryTree
         toAlter <- generate $ chooseFrom (sampleSize `div` 5) categoryList
-        stableCategories <- map toCategory <$>
-            Tree.withoutSubtreesOf categoryTree (map categoryId toAlter)
-        parallelFor_ toAlter $ \category -> do
+        stableCategories <- Tree.withoutSubtreesOf categoryTree (map fst3 toAlter)
+        parallelFor_ toAlter $ \(categoryRef, _, _) -> do
             parent <- generate $ do
                 b <- randomBool
                 if b
                     then return $ ""
-                    else categoryId <$> chooseOne stableCategories
-            assertRight =<< groundPerform ground (CategorySetParent (categoryId category) parent)
-            _ <- Tree.trySetParent categoryTree (categoryId category) parent
-            return ()
+                    else fst3 <$> chooseOne stableCategories
+            assertRight =<< groundPerform ground (CategorySetParent categoryRef parent)
+            void $ Tree.trySetParent categoryTree categoryRef parent
         validateCategories ground categoryTree
     do
-        categoryList <- map toCategory <$> Tree.toList categoryTree
+        categoryList <- Tree.toList categoryTree
         toDelete <- generate $ chooseFrom (sampleSize `div` 5) categoryList
-        parallelFor_ toDelete $ \category -> do
-            assertRight =<< groundPerform ground (CategoryDelete (categoryId category))
-            _ <- Tree.exclude categoryTree (categoryId category)
-            return ()
+        parallelFor_ toDelete $ \(categoryRef, _, _) -> do
+            assertRight =<< groundPerform ground (CategoryDelete categoryRef)
+            void $ Tree.exclude categoryTree categoryRef
         validateCategories ground categoryTree
     do
         badRefs <- sampleBadRefs $ Tree.member categoryTree
@@ -608,8 +622,12 @@ minceCategories ground sampleSize categoryTree = do
             groundPerform ground (CategoryList (ListView 0 1 [FilterCategoryId ref] []))
                 `shouldReturn`
                 Right []
+            groundPerform ground (CategoryAncestry ref)
+                `shouldReturn`
+                Right []
     do
-        categoryList <- map toCategory <$> Tree.toList categoryTree
+        categoryTupList <- Tree.toList categoryTree
+        categoryList <- parallelFor categoryTupList $ resolveCategory categoryTree
         parallelFor_ categoryList $ \category -> do
             BS.length (getReference $ categoryId category) `shouldBe` groundConfigCategoryIdLength testGroundConfig
             groundPerform ground (CategoryList (ListView 0 1 [FilterCategoryId (categoryId category)] []))
@@ -619,11 +637,13 @@ minceCategories ground sampleSize categoryTree = do
             `shouldReturn`
             Right (sortOn (\cat -> (categoryName cat, categoryId cat)) categoryList)
         parallelFor_ categoryList $ \category -> do
-            strictSubcats <- map toCategory <$> Tree.childrenList categoryTree (categoryId category)
+            strictTupSubcats <- Tree.childrenList categoryTree (categoryId category)
+            strictSubcats <- parallelFor strictTupSubcats $ resolveCategory categoryTree
             groundPerform ground (CategoryList (ListView 0 maxBound [FilterCategoryParentId (categoryId category)] []))
                 `shouldReturn`
                 Right (sortOn categoryId strictSubcats)
-            transitiveSubcats <- map toCategory <$> Tree.subtreeList categoryTree (categoryId category)
+            transitiveTupSubcats <- Tree.subtreeList categoryTree (categoryId category)
+            transitiveSubcats <- parallelFor transitiveTupSubcats $ resolveCategory categoryTree
             groundPerform ground (CategoryList (ListView 0 maxBound [FilterCategoryTransitiveParentId (categoryId category)] []))
                 `shouldReturn`
                 Right (sortOn categoryId transitiveSubcats)
@@ -634,8 +654,32 @@ minceCategories ground sampleSize categoryTree = do
             parallelFor_ someSubcats $ \subcat -> do
                 groundPerform ground (CategorySetParent (categoryId category) (categoryId subcat))
                     `shouldReturn`
-                    Left InvalidRequestError
+                    Left CyclicReferenceError
+            ancestry <- take (groundConfigCategoryAncestryLimit testGroundConfig) <$> categoryAncestry (categoryId category)
+            groundPerform ground (CategoryAncestry (categoryId category))
+                `shouldReturn`
+                Right ancestry
     return ()
+  where
+    categoryAncestry "" = return []
+    categoryAncestry ref = do
+        (_, name, parent) <- Tree.lookup' categoryTree ref
+        rest <- categoryAncestry parent
+        case rest of
+            [] -> return [Category ref name parent ""]
+            Category _ parentName _ _ : _ -> return $ Category ref name parent parentName : rest
+
+resolveCategory
+    :: Tree.Tree (Reference Category) Text.Text
+    -> (Reference Category, Text.Text, Reference Category)
+    -> IO Category
+resolveCategory categoryTree (categoryRef, name, parentRef) = do
+    parentName <- case parentRef of
+        "" -> return ""
+        _ -> do
+            (_, parentName, _) <- Tree.lookup' categoryTree parentRef
+            return parentName
+    return $ Category categoryRef name parentRef parentName
 
 validateCategories
     :: HasCallStack
@@ -643,13 +687,17 @@ validateCategories
     -> Tree.Tree (Reference Category) Text.Text
     -> IO ()
 validateCategories ground categoryTree = do
-    categoryList <- sortOn categoryId . map toCategory <$> Tree.toList categoryTree
+    categoryTupList <- sortOn fst3 <$> Tree.toList categoryTree
+    categoryList <- parallelFor categoryTupList $ \(ref, name, parentRef) -> do
+        parentName <- case parentRef of
+            "" -> return ""
+            _ -> do
+                (_, parentName, _) <- Tree.lookup' categoryTree parentRef
+                return parentName
+        return $ Category ref name parentRef parentName
     groundPerform ground (CategoryList (ListView 0 maxBound [] []))
         `shouldReturn`
         Right categoryList
-
-toCategory :: (Reference Category, Text.Text, Reference Category) -> Category
-toCategory (ref, name, parent) = Category ref name parent
 
 generateArticles
     :: Ground -> Int
@@ -795,13 +843,13 @@ minceArticles ground sampleSize userTable authorTable userAuthorConnSet category
                 else return ()
         validateArticles ground articleTable
     do
-        categoryList <- map toCategory <$> Tree.toList categoryTree
-        categoriesToDelete <- generate $ chooseFrom (sampleSize `div` 5) categoryList
-        parallelFor_ categoriesToDelete $ \category -> do
-            assertRight =<< groundPerform ground (CategoryDelete (categoryId category))
-            Just parentRef <- Tree.exclude categoryTree (categoryId category)
+        categoryRefList <- Tree.keys categoryTree
+        categoriesToDelete <- generate $ chooseFrom (sampleSize `div` 5) categoryRefList
+        parallelFor_ categoriesToDelete $ \categoryRef -> do
+            assertRight =<< groundPerform ground (CategoryDelete categoryRef)
+            Just parentRef <- Tree.exclude categoryTree categoryRef
             Map.modify articleTable $ \(article, text) ->
-                if articleCategory article == categoryId category
+                if articleCategory article == categoryRef
                     then Just (article {articleCategory = parentRef}, text)
                     else Nothing
         validateArticles ground articleTable
@@ -846,7 +894,7 @@ minceArticles ground sampleSize userTable authorTable userAuthorConnSet category
                         `shouldReturn`
                         Right (filter (\article -> articleCategory article == "") articleInfoList)
                 _ -> do
-                    subcatRefs <- map (\(k, _, _) -> k) <$> Tree.subtreeList categoryTree categoryRef
+                    subcatRefs <- map fst3 <$> Tree.subtreeList categoryTree categoryRef
                     groundPerform ground (ArticleList (ListView 0 maxBound [FilterArticleTransitiveCategoryId categoryRef] []))
                         `shouldReturn`
                         Right (filter (\article -> articleCategory article `elem` subcatRefs) articleInfoList)

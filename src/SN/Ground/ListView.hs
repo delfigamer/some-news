@@ -175,10 +175,10 @@ data instance ViewOrder Category
     deriving (Show, Eq)
 
 instance ListableObject Category where
-    applyFilter (FilterCategoryId ref) = demandCondition (WhereIs ref "category_id")
-    applyFilter (FilterCategoryParentId ref) = demandCondition (WhereIs ref "category_parent_id")
-    applyFilter (FilterCategoryTransitiveParentId ref) = demandJoin (subcategoriesSource ref) [Where "category_id = subcategory_id"]
-    applyOrder OrderCategoryName = demandOrder "category_name"
+    applyFilter (FilterCategoryId ref) = demandCondition (WhereIs ref "cat1.category_id")
+    applyFilter (FilterCategoryParentId ref) = demandCondition (WhereIs ref "cat1.category_parent_id")
+    applyFilter (FilterCategoryTransitiveParentId ref) = demandJoin (subcategoriesSource ref) [Where "cat1.category_id = subcategory_id"]
+    applyOrder OrderCategoryName = demandOrder "cat1.category_name"
 
 data instance ViewFilter Article
     = FilterArticleId (Reference Article)

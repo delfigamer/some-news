@@ -21,6 +21,7 @@ ground:
   accessKeyTokenLength: 36
   authorIdLength: 18
   categoryIdLength: 6
+  categoryAncestryLimit: 100
   articleIdLength: 18
   articleVersionLength: 18
   tagIdLength: 6
@@ -33,7 +34,7 @@ meduim:
   maxPageLimit: 100
   minPasswordLength: 8
   maxAccessKeyCount: 100
-  ticketLength: 32
+  ticketLength: 30
   ticketLifetime: 300
   fileChunkSize: 0x10000 # 64 K
   maxFileSize: 0x1000000 # 16 M

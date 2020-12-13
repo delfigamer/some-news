@@ -122,6 +122,7 @@ data Category = Category
     { categoryId :: !(Reference Category)
     , categoryName :: !Text.Text
     , categoryParent :: !(Reference Category)
+    , categoryParentName :: !Text.Text
     }
     deriving (Show, Eq, Ord)
 

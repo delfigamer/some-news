@@ -86,22 +86,22 @@ sqlGroundPerform (UserCreate name surname password isAdmin) = runTransaction Db.
     salt <- generateBytes (const 16)
     doQuery
         (Insert "sn_users"
-            (  fReference "user_id"
-            :/ fText "user_name"
-            :/ fText "user_surname"
-            :/ fTime "user_join_date"
-            :/ fBool "user_is_admin"
-            :/ fBlob "user_password_salt"
-            :/ fBlob "user_password_hash"
-            :/ E)
-            (  Value ref
-            :/ Value name
-            :/ Value surname
-            :/ Value joinDate
-            :/ Value isAdmin
-            :/ Value salt
-            :/ Value (hashPassword salt password)
-            :/ E))
+            (fReference "user_id"
+                :/ fText "user_name"
+                :/ fText "user_surname"
+                :/ fTime "user_join_date"
+                :/ fBool "user_is_admin"
+                :/ fBlob "user_password_salt"
+                :/ fBlob "user_password_hash"
+                :/ E)
+            (Value ref
+                :/ Value name
+                :/ Value surname
+                :/ Value joinDate
+                :/ Value isAdmin
+                :/ Value salt
+                :/ Value (hashPassword salt password)
+                :/ E))
         (parseInsert $ User ref name surname joinDate isAdmin)
 sqlGroundPerform (UserCheckPassword userRef password) = runTransaction Db.ReadCommited $ do
     (salt, hash1) <- doQuery
@@ -232,11 +232,20 @@ sqlGroundPerform (AuthorSetOwnership authorRef userRef False) = runTransaction D
 
 sqlGroundPerform (CategoryCreate name parentRef) = runTransaction Db.ReadCommited $ do
     ref <- Reference <$> generateBytes groundConfigCategoryIdLength
+    parentName <- case parentRef of
+        "" -> return ""
+        _ -> doQuery
+            (Select ["sn_categories"]
+                (fText "category_name" :/ E)
+                [WhereIs parentRef "category_id"]
+                []
+                (RowRange 0 1))
+            (parseHead $ parseOne id)
     doQuery
         (Insert "sn_categories"
             (fReference "category_id" :/ fText "category_name" :/ fReference "category_parent_id" :/ E)
             (Value ref :/ Value name :/ Value parentRef :/ E))
-        (parseInsert $ Category ref name parentRef)
+        (parseInsert $ Category ref name parentRef parentName)
 sqlGroundPerform (CategorySetName categoryRef name) = runTransaction Db.ReadCommited $ do
     doQuery
         (Update "sn_categories"
@@ -266,7 +275,7 @@ sqlGroundPerform (CategorySetParent categoryRef parentRef) = runTransaction Db.S
             (RowRange 0 1))
         (\case
             [] -> Right ()
-            _ -> Left InvalidRequestError)
+            _ -> Left CyclicReferenceError)
     doQuery
         (Update "sn_categories"
             (fReference "category_parent_id" :/ E)
@@ -298,34 +307,71 @@ sqlGroundPerform (CategoryList view) = runTransaction Db.ReadCommited $ do
     time <- currentTime
     withView time view $ \tables filter order range _ -> do
         doQuery
-            (Select ("sn_categories" : tables)
-                (fReference "category_id" :/ fText "category_name" :/ fReference "category_parent_id" :/ E)
+            (Select
+                ("sn_categories AS cat1"
+                    : OuterJoinSource "sn_categories AS cat2" (WhereFieldIs "cat1.category_parent_id" "cat2.category_id")
+                    : tables)
+                (fReference "cat1.category_id"
+                    :/ fText "cat1.category_name"
+                    :/ fReference "cat1.category_parent_id"
+                    :/ fText "COALESCE(cat2.category_name, '')"
+                    :/ E)
                 filter
-                (order "category_id")
+                (order "cat1.category_id")
                 range)
             (parseList $ parseOne Category)
+sqlGroundPerform (CategoryAncestry categoryRef) = runTransaction Db.ReadCommited $ do
+    ancestryLimit <- fromIntegral . groundConfigCategoryAncestryLimit . groundConfig <$> ask
+    tups <- doQuery
+        (Select
+            [RecursiveSource "anc"
+                (fReference "anc_id" :/ fText "anc_name" :/ fReference "anc_parent_id" :/ fInt "anc_level" :/ E)
+                (Select
+                    ["sn_categories"]
+                    (fReference "category_id" :/ fText "category_name" :/ fReference "category_parent_id" :/ fInt "0" :/ E)
+                    [WhereIs categoryRef "category_id"]
+                    []
+                    (RowRange 0 maxBound))
+                (Select
+                    ["sn_categories", "anc"]
+                    (fReference "category_id" :/ fText "category_name" :/ fReference "category_parent_id" :/ fInt "anc_level + 1" :/ E)
+                    [WhereFieldIs "category_id" "anc_parent_id"]
+                    []
+                    (RowRange 0 maxBound))]
+            (fReference "anc_id" :/ fText "anc_name" :/ E)
+            []
+            [Asc "anc_level"]
+            (RowRange 0 (ancestryLimit + 1)))
+        (parseList $ parseOne (,))
+    return $ buildAncestry ancestryLimit tups
+  where
+    buildAncestry _ [] = []
+    buildAncestry limit ((ref, name) : rest)
+        | limit <= 0 = []
+        | (parentRef, parentName) : _ <- rest = Category ref name parentRef parentName : buildAncestry (limit - 1) rest
+        | otherwise = [Category ref name "" ""]
 
 sqlGroundPerform (ArticleCreate authorRef) = runTransaction Db.ReadCommited $ do
     articleRef <- Reference <$> generateBytes groundConfigArticleIdLength
     articleVersion <- Version <$> generateBytes groundConfigArticleVersionLength
     doQuery
         (Insert "sn_articles"
-            (  fReference "article_id"
-            :/ fVersion "article_version"
-            :/ fReference "article_author_id"
-            :/ fText "article_name"
-            :/ fText "article_text"
-            :/ fPublicationStatus "article_publication_date"
-            :/ fReference "article_category_id"
-            :/ E)
-            (  Value articleRef
-            :/ Value articleVersion
-            :/ Value authorRef
-            :/ Value ""
-            :/ Value ""
-            :/ Value NonPublished
-            :/ Value (Reference "")
-            :/ E))
+            (fReference "article_id"
+                :/ fVersion "article_version"
+                :/ fReference "article_author_id"
+                :/ fText "article_name"
+                :/ fText "article_text"
+                :/ fPublicationStatus "article_publication_date"
+                :/ fReference "article_category_id"
+                :/ E)
+            (Value articleRef
+                :/ Value articleVersion
+                :/ Value authorRef
+                :/ Value ""
+                :/ Value ""
+                :/ Value NonPublished
+                :/ Value (Reference "")
+                :/ E))
         (parseInsert $ Article articleRef articleVersion authorRef "" NonPublished (Reference ""))
 sqlGroundPerform (ArticleGetText articleRef) = runTransaction Db.ReadCommited $ do
     doQuery
@@ -393,13 +439,13 @@ sqlGroundPerform (ArticleList view) = runTransaction Db.ReadCommited $ do
     withView time view $ \tables filter order range time -> do
         doQuery
             (Select ("sn_articles" : tables)
-                (  fReference "article_id"
-                :/ fVersion "article_version"
-                :/ fReference "article_author_id"
-                :/ fText "article_name"
-                :/ fPublicationStatus "article_publication_date"
-                :/ fReference "article_category_id"
-                :/ E)
+                (fReference "article_id"
+                    :/ fVersion "article_version"
+                    :/ fReference "article_author_id"
+                    :/ fText "article_name"
+                    :/ fPublicationStatus "article_publication_date"
+                    :/ fReference "article_category_id"
+                    :/ E)
                 filter
                 (order "article_id")
                 range)
@@ -449,18 +495,18 @@ sqlGroundPerform (CommentCreate articleRef userRef text) = runTransaction Db.Rea
     commentDate <- currentTime
     doQuery
         (Insert "sn_comments"
-            (  fReference "comment_id"
-            :/ fReference "comment_article_id"
-            :/ fReference "comment_user_id"
-            :/ fText "comment_text"
-            :/ fTime "comment_date"
-            :/ E)
-            (  Value commentRef
-            :/ Value articleRef
-            :/ Value userRef
-            :/ Value text
-            :/ Value commentDate
-            :/ E))
+            (fReference "comment_id"
+                :/ fReference "comment_article_id"
+                :/ fReference "comment_user_id"
+                :/ fText "comment_text"
+                :/ fTime "comment_date"
+                :/ E)
+            (Value commentRef
+                :/ Value articleRef
+                :/ Value userRef
+                :/ Value text
+                :/ Value commentDate
+                :/ E))
         (parseInsert $ Comment commentRef articleRef userRef text commentDate Nothing)
 sqlGroundPerform (CommentSetText commentRef text) = runTransaction Db.ReadCommited $ do
     editDate <- currentTime
@@ -480,13 +526,13 @@ sqlGroundPerform (CommentList view) = runTransaction Db.ReadCommited $ do
     withView time view $ \tables filter order range time -> do
         doQuery
             (Select ("sn_comments" : tables)
-                (  fReference "comment_id"
-                :/ fReference "comment_article_id"
-                :/ fReference "comment_user_id"
-                :/ fText "comment_text"
-                :/ fTime "comment_date"
-                :/ fTime "comment_edit_date"
-                :/ E)
+                (fReference "comment_id"
+                    :/ fReference "comment_article_id"
+                    :/ fReference "comment_user_id"
+                    :/ fText "comment_text"
+                    :/ fTime "comment_date"
+                    :/ fTime "comment_edit_date"
+                    :/ E)
                 filter
                 (order "comment_id")
                 range)
@@ -519,14 +565,14 @@ sqlGroundPerform (FileList view) = runTransaction Db.ReadCommited $ do
     withView time view $ \tables filter order range time -> do
         doQuery
             (Select ("sn_files" : tables)
-                (  fReference "file_id"
-                :/ fText "file_name"
-                :/ fText "file_mimetype"
-                :/ fTime "file_upload_date"
-                :/ fReference "file_article_id"
-                :/ fInt "file_index"
-                :/ fReference "file_user_id"
-                :/ E)
+                (fReference "file_id"
+                    :/ fText "file_name"
+                    :/ fText "file_mimetype"
+                    :/ fTime "file_upload_date"
+                    :/ fReference "file_article_id"
+                    :/ fInt "file_index"
+                    :/ fReference "file_user_id"
+                    :/ E)
                 filter
                 (order "file_id")
                 range)
@@ -540,49 +586,59 @@ sqlGroundUpload
     -> Reference User
     -> (FileInfo -> IO (Upload r))
     -> IO (Either GroundError r)
-sqlGroundUpload ground name mimeType articleRef userRef uploader = do
-    tret <- Db.execute (groundDb ground) Db.ReadCommited $ do
-        uploadTime <- currentTime
-        fileRef <- (Reference <$> generateBytes groundConfigFileIdLength) `runReaderT` ground
-        maxIndexQret <- Db.query
-            (Select ["sn_files"]
-                (fInt "COALESCE(MAX(file_index), 0)" :/ E)
-                [WhereIs articleRef "file_article_id"]
-                []
-                (RowRange 0 1))
-        maxIndex <- case maxIndexQret of
-            [Just i :/ E] -> return i
-            _ -> Db.abort
-        {- since this transaction is relaxed, it's possible for multiple files to end up with the same (`article_id`, `index`) pair -}
-        {- this is fine -}
-        {- for identification, we use an independent `id` field, which is under a primary key constraint -}
-        {- for ordering, we always append an `id ASC` to the end of the "order by" clause, so it's still always deterministic -}
-        {- if the user isn't happy with whatever order the files turned out to be, they can always rearrange the indices later -}
-        let myIndex = maxIndex + 1
-        insertQret <- Db.query
-            (Insert "sn_files"
-                (  fReference "file_id"
-                :/ fText "file_name"
-                :/ fText "file_mimetype"
-                :/ fTime "file_upload_date"
-                :/ fReference "file_article_id"
-                :/ fInt "file_index"
-                :/ fReference "file_user_id"
-                :/ E)
-                (  Value fileRef
-                :/ Value name
-                :/ Value mimeType
-                :/ Value uploadTime
-                :/ Value articleRef
-                :/ Value myIndex
-                :/ Value userRef
-                :/ E))
-        unless insertQret $ Db.abort
-        driveUpload fileRef 0 $ uploader $ FileInfo fileRef name mimeType uploadTime articleRef myIndex userRef
-    case tret of
-        Right bret -> return bret
-        Left _ -> return $ Left InternalError
+sqlGroundUpload ground name mimeType articleRef userRef uploader = go (groundConfigTransactionRetryCount $ groundConfig ground)
   where
+    go n
+        | n <= 0 = return $ Left InternalError
+        | otherwise = do
+            pSourceConsumed <- newIORef False
+            tret <- Db.execute (groundDb ground) Db.ReadCommited $ do
+                uploadTime <- currentTime
+                fileRef <- (Reference <$> generateBytes groundConfigFileIdLength) `runReaderT` ground
+                maxIndexQret <- Db.query
+                    (Select ["sn_files"]
+                        (fInt "COALESCE(MAX(file_index), 0)" :/ E)
+                        [WhereIs articleRef "file_article_id"]
+                        []
+                        (RowRange 0 1))
+                maxIndex <- case maxIndexQret of
+                    [Just i :/ E] -> return i
+                    _ -> Db.abort
+                {- since this transaction is relaxed, it's possible for multiple files to end up with the same (`article_id`, `index`) pair -}
+                {- this is fine -}
+                {- for identification, we use an independent `id` field, which is under a primary key constraint -}
+                {- for ordering, we always append an `id ASC` to the end of the "order by" clause, so it's still always deterministic -}
+                {- if the user isn't happy with whatever order the files turned out to be, they can always rearrange the indices later -}
+                let myIndex = maxIndex + 1
+                insertQret <- Db.query
+                    (Insert "sn_files"
+                        (fReference "file_id"
+                            :/ fText "file_name"
+                            :/ fText "file_mimetype"
+                            :/ fTime "file_upload_date"
+                            :/ fReference "file_article_id"
+                            :/ fInt "file_index"
+                            :/ fReference "file_user_id"
+                            :/ E)
+                        (Value fileRef
+                            :/ Value name
+                            :/ Value mimeType
+                            :/ Value uploadTime
+                            :/ Value articleRef
+                            :/ Value myIndex
+                            :/ Value userRef
+                            :/ E))
+                unless insertQret $ Db.abort
+                liftIO $ writeIORef pSourceConsumed True
+                driveUpload fileRef 0 $ uploader $ FileInfo fileRef name mimeType uploadTime articleRef myIndex userRef
+            case tret of
+                Right bret -> return bret
+                Left Db.QueryError -> return $ Left InternalError
+                Left Db.SerializationError -> do
+                    sourceConsumed <- readIORef pSourceConsumed
+                    if sourceConsumed
+                        then return $ Left InternalError
+                        else go $ n - 1
     driveUpload fileRef chunkIndex action = do
         aret <- liftIO action
         case aret of

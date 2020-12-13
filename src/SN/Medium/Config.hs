@@ -26,7 +26,7 @@ instance FromJSON MediumConfig where
             <*> v .:? "maxPageLimit" .!= 100
             <*> v .:? "minPasswordLength" .!= 8
             <*> v .:? "maxAccessKeyCount" .!= 100
-            <*> v .:? "ticketLength" .!= 32
+            <*> v .:? "ticketLength" .!= 30
             <*> v .:? "ticketLifetime" .!= 300
             <*> v .:? "fileChunkSize" .!= 0x10000 -- 64 K
             <*> v .:? "maxFileSize" .!= 0x1000000 -- 16 M

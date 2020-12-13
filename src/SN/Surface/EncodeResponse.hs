@@ -28,11 +28,14 @@ responseBody (ResponseBodyOkAccessKey akey) = pairs $ pair "ok" $ accessKey akey
 responseBody (ResponseBodyOkAccessKeyList refList) = pairs $ pair "ok" $ list reference refList
 responseBody (ResponseBodyOkAuthor author) = pairs $ pair "ok" $ exAuthor author
 responseBody (ResponseBodyOkAuthorList authorList) = pairs $ pair "ok" $ list exAuthor authorList
+responseBody (ResponseBodyOkCategoryList catList) = pairs $ pair "ok" $ list exCategory catList
+responseBody (ResponseBodyOkCategoryAncestryList catAncestry) = pairs $ pair "ok" $ categoryAncestry catAncestry
 responseBody (ResponseBodyUploadStatusList uploadStatusList) = pairs $ pair "ok" $ list exUploadStatus uploadStatusList
 
 errorMessage :: ErrorMessage -> Encoding
 errorMessage ErrAccessDenied = pairs $ pair "class" $ text "Access denied"
 errorMessage ErrArticleNotEditable = pairs $ pair "class" $ text "Article not editable"
+errorMessage ErrCyclicReference = pairs $ pair "class" $ text "Cyclic reference"
 errorMessage ErrFileTooLarge = pairs $ pair "class" $ text "File too large"
 errorMessage ErrInternal = pairs $ pair "class" $ text "Internal error"
 errorMessage ErrInvalidAccessKey = pairs $ pair "class" $ text "Invalid access key"
@@ -68,11 +71,27 @@ exAuthor (ExAuthor (Author ref name description)) = pairs $ mconcat
     ]
 
 exCategory :: Expanded Category -> Encoding
-exCategory (ExCategory ref name mParent) = pairs $ mconcat
+exCategory (ExCategory (Category ref name parentRef parentName)) = pairs $ mconcat
     [ pair "class" $ text "Category"
     , pair "id" $ reference ref
     , pair "name" $ text name
-    , pair "parent" $ maybe null_ exCategory mParent
+    , pair "parent" $ case parentRef of
+        "" -> null_
+        _ -> pairs $ mconcat
+            [ pair "class" $ text "Category"
+            , pair "id" $ reference parentRef
+            , pair "name" $ text parentName
+            ]
+    ]
+
+categoryAncestry :: [Expanded Category] -> Encoding
+categoryAncestry [] = null_
+categoryAncestry [cat] = exCategory cat
+categoryAncestry (ExCategory (Category ref name _ _) : rest) = pairs $ mconcat
+    [ pair "class" $ text "Category"
+    , pair "id" $ reference ref
+    , pair "name" $ text name
+    , pair "parent" $ categoryAncestry rest
     ]
 
 publicationStatus :: PublicationStatus -> Encoding
@@ -80,14 +99,14 @@ publicationStatus (PublishAt time) = utcTime time
 publicationStatus NonPublished = null_
 
 exArticle :: Expanded Article -> Encoding
-exArticle (ExArticle ref ver mAuthor name pubStat mCategory tags) = pairs $ mconcat
+exArticle (ExArticle ref ver mAuthor name pubStat catAncestry tags) = pairs $ mconcat
     [ pair "class" $ text "Article"
     , pair "id" $ reference ref
     , pair "version" $ version ver
     , pair "author" $ maybe null_ exAuthor mAuthor
     , pair "name" $ text name
     , pair "publicationStatus" $ publicationStatus pubStat
-    , pair "category" $ maybe null_ exCategory mCategory
+    , pair "category" $ categoryAncestry catAncestry
     , pair "tags" $ list exTag tags
     ]
 

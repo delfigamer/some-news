@@ -8,7 +8,7 @@ module SN.Medium.Response
     , ResponseStatus(..)
     , ErrorMessage(..)
     , ResponseBody(..)
-    , OkResponseBody(..)
+    , IsResponseBody(..)
     , okResponse
     , errorResponse
     , ExpansionContext
@@ -23,6 +23,7 @@ import Control.Monad
 import Control.Monad.Fix
 import Data.Aeson
 import Data.Coerce
+import Data.Either
 import Data.IORef
 import Data.Int
 import Data.Time.Clock
@@ -58,6 +59,7 @@ data ResponseStatus
 data ErrorMessage
     = ErrAccessDenied
     | ErrArticleNotEditable
+    | ErrCyclicReference
     | ErrFileTooLarge
     | ErrInternal
     | ErrInvalidAccessKey
@@ -82,21 +84,25 @@ data ResponseBody
     | ResponseBodyOkAccessKeyList [Reference AccessKey]
     | ResponseBodyOkAuthor (Expanded Author)
     | ResponseBodyOkAuthorList [Expanded Author]
+    | ResponseBodyOkCategoryList [Expanded Category]
+    | ResponseBodyOkCategoryAncestryList [Expanded Category]
     | ResponseBodyUploadStatusList [Expanded UploadStatus]
     deriving (Show, Eq)
 
-class OkResponseBody a where okResponseBody :: a -> ResponseBody
-instance OkResponseBody () where okResponseBody = const ResponseBodyOk
-instance OkResponseBody (Expanded User) where okResponseBody = ResponseBodyOkUser
-instance OkResponseBody [Expanded User] where okResponseBody = ResponseBodyOkUserList
-instance OkResponseBody AccessKey where okResponseBody = ResponseBodyOkAccessKey
-instance OkResponseBody [Reference AccessKey] where okResponseBody = ResponseBodyOkAccessKeyList
-instance OkResponseBody (Expanded Author) where okResponseBody = ResponseBodyOkAuthor
-instance OkResponseBody [Expanded Author] where okResponseBody = ResponseBodyOkAuthorList
-instance OkResponseBody [Expanded UploadStatus] where okResponseBody = ResponseBodyUploadStatusList
+class IsResponseBody a where toResponseBody :: a -> ResponseBody
+instance IsResponseBody ResponseBody where toResponseBody = id
+instance IsResponseBody () where toResponseBody = const ResponseBodyOk
+instance IsResponseBody (Expanded User) where toResponseBody = ResponseBodyOkUser
+instance IsResponseBody [Expanded User] where toResponseBody = ResponseBodyOkUserList
+instance IsResponseBody AccessKey where toResponseBody = ResponseBodyOkAccessKey
+instance IsResponseBody [Reference AccessKey] where toResponseBody = ResponseBodyOkAccessKeyList
+instance IsResponseBody (Expanded Author) where toResponseBody = ResponseBodyOkAuthor
+instance IsResponseBody [Expanded Author] where toResponseBody = ResponseBodyOkAuthorList
+instance IsResponseBody [Expanded Category] where toResponseBody = ResponseBodyOkCategoryList
+instance IsResponseBody [Expanded UploadStatus] where toResponseBody = ResponseBodyUploadStatusList
 
-okResponse :: OkResponseBody a => a -> Response
-okResponse a = Response StatusOk $ okResponseBody a
+okResponse :: IsResponseBody a => a -> Response
+okResponse a = Response StatusOk $ toResponseBody a
 
 errorResponse :: ErrorMessage -> Response
 errorResponse err = Response (errorStatus err) $ ResponseBodyError err
@@ -105,6 +111,7 @@ errorStatus :: ErrorMessage -> ResponseStatus
 errorStatus = \case
     ErrAccessDenied -> StatusForbidden
     ErrArticleNotEditable -> StatusForbidden
+    ErrCyclicReference -> StatusBadRequest
     ErrFileTooLarge -> StatusPayloadTooLarge
     ErrInternal -> StatusInternalError
     ErrInvalidAccessKey -> StatusForbidden
@@ -153,8 +160,7 @@ instance Expandable User where
 
 instance Retrievable User where
     doRetrieve (ExpansionContext ground _ _) ref = do
-        qret <- groundPerform ground $ UserList $
-            ListView 0 1 [FilterUserId ref] []
+        qret <- groundPerform ground $ UserList $ ListView 0 1 [FilterUserId ref] []
         case qret of
             Right [user] -> return $ Just $ ExUser user
             _ -> return Nothing
@@ -167,25 +173,22 @@ instance Expandable Author where
 
 instance Retrievable Author where
     doRetrieve (ExpansionContext ground _ _) ref = do
-        qret <- groundPerform ground $ AuthorList $
-            ListView 0 1 [FilterAuthorId ref] []
+        qret <- groundPerform ground $ AuthorList $ ListView 0 1 [FilterAuthorId ref] []
         case qret of
             Right [author] -> return $ Just $ ExAuthor author
             _ -> return Nothing
 
-data instance Expanded Category = ExCategory
-    (Reference Category) Text.Text (Maybe (Expanded Category))
+data instance Expanded Category = ExCategory Category
     deriving (Show, Eq)
 
 instance Expandable Category where
-    expand' cex (Category ref name parentRef) =
-        ExCategory ref name <$> retrieve cex parentRef
+    expand' _ u = return $ ExCategory u
 
 instance Retrievable Category where
-    doRetrieve cex@(ExpansionContext ground _ _) ref = do
+    doRetrieve (ExpansionContext ground _ _) ref = do
         qret <- groundPerform ground $ CategoryList $ ListView 0 1 [FilterCategoryId ref] []
         case qret of
-            Right [category] -> Just <$> expand' cex category
+            Right [category] -> return $ Just $ ExCategory category
             _ -> return Nothing
 
 data instance Expanded Article = ExArticle
@@ -194,14 +197,14 @@ data instance Expanded Article = ExArticle
     (Maybe (Expanded Author))
     Text.Text
     PublicationStatus
-    (Maybe (Expanded Category))
+    [Expanded Category]
     [Expanded Tag]
     deriving (Show, Eq)
 
 instance Expandable Article where
     expand' cex@(ExpansionContext ground _ _) article = do
         mAuthorEx <- retrieve cex $ articleAuthor article
-        mCategoryEx <- retrieve cex $ articleCategory article
+        categoryList <- fmap (fromRight []) $ groundPerform ground $ CategoryAncestry $ articleCategory article
         mTags <- groundPerform ground $ TagList $
             ListView 0 maxBound [FilterTagArticleId (articleId article)] [(OrderTagName, Ascending)]
         tagsEx <- case mTags of
@@ -213,7 +216,7 @@ instance Expandable Article where
             mAuthorEx
             (articleName article)
             (articlePublicationStatus article)
-            mCategoryEx
+            (map ExCategory categoryList)
             tagsEx
 
 instance Retrievable Article where

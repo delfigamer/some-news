@@ -21,6 +21,7 @@ import Control.Monad
 import Control.Monad.Reader
 import Data.Char
 import Data.IORef
+import GHC.Stack
 import System.IO.Unsafe
 import qualified System.Random as R
 
@@ -64,7 +65,7 @@ randomPrintableChar = do
 randomPrintableString :: Int -> Gen String
 randomPrintableString n = replicateM n randomPrintableChar
 
-chooseOne :: [a] -> Gen a
+chooseOne :: HasCallStack => [a] -> Gen a
 chooseOne [] = error "Gen.chooseOne: empty list"
 chooseOne xs = do
     i <- randomWithin 0 (length xs - 1)

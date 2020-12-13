@@ -218,6 +218,41 @@ requestDispatch ["authors", "removeOwner_"] = simpleRequest $ do
     performRequire $ AuthorSetOwnership authorRef userRef False
     exitOk ()
 
+requestDispatch ["categories", "info"] = simpleRequest $ do
+    categoryRef <- getParam "category" referenceParser
+    elems <- performRequire $ CategoryAncestry categoryRef
+    case elems of
+        [] -> exitError ErrNotFound
+        _ -> exitOk . ResponseBodyOkCategoryAncestryList =<< expandList elems
+requestDispatch ["categories", "list"] = simpleRequest $ do
+    mlParentRef <- getParam "parent" $ listOptional referenceParser
+    isStrict <- getParam "strict" optionParser
+    let filter = if isStrict
+            then map FilterCategoryParentId mlParentRef
+            else map FilterCategoryTransitiveParentId mlParentRef
+    lview <- getListView filter
+        [ ("name", OrderCategoryName)
+        ]
+    elems <- performRequire $ CategoryList lview
+    exitOk =<< expandList elems
+requestDispatch ["categories", "setName_"] = simpleRequest $ do
+    void requireAdminAccess
+    categoryRef <- getParam "category" referenceParser
+    name <- getParam "name" textParser
+    performRequire $ CategorySetName categoryRef name
+    exitOk ()
+requestDispatch ["categories", "setParent_"] = simpleRequest $ do
+    void requireAdminAccess
+    categoryRef <- getParam "category" referenceParser
+    parentRef <- getParam "parent" referenceParser
+    performRequire $ CategorySetParent categoryRef parentRef
+    exitOk ()
+requestDispatch ["categories", "delete_"] = simpleRequest $ do
+    void requireAdminAccess
+    categoryRef <- getParam "category" referenceParser
+    performRequireConfirm $ CategoryDelete categoryRef
+    exitOk ()
+
 requestDispatch ["files", "upload"] = simpleRequest $ do
     articleRef <- getParam "article" referenceParser
     myUser <- requireUserAccess

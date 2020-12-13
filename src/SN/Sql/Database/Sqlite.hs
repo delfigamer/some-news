@@ -26,7 +26,7 @@ withSqlite :: String -> Logger -> (Db.Database -> IO r) -> IO r
 withSqlite path logger body = do
     nameCounter <- newIORef (1 :: Int)
     withResourcePool 1
-        (if path == "" || path == ":memory:" then 1 else 16)
+        (if path == "" || path == ":memory:" then 1 else 4)
         (do
             newName <- fmap (Text.pack . show) $ atomicModifyIORef' nameCounter $ \x -> (x+1, x)
             logInfo logger $ "Sqlite: " <<|| newName << ": open connection"

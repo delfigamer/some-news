@@ -23,6 +23,7 @@ module SN.Medium.Internal
     , getParam
     , withDefault
     , listOptional
+    , optionParser
     , intParser
     , textParser
     , passwordParser
@@ -186,6 +187,10 @@ listOptional parser mbs = case mbs of
     Nothing -> Just []
     _ -> (\x -> [x]) <$> parser mbs
 
+optionParser :: Maybe BS.ByteString -> Maybe Bool
+optionParser Nothing = Just False
+optionParser (Just _) = Just True
+
 intParser :: Int64 -> Int64 -> Maybe BS.ByteString -> Maybe Int64
 intParser _ _ Nothing = Nothing
 intParser minv maxv (Just bs) = case reads $ BSChar.unpack bs of
@@ -325,10 +330,11 @@ groundError :: GroundError -> ErrorMessage
 groundError = \case
     NotFoundError -> ErrNotFound
     VersionError -> ErrVersionConflict
+    CyclicReferenceError -> ErrCyclicReference
     InvalidRequestError -> ErrInvalidRequest
     InternalError -> ErrInternal
 
-exitOk :: (MonadRequestHandler f m, OkResponseBody a) => a -> m void
+exitOk :: (MonadRequestHandler f m, IsResponseBody a) => a -> m void
 exitOk = exitRespond . okResponse
 
 exitError :: MonadRequestHandler f m => ErrorMessage -> m void

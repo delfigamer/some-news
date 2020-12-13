@@ -78,6 +78,7 @@ data Action a where
     CategorySetParent :: Reference Category -> Reference Category -> Action ()
     CategoryDelete :: Reference Category -> Action ()
     CategoryList :: ListView Category -> Action [Category]
+    CategoryAncestry :: Reference Category -> Action [Category]
 
     ArticleCreate :: Reference Author -> Action Article
     ArticleGetText :: Reference Article -> Action Text.Text
@@ -110,6 +111,7 @@ deriving instance Eq (Action a)
 data GroundError
     = NotFoundError
     | VersionError
+    | CyclicReferenceError
     | InvalidRequestError
     | InternalError
     deriving (Show, Eq, Ord)
