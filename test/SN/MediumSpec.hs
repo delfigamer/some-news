@@ -660,6 +660,74 @@ spec = around withTestEnv $ do
             exec
                 (expectResponse $ Response StatusOk $ ResponseBodyOkAuthor $ ExAuthor tauthor)
                 (SimpleRequest $ rqdata [("author", toBase64 "author")])
+        specifyMethod "authors/mine" $ \(MethodEnv fake exec) -> do
+            {- akey :: required user access key -}
+            {- offset :: optional integer, 0 <= offset, default -> 0 -}
+            {- limit :: optional integer, 0 < limit <= Config.maxPageLimit, default -> Config.defaultPageLimit -}
+            {- order :: optional sorting order spec, columns: "name" (utf8 lexicographical order) -}
+            let authors =
+                    [ Author "aid1" "name1" "description1"
+                    , Author "aid2" "name2" "description2"
+                    , Author "aid3" "name3" "description3"
+                    ]
+            checkpoint fake
+                [ userLookup |>> Right [tuser]
+                , AuthorList (ListView 0 10 [FilterAuthorUserId "uid"] []) |>> Right authors
+                ]
+            exec
+                (expectResponse $ Response StatusOk $ ResponseBodyOkAuthorList $ map ExAuthor authors)
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag")])
+            checkpoint fake
+                [ userLookup |>> Right [tuser]
+                , AuthorList (ListView 50 7 [FilterAuthorUserId "uid"] []) |>> Right authors
+                ]
+            exec
+                (expectResponse $ Response StatusOk $ ResponseBodyOkAuthorList $ map ExAuthor authors)
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("offset", "50"), ("limit", "7")])
+            checkpoint fake
+                [ userLookup |>> Right [tuser]
+                , AuthorList (ListView 1 2 [FilterAuthorUserId "uid"] [(OrderAuthorName, Descending)]) |>> Right []
+                ]
+            exec
+                (expectResponse $ Response StatusOk $ ResponseBodyOkAuthorList [])
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("offset", "1"), ("limit", "2"), ("order", "nameDesc")])
+        specifyMethod "authors/owners" $ \(MethodEnv fake exec) -> do
+            {- akey :: required user access key -}
+            {- author :: required author id -}
+            {- offset :: optional integer, 0 <= offset, default -> 0 -}
+            {- limit :: optional integer, 0 < limit <= Config.maxPageLimit, default -> Config.defaultPageLimit -}
+            {- order :: optional sorting order spec, columns: "name", "surname" (utf8 lexicographical order), "joinDate" (newest to oldest), "isAdmin" (admins first) -}
+            let users =
+                    [ User "uid1" "name1" "surname1" (mkTime "2020-01-01T01:01:01Z") False
+                    , User "uid2" "name2" "surname2" (mkTime "2020-01-02T03:04:05Z") True
+                    , User "uid3" "name3" "surname3" (mkTime "2020-01-06T12:18:25Z") True
+                    ]
+            exec
+                (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrMissingParameter "author")
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag")])
+            checkpoint fake
+                [ userLookup |>> Right [tuser]
+                , AuthorList (ListView 0 1 [FilterAuthorId "aid", FilterAuthorUserId "uid"] []) |>> Right []
+                ]
+            exec
+                (expectResponse $ Response StatusForbidden $ ResponseBodyError ErrAuthorNotOwned)
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("author", toBase64 "aid")])
+            checkpoint fake
+                [ userLookup |>> Right [tuser]
+                , AuthorList (ListView 0 1 [FilterAuthorId "aid", FilterAuthorUserId "uid"] []) |>> Right [tauthor]
+                , UserList (ListView 0 10 [FilterUserAuthorId "aid"] []) |>> Right [tuser]
+                ]
+            exec
+                (expectResponse $ Response StatusOk $ ResponseBodyOkUserList [ExUser tuser])
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("author", toBase64 "aid")])
+            checkpoint fake
+                [ userLookup |>> Right [tuser]
+                , AuthorList (ListView 0 1 [FilterAuthorId "aid", FilterAuthorUserId "uid"] []) |>> Right [tauthor]
+                , UserList (ListView 1 2 [FilterUserAuthorId "aid"] [(OrderUserName, Ascending), (OrderUserJoinDate, Descending)]) |>> Right [tuser]
+                ]
+            exec
+                (expectResponse $ Response StatusOk $ ResponseBodyOkUserList [ExUser tuser])
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("author", toBase64 "aid"), ("offset", "1"), ("limit", "2"), ("order", "name+joinDateDesc")])
         specifyMethod "authors/create_" $ \(MethodEnv fake exec) -> do
             {- akey :: required admin access key -}
             {- name :: required non-empty text -}
@@ -675,7 +743,7 @@ spec = around withTestEnv $ do
                 ]
             exec
                 (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrInvalidParameter "name")
-                (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("name", "")])
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("name", ""), ("description", "bar")])
             checkpoint fake
                 [ adminLookup |>> Right [tadmin]
                 ]
@@ -959,6 +1027,51 @@ spec = around withTestEnv $ do
             exec
                 (expectResponse $ Response StatusInternalError $ ResponseBodyError ErrInternal)
                 (SimpleRequest $ rqdata [("parent", "."), ("strict", "parent is null")])
+        specifyMethod "categories/create_" $ \(MethodEnv fake exec) -> do
+            {- akey :: required admin access key -}
+            {- name :: required non-empty text -}
+            {- parent :: required category id -}
+            checkpoint fake
+                [ adminLookup |>> Right [tadmin]
+                ]
+            exec
+                (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrMissingParameter "name")
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("parent", "cat1")])
+            checkpoint fake
+                [ adminLookup |>> Right [tadmin]
+                ]
+            exec
+                (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrInvalidParameter "name")
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("name", ""), ("parent", toBase64 "cat1")])
+            checkpoint fake
+                [ adminLookup |>> Right [tadmin]
+                ]
+            exec
+                (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrMissingParameter "parent")
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("name", "foo")])
+            checkpoint fake
+                [ adminLookup |>> Right [tadmin]
+                , CategoryAncestry "cat1" |>> Right []
+                ]
+            exec
+                (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrInvalidParameter "parent")
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("name", "foo"), ("parent", toBase64 "cat1")])
+            let newcat = Category "cat0" "foo" "cat1" "cat name 1"
+            checkpoint fake
+                [ adminLookup |>> Right [tadmin]
+                , CategoryAncestry "cat1" |>> Right [tcategory1, tcategory2]
+                , CategoryCreate "foo" "cat1" |>> Right newcat
+                ]
+            exec
+                (expectResponse $ Response StatusOk $ ResponseBodyOkCategoryAncestryList $ map ExCategory [newcat, tcategory1, tcategory2])
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("name", "foo"), ("parent", toBase64 "cat1")])
+            checkpoint fake
+                [ adminLookup |>> Right [tadmin]
+                , CategoryCreate "foo" "" |>> Right (Category "cat3" "foo" "" "")
+                ]
+            exec
+                (expectResponse $ Response StatusOk $ ResponseBodyOkCategoryAncestryList [ExCategory $ Category "cat3" "foo" "" ""])
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("name", "foo"), ("parent", "")])
         specifyMethod "categories/setName_" $ \(MethodEnv fake exec) -> do
             {- akey :: required admin access key -}
             {- category :: required category id -}
@@ -1043,6 +1156,110 @@ spec = around withTestEnv $ do
             exec
                 (expectResponse $ Response StatusOk ResponseBodyOk)
                 (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("category", toBase64 "cid"), ("confirm", toBase64 "tikt")])
+        specifyMethod "tags/info" $ \(MethodEnv fake exec) -> do
+            {- tag :: required tag id -}
+            exec
+                (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrMissingParameter "tag")
+                (SimpleRequest $ rqdata [])
+            checkpoint fake
+                [ TagList (ListView 0 1 [FilterTagId "tag1"] []) |>> Right [ttag1]
+                ]
+            exec
+                (expectResponse $ Response StatusOk $ ResponseBodyOkTag $ ExTag ttag1)
+                (SimpleRequest $ rqdata [("tag", toBase64 "tag1")])
+            checkpoint fake
+                [ TagList (ListView 0 1 [FilterTagId "tag1"] []) |>> Right []
+                ]
+            exec
+                (expectResponse $ Response StatusNotFound $ ResponseBodyError ErrNotFound)
+                (SimpleRequest $ rqdata [("tag", toBase64 "tag1")])
+        specifyMethod "tags/list" $ \(MethodEnv fake exec) -> do
+            {- offset :: optional integer, 0 <= offset, default -> 0 -}
+            {- limit :: optional integer, 0 < limit <= Config.maxPageLimit, default -> Config.defaultPageLimit -}
+            {- order :: optional sorting order spec, columns: "name" (utf8 lexicographical order) -}
+            let tagList = [ttag1, ttag2]
+            let exTagList = [ExTag ttag1, ExTag ttag2]
+            checkpoint fake
+                [ TagList (ListView 0 10 [] []) |>> Right tagList
+                ]
+            exec
+                (expectResponse $ Response StatusOk $ ResponseBodyOkTagList exTagList)
+                (SimpleRequest $ rqdata [])
+            checkpoint fake
+                [ TagList (ListView 50 7 [] [(OrderTagName, Ascending)]) |>> Right tagList
+                ]
+            exec
+                (expectResponse $ Response StatusOk $ ResponseBodyOkTagList exTagList)
+                (SimpleRequest $ rqdata [("offset", "50"), ("limit", "7"), ("order", "name")])
+        specifyMethod "tags/create_" $ \(MethodEnv fake exec) -> do
+            {- akey :: required admin access key -}
+            {- name :: required non-empty text -}
+            checkpoint fake
+                [ adminLookup |>> Right [tadmin]
+                ]
+            exec
+                (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrMissingParameter "name")
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag")])
+            checkpoint fake
+                [ adminLookup |>> Right [tadmin]
+                ]
+            exec
+                (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrInvalidParameter "name")
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("name", "")])
+            checkpoint fake
+                [ adminLookup |>> Right [tadmin]
+                , TagCreate "foo" |>> Right (Tag "tid" "foo")
+                ]
+            exec
+                (expectResponse $ Response StatusOk $ ResponseBodyOkTag $ ExTag $ Tag "tid" "foo")
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("name", "foo")])
+        specifyMethod "tags/setName_" $ \(MethodEnv fake exec) -> do
+            {- akey :: required admin access key -}
+            {- tag :: required tag id -}
+            {- name :: required non-empty text -}
+            checkpoint fake
+                [ adminLookup |>> Right [tadmin]
+                ]
+            exec
+                (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrMissingParameter "tag")
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("name", "foo")])
+            checkpoint fake
+                [ adminLookup |>> Right [tadmin]
+                ]
+            exec
+                (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrInvalidParameter "name")
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("tag", toBase64 "tid"), ("name", "")])
+            checkpoint fake
+                [ adminLookup |>> Right [tadmin]
+                , TagSetName "tid" "foo" |>> Right ()
+                ]
+            exec
+                (expectResponse $ Response StatusOk ResponseBodyOk)
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("tag", toBase64 "tid"), ("name", "foo")])
+        specifyMethod "tags/delete_" $ \(MethodEnv fake exec) -> do
+            {- akey :: required admin access key -}
+            {- tag :: required tag id -}
+            {- confirm :: confirmation ticket -}
+            checkpoint fake
+                [ adminLookup |>> Right [tadmin]
+                ]
+            exec
+                (expectResponse $ Response StatusBadRequest $ ResponseBodyError $ ErrMissingParameter "tag")
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag")])
+            checkpoint fake
+                [ adminLookup |>> Right [tadmin]
+                , GroundGenerateBytes 4 |>> "tikt"
+                ]
+            exec
+                (expectResponse $ Response StatusOk $ ResponseBodyConfirm "tikt")
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("tag", toBase64 "tid")])
+            checkpoint fake
+                [ adminLookup |>> Right [tadmin]
+                , TagDelete "tid" |>> Right ()
+                ]
+            exec
+                (expectResponse $ Response StatusOk ResponseBodyOk)
+                (SimpleRequest $ rqdata [("akey", "AQ:Ag"), ("tag", toBase64 "tid"), ("confirm", toBase64 "tikt")])
         specifyMethod "files/upload" $ \(MethodEnv fake exec) -> do
             {- akey :: required user access key -}
             {- article :: required article id -}

@@ -30,11 +30,14 @@ responseBody (ResponseBodyOkAuthor author) = pairs $ pair "ok" $ exAuthor author
 responseBody (ResponseBodyOkAuthorList authorList) = pairs $ pair "ok" $ list exAuthor authorList
 responseBody (ResponseBodyOkCategoryList catList) = pairs $ pair "ok" $ list exCategory catList
 responseBody (ResponseBodyOkCategoryAncestryList catAncestry) = pairs $ pair "ok" $ categoryAncestry catAncestry
+responseBody (ResponseBodyOkTag tag) = pairs $ pair "ok" $ exTag tag
+responseBody (ResponseBodyOkTagList tagList) = pairs $ pair "ok" $ list exTag tagList
 responseBody (ResponseBodyUploadStatusList uploadStatusList) = pairs $ pair "ok" $ list exUploadStatus uploadStatusList
 
 errorMessage :: ErrorMessage -> Encoding
 errorMessage ErrAccessDenied = pairs $ pair "class" $ text "Access denied"
 errorMessage ErrArticleNotEditable = pairs $ pair "class" $ text "Article not editable"
+errorMessage ErrAuthorNotOwned = pairs $ pair "class" $ text "Author not owned"
 errorMessage ErrCyclicReference = pairs $ pair "class" $ text "Cyclic reference"
 errorMessage ErrFileTooLarge = pairs $ pair "class" $ text "File too large"
 errorMessage ErrInternal = pairs $ pair "class" $ text "Internal error"

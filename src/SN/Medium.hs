@@ -159,13 +159,8 @@ requestDispatch ["users", "delete_"] = simpleRequest $ do
 requestDispatch ["users", "list_"] = simpleRequest $ do
     void requireAdminAccess
     mlAuthorRef <- getParam "author" $ listOptional referenceParser
-    lview <- getListView (map FilterUserAuthorId mlAuthorRef)
-        [ ("name", OrderUserName)
-        , ("surname", OrderUserSurname)
-        , ("joinDate", OrderUserJoinDate)
-        , ("isAdmin", OrderUserIsAdmin)
-        ]
-    elems <- performRequire $ UserList lview
+    lview <- getUserListView
+    elems <- performRequire $ UserList $ lview $ map FilterUserAuthorId mlAuthorRef
     exitOk =<< expandList elems
 
 requestDispatch ["authors", "info"] = simpleRequest $ do
@@ -174,6 +169,18 @@ requestDispatch ["authors", "info"] = simpleRequest $ do
     case ret of
         [author] -> exitOk =<< expand author
         _ -> exitError ErrNotFound
+requestDispatch ["authors", "mine"] = simpleRequest $ do
+    lview <- getAuthorListView
+    myUser <- requireUserAccess
+    elems <- performRequire $ AuthorList $ lview [FilterAuthorUserId $ userId myUser]
+    exitOk =<< expandList elems
+requestDispatch ["authors", "owners"] = simpleRequest $ do
+    authorRef <- getParam "author" referenceParser
+    lview <- getUserListView
+    myUser <- requireUserAccess
+    void $ assertAuthorAccess (userId myUser) authorRef
+    elems <- performRequire $ UserList $ lview [FilterUserAuthorId authorRef]
+    exitOk =<< expandList elems
 requestDispatch ["authors", "create_"] = simpleRequest $ do
     void requireAdminAccess
     name <- getParam "name" textParser
@@ -200,10 +207,8 @@ requestDispatch ["authors", "delete_"] = simpleRequest $ do
 requestDispatch ["authors", "list_"] = simpleRequest $ do
     void requireAdminAccess
     mlUserRef <- getParam "user" $ listOptional referenceParser
-    lview <- getListView (map FilterAuthorUserId mlUserRef)
-        [ ("name", OrderAuthorName)
-        ]
-    elems <- performRequire $ AuthorList lview
+    lview <- getAuthorListView
+    elems <- performRequire $ AuthorList $ lview $ map FilterAuthorUserId mlUserRef
     exitOk =<< expandList elems
 requestDispatch ["authors", "addOwner_"] = simpleRequest $ do
     void requireAdminAccess
@@ -227,14 +232,25 @@ requestDispatch ["categories", "info"] = simpleRequest $ do
 requestDispatch ["categories", "list"] = simpleRequest $ do
     mlParentRef <- getParam "parent" $ listOptional referenceParser
     isStrict <- getParam "strict" optionParser
+    lview <- getCategoryListView
     let filter = if isStrict
             then map FilterCategoryParentId mlParentRef
             else map FilterCategoryTransitiveParentId mlParentRef
-    lview <- getListView filter
-        [ ("name", OrderCategoryName)
-        ]
-    elems <- performRequire $ CategoryList lview
+    elems <- performRequire $ CategoryList $ lview filter
     exitOk =<< expandList elems
+requestDispatch ["categories", "create_"] = simpleRequest $ do
+    void requireAdminAccess
+    name <- getParam "name" textParser
+    parentRef <- getParam "parent" referenceParser
+    parentAncestry <- case parentRef of
+        "" -> return []
+        _ -> do
+            anc <- performRequire $ CategoryAncestry parentRef
+            when (null anc) $
+                exitError $ ErrInvalidParameter "parent"
+            return anc
+    category <- performRequire $ CategoryCreate name parentRef
+    exitOk . ResponseBodyOkCategoryAncestryList =<< expandList (category : parentAncestry)
 requestDispatch ["categories", "setName_"] = simpleRequest $ do
     void requireAdminAccess
     categoryRef <- getParam "category" referenceParser
@@ -251,6 +267,33 @@ requestDispatch ["categories", "delete_"] = simpleRequest $ do
     void requireAdminAccess
     categoryRef <- getParam "category" referenceParser
     performRequireConfirm $ CategoryDelete categoryRef
+    exitOk ()
+
+requestDispatch ["tags", "info"] = simpleRequest $ do
+    tagRef <- getParam "tag" referenceParser
+    elems <- performRequire $ TagList $ ListView 0 1 [FilterTagId tagRef] []
+    case elems of
+        [tag] -> exitOk . ResponseBodyOkTag =<< expand tag
+        _ -> exitError ErrNotFound
+requestDispatch ["tags", "list"] = simpleRequest $ do
+    lview <- getTagListView
+    elems <- performRequire $ TagList $ lview []
+    exitOk =<< expandList elems
+requestDispatch ["tags", "create_"] = simpleRequest $ do
+    void requireAdminAccess
+    name <- getParam "name" textParser
+    tag <- performRequire $ TagCreate name
+    exitOk =<< expand tag
+requestDispatch ["tags", "setName_"] = simpleRequest $ do
+    void requireAdminAccess
+    tagRef <- getParam "tag" referenceParser
+    name <- getParam "name" textParser
+    performRequire $ TagSetName tagRef name
+    exitOk ()
+requestDispatch ["tags", "delete_"] = simpleRequest $ do
+    void requireAdminAccess
+    tagRef <- getParam "tag" referenceParser
+    performRequireConfirm $ TagDelete tagRef
     exitOk ()
 
 requestDispatch ["files", "upload"] = simpleRequest $ do

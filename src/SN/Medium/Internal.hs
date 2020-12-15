@@ -19,6 +19,7 @@ module SN.Medium.Internal
     , requireUserPassword
     , requireUserAccess
     , requireAdminAccess
+    , assertAuthorAccess
     , assertArticleAccess
     , getParam
     , withDefault
@@ -31,6 +32,10 @@ module SN.Medium.Internal
     , accessKeyParser
     , sortOrderParser
     , getListView
+    , getUserListView
+    , getAuthorListView
+    , getCategoryListView
+    , getTagListView
     , createActionTicket
     , lookupActionTicket
     , withGround
@@ -159,6 +164,13 @@ requireAdminAccess = do
                 _ -> exitError ErrUnknownRequest
         _ -> exitError ErrUnknownRequest
 
+assertAuthorAccess :: MonadRequestHandler f m => Reference User -> Reference Author -> m Author
+assertAuthorAccess userRef authorRef = do
+    qret <- performRequire $ AuthorList $ ListView 0 1 [FilterAuthorId authorRef, FilterAuthorUserId userRef] []
+    case qret of
+        [author] -> return author
+        _ -> exitError ErrAuthorNotOwned
+
 assertArticleAccess :: MonadRequestHandler f m => Reference User -> Reference Article -> m Article
 assertArticleAccess userRef articleRef = do
     qret <- performRequire $ ArticleList $ ListView 0 1 [FilterArticleId articleRef, FilterArticleUserId userRef] []
@@ -251,17 +263,47 @@ sortOrderParser colNames (Just bs) = parse bs
 
 getListView
     :: (MonadRequestHandler f m, MonadReader RequestData m)
-    => [ViewFilter a]
-    -> [(BSChar.ByteString, ViewOrder a)]
-    -> m (ListView a)
-getListView filters orderCols = do
+    => [(BSChar.ByteString, ViewOrder a)]
+    -> m ([ViewFilter a] -> ListView a)
+getListView orderCols = do
     config <- contextConfig <$> askContext
     offset <- getParam "offset" $
         withDefault 0 $ intParser 0 maxBound
     limit <- getParam "limit" $
         withDefault (mediumConfigDefaultPageLimit config) $ intParser 1 (mediumConfigMaxPageLimit config)
     order <- getParam "order" $ sortOrderParser orderCols
-    return $ ListView offset limit filters order
+    return $ \filters -> ListView offset limit filters order
+
+getUserListView
+    :: (MonadRequestHandler f m, MonadReader RequestData m)
+    => m ([ViewFilter User] -> ListView User)
+getUserListView = getListView
+    [ ("name", OrderUserName)
+    , ("surname", OrderUserSurname)
+    , ("joinDate", OrderUserJoinDate)
+    , ("isAdmin", OrderUserIsAdmin)
+    ]
+
+getAuthorListView
+    :: (MonadRequestHandler f m, MonadReader RequestData m)
+    => m ([ViewFilter Author] -> ListView Author)
+getAuthorListView = getListView
+    [ ("name", OrderAuthorName)
+    ]
+
+getCategoryListView
+    :: (MonadRequestHandler f m, MonadReader RequestData m)
+    => m ([ViewFilter Category] -> ListView Category)
+getCategoryListView = getListView
+    [ ("name", OrderCategoryName)
+    ]
+
+getTagListView
+    :: (MonadRequestHandler f m, MonadReader RequestData m)
+    => m ([ViewFilter Tag] -> ListView Tag)
+getTagListView = getListView
+    [ ("name", OrderTagName)
+    ]
 
 createActionTicket :: MonadRequestHandler f m => ActionTicket -> m (Reference ActionTicket)
 createActionTicket ticket = do

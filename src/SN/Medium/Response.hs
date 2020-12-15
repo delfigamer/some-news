@@ -59,6 +59,7 @@ data ResponseStatus
 data ErrorMessage
     = ErrAccessDenied
     | ErrArticleNotEditable
+    | ErrAuthorNotOwned
     | ErrCyclicReference
     | ErrFileTooLarge
     | ErrInternal
@@ -86,6 +87,8 @@ data ResponseBody
     | ResponseBodyOkAuthorList [Expanded Author]
     | ResponseBodyOkCategoryList [Expanded Category]
     | ResponseBodyOkCategoryAncestryList [Expanded Category]
+    | ResponseBodyOkTag (Expanded Tag)
+    | ResponseBodyOkTagList [Expanded Tag]
     | ResponseBodyUploadStatusList [Expanded UploadStatus]
     deriving (Show, Eq)
 
@@ -99,6 +102,8 @@ instance IsResponseBody [Reference AccessKey] where toResponseBody = ResponseBod
 instance IsResponseBody (Expanded Author) where toResponseBody = ResponseBodyOkAuthor
 instance IsResponseBody [Expanded Author] where toResponseBody = ResponseBodyOkAuthorList
 instance IsResponseBody [Expanded Category] where toResponseBody = ResponseBodyOkCategoryList
+instance IsResponseBody (Expanded Tag) where toResponseBody = ResponseBodyOkTag
+instance IsResponseBody [Expanded Tag] where toResponseBody = ResponseBodyOkTagList
 instance IsResponseBody [Expanded UploadStatus] where toResponseBody = ResponseBodyUploadStatusList
 
 okResponse :: IsResponseBody a => a -> Response
@@ -111,6 +116,7 @@ errorStatus :: ErrorMessage -> ResponseStatus
 errorStatus = \case
     ErrAccessDenied -> StatusForbidden
     ErrArticleNotEditable -> StatusForbidden
+    ErrAuthorNotOwned -> StatusForbidden
     ErrCyclicReference -> StatusBadRequest
     ErrFileTooLarge -> StatusPayloadTooLarge
     ErrInternal -> StatusInternalError
