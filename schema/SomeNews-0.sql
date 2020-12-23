@@ -1,7 +1,7 @@
 -- This file is only used for documentation, and is never executed directly
 -- The actual code for setting up a database is located at src/Storage/Schema.hs
 PRAGMA foreign_keys=ON;
-
+-- 111
 BEGIN TRANSACTION;
 
 CREATE TABLE sn_metadata
